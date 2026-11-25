@@ -1,0 +1,6 @@
+{
+  "mode": "standalone",
+  "domain": "vpn.example.com",
+  "fast_hop": "20000-40000",
+  "device": "phone"
+}

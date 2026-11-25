@@ -1,0 +1,45 @@
+# --- secrets / server state: NEVER commit ---
+/private/
+server.json
+devices.json
+*.key
+*.pem
+*.seed
+*.keystore
+*.jks
+*.p12
+pipe-data/
+/state/
+
+# --- build outputs ---
+/pipe
+/pipe.exe
+/dist/
+/bin/
+*.apk
+*.aab
+*.aar
+/android/app/libs/*-sources.jar
+*.so
+*.test
+*.out
+coverage.*
+
+# --- Android / Gradle ---
+.gradle/
+build/
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+*.iml
+.idea/
+
+# --- misc ---
+.DS_Store
+*.log
+*.hprof
+/tmp/
+
+# your filled-in setup config (has your IP and domains)
+/setup.json

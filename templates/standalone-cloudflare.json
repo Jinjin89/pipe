@@ -1,0 +1,7 @@
+{
+  "mode": "standalone",
+  "domain": "vpn.example.com",
+  "cdn_domain": "static.example.com",
+  "fast_hop": "20000-40000",
+  "device": "phone"
+}

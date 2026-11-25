@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Pipe</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+<aside class="side">
+  <div class="brand"><img src="logo.svg" alt="" width="30" height="30"><span>pipe</span></div>
+  <nav id="nav" aria-label="Main">
+    <button class="nav" data-page="home" aria-current="page"><span class="ic" data-ic="home"></span>Home</button>
+    <button class="nav" data-page="routing"><span class="ic" data-ic="routing"></span>Routing</button>
+    <button class="nav" data-page="profiles"><span class="ic" data-ic="profiles"></span>Profiles</button>
+    <button class="nav" data-page="logs"><span class="ic" data-ic="logs"></span>Logs</button>
+    <button class="nav" data-page="settings"><span class="ic" data-ic="settings"></span>Settings</button>
+  </nav>
+  <div class="side-foot">
+    <div class="speed" aria-label="Current speed">
+      <div><span class="ar up">↑</span><span id="side-up">0 B/s</span></div>
+      <div><span class="ar down">↓</span><span id="side-down">0 B/s</span></div>
+    </div>
+    <div class="statusline"><span class="dot" id="side-dot"></span><span id="side-state">Not connected</span></div>
+    <button class="btn ghost quit" id="quit"><span class="ic" data-ic="quit"></span>Quit</button>
+  </div>
+</aside>
+
+<main class="main" id="main" tabindex="-1">
+<div class="banner err" id="banner" role="alert" hidden></div>
+
+<section class="page" id="page-home">
+  <div id="home-empty" hidden>
+    <div class="card empty">
+      <img src="logo.svg" alt="" width="56" height="56">
+      <h1>Add your server</h1>
+      <p class="muted">Paste the <code>pipe://</code> link you got from your server. You will see what it contains before anything is saved.</p>
+      <label class="sr" for="empty-link">Server link</label>
+      <textarea id="empty-link" rows="3" placeholder="pipe://…" spellcheck="false" autocomplete="off"></textarea>
+      <div class="row end"><button class="btn primary" id="empty-import" disabled>Import</button></div>
+    </div>
+  </div>
+  <div id="home-main">
+    <div class="card hero">
+      <button class="power" id="power" aria-label="Connect"><span class="ic big" data-ic="power"></span></button>
+      <div class="hero-text">
+        <h1 id="hero-title" aria-live="polite">Not connected</h1>
+        <p class="muted" id="hero-sub">&nbsp;</p>
+        <div class="seg tun-seg" id="home-tun" role="group" aria-label="How apps reach Pipe">
+          <button data-tun="false">System proxy</button><button data-tun="true">TUN</button>
+        </div>
+        <p class="muted small-text" id="tun-note" hidden></p>
+        <div class="proxy-strip" id="proxy-strip" hidden>
+          <span class="dot" id="proxy-dot"></span><span class="pill ok" id="tun-badge" hidden>TUN</span><span id="proxy-text"></span>
+          <button class="btn small ghost" id="copy-proxy" title="Copy proxy environment variables">Copy for terminal</button>
+        </div>
+      </div>
+    </div>
+    <section class="card path-card" id="live-path" aria-label="Connection path" data-state="off" data-middle="none" data-up="0" data-down="0">
+      <div class="path-top"><span class="pill path-route" id="path-route">Not connected</span></div>
+      <div class="path-diagram">
+        <div class="path-tracks" aria-hidden="true">
+          <div class="path-lane up"><div class="path-packet"></div><div class="path-packet"></div><div class="path-packet"></div></div>
+          <div class="path-lane down"><div class="path-packet"></div><div class="path-packet"></div><div class="path-packet"></div></div>
+        </div>
+        <span class="path-direction path-direction-up" aria-hidden="true"></span>
+        <span class="path-direction path-direction-down" aria-hidden="true"></span>
+        <div class="path-node path-computer">
+          <div class="path-ring"><span class="ic" data-ic="computer"></span></div>
+          <b>This computer</b>
+        </div>
+        <div class="path-node path-middle" id="path-middle" aria-hidden="true">
+          <div class="path-ring"><span class="ic path-relay-icon" data-ic="relay"></span><span class="ic path-cloud-icon" data-ic="cloud"></span></div>
+          <b id="path-middle-label"></b><span class="path-host" id="path-middle-host"></span>
+        </div>
+        <div class="path-node path-destination">
+          <div class="path-ring"><span class="ic path-server-icon" data-ic="server"></span><span class="ic path-internet-icon" data-ic="internet"></span></div>
+          <b id="path-destination-label">Server</b><span class="path-host" id="path-server"></span>
+        </div>
+        <span class="path-rate path-rate-up"><span class="ar" aria-hidden="true">↑</span><span class="sr">Sending </span><span id="path-up">0 B/s</span></span>
+        <span class="path-rate path-rate-down"><span class="ar" aria-hidden="true">↓</span><span class="sr">Receiving </span><span id="path-down">0 B/s</span></span>
+      </div>
+      <p class="path-note" id="path-note"></p>
+    </section>
+    <div class="grid3">
+      <div class="card">
+        <div class="card-head"><h2>Route</h2><button class="btn small" id="test-routes" disabled>Test</button></div>
+        <div class="route-now"><span class="pill" id="route-pill">Auto</span><span class="big-num" id="route-ms">—</span></div>
+        <p class="muted small-text" id="route-note">Pipe picks the best route for you.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Mode</h2></div>
+        <div class="seg" id="home-mode" role="group" aria-label="Mode">
+          <button data-mode="smart">Smart</button><button data-mode="global">Global</button><button data-mode="direct">Direct</button>
+        </div>
+        <p class="muted small-text" id="mode-note"></p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Traffic</h2></div>
+        <div class="rates">
+          <div><span class="ar down">↓</span><b id="t-down">0 B/s</b></div>
+          <div><span class="ar up">↑</span><b id="t-up">0 B/s</b></div>
+        </div>
+        <canvas id="spark" height="46" aria-label="Traffic in the last minute" role="img"></canvas>
+        <p class="muted small-text" id="t-total">This session: 0 B down · 0 B up</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="page" id="page-routing" hidden>
+  <h1>Routing</h1>
+  <p class="muted lead">Every connection is decided in this order.</p>
+  <div class="chain" aria-label="Order of decisions">
+    <div class="chip"><b>1 · Rules</b><span>Your own exceptions</span></div><span class="arrow">→</span>
+    <div class="chip"><b>2 · Mode</b><span>Which sites use pipe</span></div><span class="arrow">→</span>
+    <div class="chip"><b>3 · Route</b><span>Which tunnel carries it</span></div>
+  </div>
+
+  <h2 class="sec">Mode</h2>
+  <div class="tiles t3" id="mode-tiles" role="radiogroup" aria-label="Mode"></div>
+
+  <div class="sec-head"><h2 class="sec">Route</h2><button class="btn small" id="test-routes2" disabled>Test routes</button></div>
+  <div class="tiles t4" id="tier-tiles" role="radiogroup" aria-label="Route"></div>
+
+  <h2 class="sec">Rules</h2>
+  <p class="muted">Rules are checked top to bottom before the mode. LAN is always direct.</p>
+  <p class="banner warn" id="rules-paused" hidden>Rules are paused in Direct mode.</p>
+  <div class="card flush">
+    <table class="rules" id="rules-table">
+      <thead><tr><th class="n">#</th><th>Type</th><th>Value</th><th>Action</th><th class="acts"><span class="sr">Actions</span></th></tr></thead>
+      <tbody id="rules-body"></tbody>
+    </table>
+    <div class="rules-empty muted" id="rules-empty">No rules yet. Add one below, for example send a streaming app direct.</div>
+    <form class="add-rule" id="add-rule" autocomplete="off">
+      <label class="sr" for="r-type">Rule type</label>
+      <select id="r-type"><option value="suffix">Domain suffix</option><option value="domain">Domain</option><option value="keyword">Keyword</option><option value="ip">IP / CIDR</option><option value="app">App</option></select>
+      <label class="sr" for="r-value">Value</label>
+      <input id="r-value" type="text" placeholder="example.com" spellcheck="false">
+      <label class="sr" for="r-action">Action</label>
+      <select id="r-action"><option value="proxy">Proxy</option><option value="direct">Direct</option><option value="block">Block</option></select>
+      <button class="btn primary" id="r-add" disabled>Add</button>
+    </form>
+    <p class="hint" id="r-hint" aria-live="polite"></p>
+  </div>
+</section>
+
+<section class="page" id="page-profiles" hidden>
+  <div class="sec-head top"><h1>Profiles</h1><button class="btn" id="test-profiles" hidden>Test all</button></div>
+  <p class="muted lead">A profile is one server. One link can be used on several devices.</p>
+  <section class="card flush profile-results" id="profile-results" aria-label="Profile comparison" hidden>
+    <table aria-label="Route latency by profile">
+      <thead><tr><th scope="col">Profile</th><th scope="col">Fast</th><th scope="col">Stealth</th><th scope="col">Rescue</th></tr></thead>
+      <tbody id="profile-test-rows"></tbody>
+    </table>
+  </section>
+  <div id="profile-list" class="plist"></div>
+  <div class="card add-profile">
+    <h2>Add profile</h2>
+    <label class="sr" for="add-link">Server link</label>
+    <textarea id="add-link" rows="3" placeholder="Paste a pipe:// link" spellcheck="false" autocomplete="off"></textarea>
+    <div class="row end"><button class="btn primary" id="add-preview" disabled>Preview</button></div>
+  </div>
+</section>
+
+<section class="page logs-page" id="page-logs" hidden>
+  <h1>Logs</h1>
+  <div class="toolbar">
+    <div class="seg" id="log-level" role="group" aria-label="Level">
+      <button data-l="0">Errors</button><button data-l="1">Warnings</button><button data-l="2">Info</button><button data-l="3">All</button>
+    </div>
+    <label class="sr" for="log-search">Search logs</label>
+    <input id="log-search" type="search" placeholder="Search" spellcheck="false">
+    <button class="btn small" id="log-pause">Pause</button>
+    <button class="btn small" id="log-copy">Copy</button>
+    <button class="btn small" id="log-clear">Clear</button>
+  </div>
+  <div class="logbox card flush" id="logbox" tabindex="0" role="log" aria-label="Log lines">
+    <div class="log-empty muted" id="log-empty">Nothing to show yet.</div>
+  </div>
+  <p class="muted small-text">Logs stay in memory only. They are never saved to disk.</p>
+</section>
+
+<section class="page" id="page-settings" hidden>
+  <h1>Settings</h1>
+  <div class="card group">
+    <h2>General</h2>
+    <label class="setting"><span><b>Start at login</b><small>Pipe starts in the background when you sign in.</small></span><input type="checkbox" class="sw" data-k="startAtLogin"></label>
+    <label class="setting"><span><b>Connect when Pipe starts</b><small>Connect straight away with your active profile.</small></span><input type="checkbox" class="sw" data-k="connectOnLaunch"></label>
+    <div class="setting"><span><b>Theme</b><small>Follow your system or pick one.</small></span>
+      <div class="seg" data-k="theme" role="group" aria-label="Theme"><button data-v="system">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
+  </div>
+  <div class="card group">
+    <h2>Network</h2>
+    <label class="setting"><span><b>Set system proxy when connected</b><small id="sp-note">Browsers and most apps then use Pipe automatically.</small></span><input type="checkbox" class="sw" data-k="systemProxy"></label>
+    <div class="setting"><span><b>Local proxy port</b><small>Apps can also use 127.0.0.1 on this port.</small></span><input type="number" id="s-port" min="1024" max="65535" aria-label="Local proxy port"></div>
+    <label class="setting"><span><b>IPv6</b><small>Used when your network supports it.</small></span><input type="checkbox" class="sw" data-k="ipv6"></label>
+  </div>
+  <div class="card group">
+    <h2>Logs</h2>
+    <div class="setting"><span><b>Log detail</b><small>“Every connection” lists each site and the route it took.</small></span>
+      <div class="seg" data-k="logDetail" role="group" aria-label="Log detail"><button data-v="normal">Normal</button><button data-v="connections">Every connection</button></div></div>
+  </div>
+  <div class="card group">
+    <h2>Advanced</h2>
+    <div class="setting"><span><b>Pipe Helper</b><small id="helper-note">Lets TUN start without asking for your password each time.</small></span>
+      <div class="row"><b id="helper-state">-</b><button class="btn small primary" id="helper-install" hidden>Install</button><button class="btn small" id="helper-remove" hidden>Remove</button></div></div>
+    <div class="setting col" id="cli-box" hidden><span><b>Full VPN (all apps)</b><small>To capture every app, run this in a terminal with administrator rights.</small></span>
+      <div class="code"><code id="cli-cmd">pipe run --tun</code><button class="btn small" id="copy-cli">Copy</button></div></div>
+    <div class="setting col"><span><b>Config folder</b></span><div class="code"><code id="cfg-dir">—</code></div></div>
+  </div>
+  <div class="card group">
+    <h2>About</h2>
+    <div class="about"><img src="logo.svg" alt="" width="40" height="40"><div><b>Pipe <span id="ab-ver"></span></b><div class="muted" id="ab-os"></div></div></div>
+  </div>
+</section>
+</main>
+</div>
+
+<dialog id="sheet" aria-labelledby="sheet-title">
+  <form method="dialog" id="sheet-form">
+    <h2 id="sheet-title"></h2>
+    <div id="sheet-body"></div>
+    <div class="row end" id="sheet-actions"></div>
+  </form>
+</dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="veil" id="veil" hidden><div class="card"><h2 id="veil-title"></h2><p class="muted" id="veil-text"></p></div></div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="20dp">
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:text="Per-app VPN" android:textSize="26sp" android:textStyle="bold"
+        android:textColor="@color/text" android:accessibilityHeading="true" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" android:textColor="@color/muted"
+        android:text="Choose which apps use pipe. Changes replace the tunnel for a moment." />
+
+    <CheckBox android:id="@+id/ipv6" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:minHeight="48dp"
+        android:layout_marginTop="8dp" android:textColor="@color/text" android:text="Enable IPv6" />
+
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:layout_marginTop="8dp" android:labelFor="@+id/per_app"
+        android:textColor="@color/muted" android:text="Apps that use pipe" />
+    <Spinner android:id="@+id/per_app" android:layout_width="match_parent"
+        android:layout_height="48dp" />
+    <EditText android:id="@+id/search_apps" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:minHeight="48dp" android:hint="Search apps"
+        android:textColor="@color/text" android:textColorHint="@color/muted"
+        android:imeOptions="actionDone" android:inputType="text" android:singleLine="true" />
+    <ListView android:id="@+id/apps" android:layout_width="match_parent"
+        android:layout_height="0dp" android:layout_weight="1" />
+
+    <Button android:id="@+id/save" android:layout_width="match_parent"
+        android:layout_height="52dp" android:layout_marginTop="8dp"
+        android:textAllCaps="false" android:textColor="@color/on_primary"
+        android:backgroundTint="@color/primary" android:text="Save settings" />
+</LinearLayout>

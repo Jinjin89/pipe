@@ -1,0 +1,12 @@
+{
+  "mode": "shared",
+  "domain": "203.0.113.7",
+  "fast_sni": "proxy.example.org",
+  "cdn_domain": "static.example.com",
+  "rescue_listen": "127.0.0.1:18080",
+  "reality_dest": "self",
+  "fast_hop": "20000-40000",
+  "proxy_domain": "proxy.example.org",
+  "proxy_cert_method": "auto",
+  "device": "phone"
+}

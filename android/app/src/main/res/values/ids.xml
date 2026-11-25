@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="status" type="id" />
+    <item name="detail" type="id" />
+    <item name="connect" type="id" />
+    <item name="server" type="id" />
+    <item name="error" type="id" />
+    <item name="smart" type="id" />
+    <item name="global" type="id" />
+    <item name="direct" type="id" />
+    <item name="test" type="id" />
+    <item name="import_profile" type="id" />
+    <item name="tab_home" type="id" />
+    <item name="tab_routing" type="id" />
+    <item name="tab_logs" type="id" />
+    <item name="tab_settings" type="id" />
+    <item name="mode_smart" type="id" />
+    <item name="mode_global" type="id" />
+    <item name="mode_direct" type="id" />
+    <item name="tier_auto" type="id" />
+    <item name="tier_fast" type="id" />
+    <item name="tier_stealth" type="id" />
+    <item name="tier_rescue" type="id" />
+    <item name="add_rule" type="id" />
+    <item name="open_apps" type="id" />
+    <item name="log_normal" type="id" />
+    <item name="log_connections" type="id" />
+</resources>

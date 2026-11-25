@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0F1115</color>
+    <color name="surface">#181B22</color>
+    <color name="surface2">#20242D</color>
+    <color name="text">#E7E9EF</color>
+    <color name="muted">#9BA3B1</color>
+    <color name="border">#2A2F3A</color>
+    <color name="primary">#818CF8</color>
+    <color name="primary_soft">#23274A</color>
+    <color name="on_primary">#11131A</color>
+    <color name="connected">#2DD4BF</color>
+    <color name="connected_soft">#12332F</color>
+    <color name="danger">#F87171</color>
+    <color name="danger_soft">#3A1E22</color>
+    <color name="warn">#FBBF24</color>
+    <color name="warn_soft">#3A2C12</color>
+    <color name="ripple">#33818CF8</color>
+</resources>
