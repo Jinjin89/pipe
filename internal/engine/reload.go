@@ -27,7 +27,7 @@ func registerInbound[T any](registry *inbound.Registry, reloads map[string]*relo
 			return nil, err
 		}
 		item := &reloadableInbound{
-			Adapter: inbound.NewAdapter(kind, tag), logger: logger, current: initial,
+			Adapter: inbound.NewAdapter(kind, tag), logger: logger, current: initial, options: &options,
 			create: func(options any) (adapter.Inbound, error) {
 				return create(ctx, router, logger, tag, *options.(*T))
 			},
@@ -46,6 +46,7 @@ type reloadableInbound struct {
 	parent  *adapter.Scope
 	scope   *adapter.Scope
 	current adapter.Inbound
+	options any
 	create  func(any) (adapter.Inbound, error)
 }
 
@@ -54,12 +55,17 @@ func (in *reloadableInbound) Start(stage adapter.StartStage, parent *adapter.Sco
 	defer in.mu.Unlock()
 	if stage == adapter.StartStateInitialize {
 		in.parent = parent
-		in.scope = adapter.NewScope(parent.Context(), in.logger)
+		if in.current != nil {
+			in.scope = adapter.NewScope(parent.Context(), in.logger)
+		}
 		parent.Add(func() error {
 			in.mu.Lock()
 			defer in.mu.Unlock()
-			return in.scope.Close()
+			return in.stop()
 		})
+	}
+	if in.scope == nil {
+		return nil
 	}
 	return in.scope.Start(in.Tag(), in.current, stage)
 }
@@ -75,9 +81,47 @@ func (in *reloadableInbound) InterfaceUpdated(ctx context.Context) {
 func (in *reloadableInbound) replace(next adapter.Inbound, options any) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if err := in.scope.Close(); err != nil {
+	in.options = options
+	if in.current == nil {
+		return nil
+	}
+	if err := in.stop(); err != nil {
 		return err
 	}
+	return in.start(next)
+}
+
+func (in *reloadableInbound) setEnabled(enabled bool) error {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if enabled == (in.current != nil) {
+		return nil
+	}
+	if !enabled {
+		return in.stop()
+	}
+	next, err := in.create(in.options)
+	if err != nil {
+		return err
+	}
+	if in.parent == nil {
+		in.current = next
+		return nil
+	}
+	return in.start(next)
+}
+
+func (in *reloadableInbound) stop() error {
+	in.current = nil
+	scope := in.scope
+	in.scope = nil
+	if scope == nil {
+		return nil
+	}
+	return scope.Close()
+}
+
+func (in *reloadableInbound) start(next adapter.Inbound) error {
 	ctx := in.parent.Context()
 	for delay := 25 * time.Millisecond; ; delay *= 2 {
 		scope := adapter.NewScope(ctx, in.logger)
@@ -98,11 +142,20 @@ func (in *reloadableInbound) replace(next adapter.Inbound, options any) error {
 		case <-time.After(delay):
 		}
 		// A failed Start may have set up part of the previous component.
-		next, err = in.create(options)
+		next, err = in.create(in.options)
 		if err != nil {
 			return err
 		}
 	}
+}
+
+// SetInboundEnabled opens or closes one server inbound within its existing router.
+func (i *Instance) SetInboundEnabled(tag string, enabled bool) error {
+	in := i.reloads[tag]
+	if in == nil {
+		return fmt.Errorf("unknown server listener %q", tag)
+	}
+	return in.setEnabled(enabled)
 }
 
 func (in *reloadableInbound) startReplacement(scope *adapter.Scope, next adapter.Inbound) error {

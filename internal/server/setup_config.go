@@ -7,197 +7,146 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
+	"net/netip"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"pipe/internal/localfile"
+	"pipe/templates"
 )
 
 const maxSetupConfigBytes = 64 << 10
 
-// setupConfigFile is the JSON form of SetupOptions. It holds file paths only,
-// never secrets, and unknown keys are rejected.
-type setupConfigFile struct {
-	Mode            string `json:"mode"`
-	Domain          string `json:"domain"`
-	FastSNI         string `json:"fast_sni"`
-	CDNDomain       string `json:"cdn_domain"`
-	RescueListen    string `json:"rescue_listen"`
-	RealityDest     string `json:"reality_dest"`
-	FastHop         string `json:"fast_hop"`
-	ProxyDomain     string `json:"proxy_domain"`
-	ProxyCertMethod string `json:"proxy_cert_method"`
-	ACMEListen      string `json:"acme_listen"`
-	DNS             string `json:"dns"`
-	DNSKeyFile      string `json:"dns_key_file"`
-	DNSTokenFile    string `json:"dns_token_file"`
-	Cert            string `json:"cert"`
-	Key             string `json:"key"`
-	Device          string `json:"device"`
-	Dir             string `json:"dir"`
+// SetupConfig is the operator's setup JSON. Certificate values are file paths.
+type SetupConfig struct {
+	IP      string            `json:"ip,omitempty"`
+	SNI     string            `json:"sni"`
+	Cert    *SetupCertificate `json:"cert,omitempty"`
+	Fast    SetupFast         `json:"fast,omitzero"`
+	Stealth SetupPort         `json:"stealth,omitzero"`
+	Proxy   *SetupPort        `json:"proxy,omitempty"`
+	Rescue  *SetupRescue      `json:"rescue,omitempty"`
+	Device  string            `json:"device,omitempty"`
 }
 
-// LoadSetupConfig reads a JSON setup file. Relative file paths are resolved
-// against the directory of the JSON file. Empty values mean not set.
+type SetupCertificate struct {
+	DNS       string `json:"dns,omitempty"`
+	TokenFile string `json:"token_file,omitempty"`
+	KeyFile   string `json:"key_file,omitempty"`
+	File      string `json:"file,omitempty"`
+	Key       string `json:"key,omitempty"`
+}
+
+type SetupFast struct {
+	Port uint16 `json:"port,omitempty"`
+	Hop  string `json:"hop,omitempty"`
+}
+
+type SetupPort struct {
+	Port uint16 `json:"port,omitempty"`
+}
+
+type SetupRescue struct {
+	SNI  string `json:"sni"`
+	Port uint16 `json:"port,omitempty"`
+	Cert string `json:"cert,omitempty"`
+	Key  string `json:"key,omitempty"`
+}
+
+// LoadSetupConfig reads the JSON before flag overrides. Paths in the file are
+// relative to the file's directory. A config file implies noninteractive setup.
 func LoadSetupConfig(path string) (SetupOptions, error) {
-	data, err := localfile.Read(path, maxSetupConfigBytes, false)
+	data, err := readSetupConfigInput(path)
 	if err != nil {
 		return SetupOptions{}, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return SetupOptions{}, fmt.Errorf("setup config %s: %w", path, err)
+	}
+	if raw == nil {
+		return SetupOptions{}, fmt.Errorf("setup config %s must contain a JSON object", path)
+	}
+	for key, value := range raw {
+		switch strings.ToLower(key) {
+		case "mode", "domain", "fast_sni", "cdn_domain", "proxy_domain", "proxy_cert_method",
+			"rescue_listen", "acme_listen", "reality_dest", "dir", "fast_port", "fast_hop",
+			"stealth_port", "proxy_port", "rescue_port", "rescue_cert", "rescue_key", "dns",
+			"dns_key_file", "dns_token_file", "key":
+			return SetupOptions{}, oldSetupFormat(path)
+		case "cert":
+			if bytes.HasPrefix(bytes.TrimSpace(value), []byte(`"`)) {
+				return SetupOptions{}, oldSetupFormat(path)
+			}
+		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
-	var raw map[string]json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
+	dec.DisallowUnknownFields()
+	var cfg SetupConfig
+	if err := dec.Decode(&cfg); err != nil {
 		return SetupOptions{}, fmt.Errorf("setup config %s: %w", path, err)
 	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return SetupOptions{}, fmt.Errorf("setup config %s: unexpected data after the JSON object", path)
-	}
-	// Keys that start with "_" are notes and are ignored, whatever their value.
-	for k := range raw {
-		if strings.HasPrefix(k, "_") {
-			delete(raw, k)
+	resolve := func(name string) string {
+		if name == "" || filepath.IsAbs(name) {
+			return name
 		}
+		return filepath.Join(filepath.Dir(path), name)
 	}
-	filtered, err := json.Marshal(raw)
+	if c := cfg.Cert; c != nil {
+		c.File, c.Key = resolve(c.File), resolve(c.Key)
+		c.TokenFile, c.KeyFile = resolve(c.TokenFile), resolve(c.KeyFile)
+	}
+	if r := cfg.Rescue; r != nil {
+		r.Cert, r.Key = resolve(r.Cert), resolve(r.Key)
+	}
+	return SetupOptions{SetupConfig: cfg, FromConfig: true, Yes: true}, nil
+}
+
+func readSetupConfigInput(path string) ([]byte, error) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return localfile.Read(path, maxSetupConfigBytes, false)
+	}
+	uid, _, found, err := lookupPipeUser()
 	if err != nil {
-		return SetupOptions{}, err
+		return nil, err
 	}
-	strict := json.NewDecoder(bytes.NewReader(filtered))
-	strict.DisallowUnknownFields()
-	var c setupConfigFile
-	if err := strict.Decode(&c); err != nil {
-		return SetupOptions{}, fmt.Errorf("setup config %s: %w", path, err)
+	if !found {
+		uid = ^uint32(0)
 	}
-	opts := SetupOptions{
-		Dir:             c.Dir,
-		Mode:            c.Mode,
-		Domain:          c.Domain,
-		FastSNI:         c.FastSNI,
-		CDNDomain:       c.CDNDomain,
-		RescueListen:    c.RescueListen,
-		RealityDest:     c.RealityDest,
-		FastHop:         c.FastHop,
-		ProxyDomain:     c.ProxyDomain,
-		ProxyCertMethod: c.ProxyCertMethod,
-		ACMEListen:      c.ACMEListen,
-		DNS:             c.DNS,
-		DNSKeyFile:      c.DNSKeyFile,
-		DNSTokenFile:    c.DNSTokenFile,
-		Cert:            c.Cert,
-		Key:             c.Key,
-		Device:          c.Device,
-	}
-	clearUnusedSetupFields(&opts)
-	base := filepath.Dir(path)
-	rel := func(p string) string {
-		if p == "" || filepath.IsAbs(p) {
-			return p
-		}
-		return filepath.Join(base, p)
-	}
-	opts.DNSKeyFile = rel(opts.DNSKeyFile)
-	opts.DNSTokenFile = rel(opts.DNSTokenFile)
-	opts.Cert = rel(opts.Cert)
-	opts.Key = rel(opts.Key)
-	return opts, nil
+	return readSetupOperatorFile(path, uid, maxSetupConfigBytes, false)
 }
 
-// clearUnusedSetupFields drops values that do not apply, so suggested
-// placeholders in a template are harmless.
-func clearUnusedSetupFields(o *SetupOptions) {
-	if o.Mode == string(Standalone) {
-		o.FastSNI, o.RescueListen, o.RealityDest = "", "", ""
-		o.ProxyDomain = ""
-	}
-	if o.ProxyDomain == "" {
-		o.ProxyCertMethod, o.ACMEListen, o.DNS, o.DNSKeyFile, o.DNSTokenFile, o.Cert, o.Key = "", "", "", "", "", "", ""
-		return
-	}
-	method := o.ProxyCertMethod
-	if method != "files" {
-		o.Cert, o.Key = "", ""
-	}
-	if method != "dns" {
-		o.DNS = ""
-	}
-	if method != "dns" || o.DNS != "alidns" {
-		o.DNSKeyFile = ""
-	}
-	if method != "dns" || o.DNS != "cloudflare" {
-		o.DNSTokenFile = ""
-	}
-	if method != "auto" && method != "nginx" {
-		o.ACMEListen = ""
-	}
+func oldSetupFormat(path string) error {
+	return fmt.Errorf("%s: this is the old setup format; run `pipe server setup --template > setup.json`", path)
 }
 
-// SetupTemplate renders a plain JSON setup file for the layout with suggested
-// values. Placeholders that do not apply are ignored by LoadSetupConfig.
-func SetupTemplate(layout DeployMode, det SetupDetection) []byte {
-	type kv struct{ k, v string }
-	fields := []kv{{"mode", string(layout)}}
-	if layout == Shared {
-		domain, rescue := "203.0.113.7", "172.17.0.1:18080"
-		if len(det.PublicIPs) > 0 {
-			domain = det.PublicIPs[0].String()
-		}
-		// User-defined br-* networks come before docker0.
-		if len(det.NetworkBridges) > 0 {
-			rescue = det.NetworkBridges[0].String() + ":18080"
-		} else if len(det.Bridges) > 0 {
-			rescue = det.Bridges[0].String() + ":18080"
-		}
-		fields = append(fields, []kv{
-			{"domain", domain},
-			{"fast_sni", "proxy.example.org"},
-			{"cdn_domain", "static.example.com"},
-			{"rescue_listen", rescue},
-			{"reality_dest", "self"},
-			{"fast_hop", "20000-40000"},
-			{"proxy_domain", "proxy.example.org"},
-			{"proxy_cert_method", "auto"},
-			{"dns", "alidns"},
-			{"dns_key_file", "/path/to/alidns.key"},
-			{"dns_token_file", "/path/to/cloudflare.token"},
-			{"cert", "/path/to/fullchain.pem"},
-			{"key", "/path/to/privkey.pem"},
-			{"device", "phone"},
-		}...)
-	} else {
-		fields = append(fields, []kv{
-			{"domain", "vpn.example.com"},
-			{"cdn_domain", "static.example.com"},
-			{"fast_hop", "20000-40000"},
-			{"device", "phone"},
-		}...)
+// SetupTemplateFor renders the single embedded template using the host's IP
+// and ports. When probing is inconclusive, show the dedicated-port example.
+// Migration notes go to env.Out when it is set.
+func SetupTemplateFor(env SetupEnv, dir string) ([]byte, error) {
+	if dir == "" {
+		dir = setupStateDir
 	}
-	str := func(v string) []byte {
-		var vb bytes.Buffer
-		enc := json.NewEncoder(&vb)
-		enc.SetEscapeHTML(false)
-		_ = enc.Encode(v)
-		return bytes.TrimSpace(vb.Bytes())
+	var cfg SetupConfig
+	if err := json.Unmarshal(templates.Setup, &cfg); err != nil {
+		return nil, err
 	}
-	var b bytes.Buffer
-	b.WriteString("{\n")
-	for i, f := range fields {
-		sep := ","
-		if i == len(fields)-1 {
-			sep = ""
+	if _, err := os.Lstat(env.path(filepath.Join(dir, settingsFile))); err == nil {
+		r := setupRun{SetupEnv: env, opts: SetupOptions{Dir: dir}}
+		saved, err := r.readSetupSettings()
+		if err != nil {
+			return nil, err
 		}
-		fmt.Fprintf(&b, "  %s: %s%s\n", str(f.k), str(f.v), sep)
+		return renderSetupConfig(env.savedSetupConfig(saved, cfg))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
-	b.WriteString("}\n")
-	return b.Bytes()
-}
-
-// SetupTemplateFor detects the host and renders a template. It changes
-// nothing and needs no root. An empty or auto layout uses the suggestion.
-func SetupTemplateFor(env SetupEnv, layout DeployMode) ([]byte, error) {
 	var d SetupDetection
 	if env.Interfaces != nil {
 		ifaces, err := env.Interfaces()
@@ -206,31 +155,119 @@ func SetupTemplateFor(env SetupEnv, layout DeployMode) ([]byte, error) {
 		}
 		d = detectInterfaces(ifaces)
 	}
-	if env.PortProbe != nil {
-		for _, port := range []int{80, 443} {
-			busy, unknown := env.PortProbe(port)
-			d.PortsUnknown = d.PortsUnknown || unknown
-			if port == 80 {
-				d.Port80Busy = busy
-			} else {
-				d.Port443Busy = busy
-			}
-		}
-	} else {
+	if env.PortProbe == nil {
 		d.PortsUnknown = true
+	} else {
+		var unknown80, unknown443 bool
+		d.Port80Busy, unknown80 = env.PortProbe(80)
+		d.Port443Busy, unknown443 = env.PortProbe(443)
+		d.PortsUnknown = unknown80 || unknown443
 	}
-	switch layout {
-	case "", Auto:
-		layout = d.suggestedMode()
-	case Standalone, Shared:
-	default:
-		return nil, errors.New("--mode must be standalone or shared")
+	cfg.IP = ""
+	if len(d.PublicIPs) != 0 {
+		cfg.IP = d.PublicIPs[0].String()
 	}
-	return SetupTemplate(layout, d), nil
+	if d.suggestedMode() == Standalone && !d.PortsUnknown {
+		cfg.Stealth.Port, cfg.Proxy.Port, cfg.Rescue.Port = 443, 443, 443
+		cfg.Cert = nil
+		cfg.Rescue.Cert, cfg.Rescue.Key = "", ""
+	} else if !d.Port80Busy && !d.PortsUnknown {
+		cfg.Cert = nil // HTTP-01 is available even when TCP 443 is occupied.
+	}
+	return renderSetupConfig(cfg)
 }
 
-// setupPortProbe reports whether a TCP port is in use. Missing permission
-// to bind makes the answer unknown.
+func renderSetupConfig(cfg SetupConfig) ([]byte, error) {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func savedSetupSNI(s Settings) string {
+	if cfg := s.HTTPSProxyListener; cfg != nil {
+		return cfg.Domain
+	}
+	if s.LastProxyDomain != "" {
+		return s.LastProxyDomain
+	}
+	if s.RealityDest == realitySelf && s.RealitySNI != "" {
+		return s.RealitySNI
+	}
+	return s.fastName()
+}
+
+func (env SetupEnv) savedSetupConfig(s Settings, example SetupConfig) SetupConfig {
+	cfg := SetupConfig{SNI: savedSetupSNI(s), Fast: env.savedSetupFast(s),
+		Stealth: SetupPort{Port: s.stealthPort()}}
+	if ip, err := netip.ParseAddr(s.Domain); err == nil {
+		cfg.IP = ip.String()
+	}
+	if proxy := s.HTTPSProxyListener; proxy != nil {
+		cfg.Proxy = &SetupPort{Port: proxy.Port}
+		if proxy.retired() {
+			cfg.Cert = example.Cert
+		}
+	} else if s.proxyEnabled() {
+		cfg.Proxy = &SetupPort{Port: s.stealthPort()}
+	}
+	if s.CDNDomain != "" {
+		cfg.Rescue = &SetupRescue{SNI: s.CDNDomain, Port: s.rescuePort()}
+		if s.Mode == Shared && cfg.Rescue.Port == 0 {
+			cfg.Rescue.Port, cfg.Rescue.Cert, cfg.Rescue.Key = DefaultRescuePort, example.Rescue.Cert, example.Rescue.Key
+		}
+	}
+	return cfg
+}
+
+func (env SetupEnv) savedSetupFast(saved Settings) SetupFast {
+	// A Fast port by itself can become a hopping target when setup reads the
+	// range from an installed unit. Only emit an authorized pair.
+	if saved.FastHop == "" {
+		return SetupFast{}
+	}
+	lookup := env.LookupPipeUser
+	if lookup == nil {
+		lookup = lookupPipeUser
+	}
+	uid, _, found, err := lookup()
+	if err == nil {
+		if !found {
+			uid = ^uint32(0)
+		}
+		path := env.path(filepath.Join(setupUnitDir, hopServiceUnit))
+		if fast, err := readInstalledSetupHop(path, uid); err == nil && fast.checkSaved(saved) == nil {
+			return fast
+		}
+	}
+	if env.Out != nil {
+		fmt.Fprintln(env.Out, "Fast hopping needs operator confirmation. Add the intended fast.hop and fast.port to the JSON or pass --fast-hop and --fast-port.")
+	}
+	return SetupFast{}
+}
+
+func (r *setupRun) printRetiredSetup(saved Settings, rescue, proxy bool) error {
+	if rescue {
+		r.printf("Rescue will be off after restart. Replace its retired listener with a rescue section containing the certificate and key.\n")
+	}
+	if proxy {
+		r.printf("The HTTPS proxy will be off after restart. Stealth will also be off until the proxy uses a supported certificate method. Replace the retired method with cert and proxy sections.\n")
+	}
+	var example SetupConfig
+	if err := json.Unmarshal(templates.Setup, &example); err != nil {
+		return err
+	}
+	data, err := renderSetupConfig(r.savedSetupConfig(saved, example))
+	if err != nil {
+		return err
+	}
+	r.printf("Fill in the credential paths in this setup file, then run pipe server setup --config setup.json with the same --dir.\n%s", data)
+	return nil
+}
+
+// setupPortProbe reports whether a TCP port is in use, including a loopback
+// probe when a non-root template command lacks permission to bind it.
 func setupPortProbe(port int) (busy, unknown bool) {
 	for _, e := range []struct{ network, host string }{{"tcp4", "0.0.0.0"}, {"tcp6", "::"}} {
 		l, err := net.Listen(e.network, net.JoinHostPort(e.host, strconv.Itoa(port)))
@@ -241,6 +278,15 @@ func setupPortProbe(port int) (busy, unknown bool) {
 			return true, false
 		case errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM):
 			unknown = true
+		}
+	}
+	if unknown {
+		for _, host := range []string{"127.0.0.1", "::1"} {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 200*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return true, false
+			}
 		}
 	}
 	return false, unknown

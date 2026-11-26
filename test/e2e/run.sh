@@ -37,6 +37,8 @@ named_port=18448
 unusable_ipv6=2001:db8::80
 client_ipv6=2001:db8:1::2
 scenario=${1:-standalone}
+setup_uid=65530
+setup_gid=65530
 
 fail() {
   printf 'FAIL %s\n' "$1" >&2
@@ -88,7 +90,7 @@ trap 'fail "$check (line $LINENO)"' ERR
 
 [[ $EUID == 0 ]] || fail 'root is required for the isolated network namespaces'
 [[ $# -le 1 && ($scenario == standalone || $scenario == shared || $scenario == relay) ]] || fail 'usage: run.sh [standalone|shared|relay]'
-for tool in ip tc nft curl python3 grep tail; do
+for tool in ip tc nft curl python3 grep tail unshare mount install; do
   command -v "$tool" >/dev/null || fail "missing $tool"
 done
 umask 077
@@ -136,9 +138,11 @@ WAIT_FOR_LOG
 start_client() {
   local profile=$1 tier=$2 mode=${3:-global} client_log=$work_dir/client.log
   local -a address=(--test-address "$server_addr")
+  client_run_ns=$client_ns
+  if [[ $scenario == shared && $tier == rescue ]]; then client_run_ns=$server_ns; fi
   if [[ $scenario == relay ]]; then address=(); fi
   : > "$client_log"
-  ip netns exec "$client_ns" "$bin" run "$profile" --mode "$mode" --tier "$tier" \
+  ip netns exec "$client_run_ns" "$bin" run "$profile" --mode "$mode" --tier "$tier" \
     --listen "127.0.0.1:$mixed_port" --test-ca "$work_dir/ca" "${address[@]}" \
     --profile-dir "$work_dir/profiles" "${@:4}" \
     >> "$client_log" 2>&1 &
@@ -148,7 +152,7 @@ start_client() {
   local deadline=$((SECONDS + 3))
   while ((SECONDS < deadline)); do
     kill -0 "$client_pid" 2>/dev/null || fail "$check (client exited during startup)"
-    if ip netns exec "$client_ns" python3 -c \
+    if ip netns exec "$client_run_ns" python3 -c \
       'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2).close()' \
       "$mixed_port" >/dev/null 2>&1; then
       kill -0 "$client_pid" 2>/dev/null || fail "$check (client exited during startup)"
@@ -165,7 +169,7 @@ stop_client() {
 }
 
 proxied_curl() {
-  ip netns exec "$client_ns" curl --noproxy '' --proxy "socks5h://127.0.0.1:$mixed_port" \
+  ip netns exec "$client_run_ns" curl --noproxy '' --proxy "socks5h://127.0.0.1:$mixed_port" \
     --connect-timeout 4 --fail --silent --show-error "$@"
 }
 
@@ -187,6 +191,47 @@ check_cover_page() {
     grep -Fq "<h1>$title</h1>" "$page" &&
     grep -Fq '<style>' "$page" &&
     ! grep -Eiq 'pipe|proxy|vpn|sing-box' "$page"
+}
+
+# Run the real setup command with fixture-only system directories and service tools.
+# The test drives the service explicitly later, inside the server network namespace.
+setup_in_fixture() {
+  local config=$1 hosts=$2 state=$3 system=$work_dir/setup-system
+  mkdir -p "$system"/{bin,units,sysctl,commands}
+  chmod 0711 "$work_dir"
+  chmod 0755 "$system/bin"
+  install -m 0755 "$bin" "$system/setup-pipe"
+  printf 'root:x:0:0:root:/root:/bin/sh\npipe:x:%s:%s:Pipe:/var/lib/pipe:/bin/false\n' \
+    "$setup_uid" "$setup_gid" > "$system/passwd"
+  printf 'root:x:0:\npipe:x:%s:\n' "$setup_gid" > "$system/group"
+  chmod 0644 "$system/passwd" "$system/group" "$hosts"
+  cat > "$system/commands/systemctl" <<'SH'
+#!/bin/sh
+case "$*" in
+  'daemon-reload'|'enable --now pipe-hop'|'enable pipe-hop'|'restart pipe-hop'|'enable pipe'|'restart pipe') exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$system/commands/sysctl" <<'SH'
+#!/bin/sh
+[ "$*" = '-p /etc/sysctl.d/90-pipe.conf' ] && [ -s /etc/sysctl.d/90-pipe.conf ]
+SH
+  printf '#!/bin/sh\nexit 1\n' > "$system/commands/useradd"
+  chmod 0755 "$system/commands/"{systemctl,sysctl,useradd}
+  ip netns exec "$server_ns" unshare --mount --propagation private -- bash -c '
+    set -euo pipefail
+    system=$1
+    hosts=$2
+    shift 2
+    mount --bind "$system/bin" /usr/local/bin
+    mount --bind "$system/units" /etc/systemd/system
+    mount --bind "$system/sysctl" /etc/sysctl.d
+    mount --bind "$system/passwd" /etc/passwd
+    mount --bind "$system/group" /etc/group
+    mount --bind "$hosts" /etc/hosts
+    export PATH="$system/commands:/usr/bin:/bin:/usr/sbin:/sbin"
+    exec "$@"
+  ' setup-fixture "$system" "$hosts" "$system/setup-pipe" server setup --config "$config" --dir "$state"
 }
 
 check='isolated topology'
@@ -249,7 +294,34 @@ if [[ $scenario == shared || $scenario == relay ]]; then
   exit 0
 fi
 
-"$bin" server init --mode standalone --dir "$work_dir/state" --domain "$origin" --cdn-domain "$cdn" >/dev/null
+# Exercise Cloudflare ingress with a published source address inside the fixture.
+# The original private address remains available for direct-peer checks.
+cf_client_addr=198.41.128.10
+ip -n "$client_ns" addr add "$cf_client_addr/32" dev veth-cli
+ip -n "$server_ns" route add "$cf_client_addr/32" dev veth-srv
+ip -n "$client_ns" route add "$server_addr/32" dev veth-cli src "$cf_client_addr"
+
+check='standalone JSON setup uses free ports and preserves devices when enabling optional services'
+printf '127.0.0.1 localhost\n' > "$work_dir/setup-hosts"
+printf '{"sni":"%s","device":"setup-fixture"}\n' "$origin" > "$work_dir/setup.json"
+setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" > "$work_dir/setup.out"
+grep -Fq 'TCP 80 and 443 are free, so Pipe uses the standalone layout' "$work_dir/setup.out"
+cp "$work_dir/state/devices.json" "$work_dir/setup-devices.json"
+cat > "$work_dir/setup.json" <<JSON
+{
+  "sni": "$origin",
+  "proxy": {},
+  "rescue": { "sni": "$cdn" },
+  "device": "setup-fixture"
+}
+JSON
+setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" > "$work_dir/setup.out"
+grep -Fq 'Its existing link stays valid' "$work_dir/setup.out"
+cmp "$work_dir/setup-devices.json" "$work_dir/state/devices.json"
+"$bin" server revoke setup-fixture --dir "$work_dir/state" >/dev/null
+pass "$check"
+
+check='standalone server runs from setup state'
 "$bin" server add main --dir "$work_dir/state" --test-ports > "$work_dir/main.link"
 "$bin" server add revoke-me --dir "$work_dir/state" --test-ports > "$work_dir/revoke.link"
 IFS= read -r main_link < "$work_dir/main.link"
@@ -316,14 +388,53 @@ ip -n "$client_ns" addr del "$client_ipv6/64" dev veth-cli
 ip -n "$client_ns" route del default via "$server_addr"
 pass "$check"
 
-check='REALITY authentication also accepts the CDN SNI'
+check='REALITY authentication accepts the CDN SNI from a Cloudflare source'
 cdn_sni_link=${main_link/"@$origin:"/"@$cdn:"}
 start_client "$cdn_sni_link" stealth
 check_target
 stop_client
 pass "$check"
 
-check='standalone HTTPS serves a stable cover over HTTP/1.1 and HTTP/2'
+check='standalone direct peers see the main site and receive no Rescue certificate'
+ip netns exec "$client_ns" python3 - "$client_addr" "$server_addr" "$https_port" "$origin" "$cdn" <<'PY'
+import socket
+import ssl
+import sys
+
+source, target, port, origin, cdn = sys.argv[1:]
+context = ssl._create_unverified_context()
+context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+def dial(name, session=None):
+    sock = socket.create_connection((target, int(port)), timeout=3, source_address=(source, 0))
+    try:
+        return context.wrap_socket(sock, server_hostname=name, session=session)
+    except BaseException:
+        sock.close()
+        raise
+
+with dial(origin) as tls:
+    session = tls.session
+    assert session.has_ticket
+with dial(origin, session) as tls:
+    assert tls.session_reused
+for name in [None, target, "unknown.pipe.test", cdn]:
+    for ticket in [None, session]:
+        try:
+            with dial(name, ticket):
+                raise AssertionError(f"unexpected TLS handshake for {name!r}")
+        except (ssl.SSLError, ConnectionResetError):
+            pass
+PY
+for name in "$cdn" unknown.pipe.test; do
+  response=$(ip netns exec "$client_ns" curl --noproxy '*' --silent --interface "$client_addr" \
+    --resolve "$name:18080:$server_addr" --output /dev/null --write-out '%{http_code} %{redirect_url}' \
+    "http://$name:18080/")
+  [[ $response == '404 ' ]]
+done
+pass "$check"
+
+check='standalone HTTPS selects a stable cover by SNI over HTTP/1.1 and HTTP/2'
 for domain in "$origin" "$cdn"; do
   ip netns exec "$client_ns" curl --http1.1 --noproxy '*' --fail --silent --show-error --max-time 8 \
     --cacert "$work_dir/ca/ca.pem" --resolve "$domain:$https_port:$server_addr" \
@@ -331,7 +442,13 @@ for domain in "$origin" "$cdn"; do
 done
 standalone_cover="$work_dir/decoy-$origin.html"
 check_cover_page "$standalone_cover"
-cmp "$standalone_cover" "$work_dir/decoy-$cdn.html"
+rescue_cover="$work_dir/decoy-$cdn.html"
+check_cover_page "$rescue_cover"
+if cmp -s "$standalone_cover" "$rescue_cover"; then fail "$check (same cover)"; fi
+ip netns exec "$client_ns" curl --http1.1 --noproxy '*' --fail --silent --show-error --max-time 8 \
+  --cacert "$work_dir/ca/ca.pem" --resolve "$origin:$https_port:$server_addr" \
+  -H "Host: $cdn" "https://$origin:$https_port/" > "$work_dir/decoy-host.html"
+cmp "$standalone_cover" "$work_dir/decoy-host.html"
 version=$(ip netns exec "$client_ns" curl --http2 --noproxy '*' --fail --silent --show-error --max-time 8 \
   --cacert "$work_dir/ca/ca.pem" --resolve "$origin:$https_port:$server_addr" \
   --output "$work_dir/decoy-h2.html" --write-out '%{http_version}' "https://$origin:$https_port/")
@@ -339,14 +456,29 @@ version=$(ip netns exec "$client_ns" curl --http2 --noproxy '*' --fail --silent 
 cmp "$standalone_cover" "$work_dir/decoy-h2.html"
 pass "$check"
 
-check='standalone HTTP/3 serves the same cover with a valid certificate'
+check='standalone Fast presents only its own certificate and always serves the main cover'
 ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
   "https://$origin:$https_port/" "$work_dir/ca/ca.pem" > "$work_dir/decoy-h3.html"
 cmp "$standalone_cover" "$work_dir/decoy-h3.html"
+if ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
+  "https://$cdn:$https_port/" "$work_dir/ca/ca.pem" >/dev/null 2>&1; then
+  fail "$check (CDN SNI succeeded)"
+fi
+ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
+  "https://$origin:$https_port/" "$work_dir/ca/ca.pem" "$cdn" > "$work_dir/decoy-host-h3.html"
+cmp "$standalone_cover" "$work_dir/decoy-host-h3.html"
 pass "$check"
 
 source "$repo_dir/test/e2e/https-proxy.sh"
 check_https_proxy
+
+check='standalone HTTPS proxy credentials work only on the main TLS name'
+cdn_proxy=${main_proxy/"@$origin:"/"@$cdn:"}
+if https_curl "$cdn_proxy" --resolve "$cdn:$https_port:$server_addr" --fail \
+  "https://$target_addr:$tls_target_port/" >/dev/null 2>&1; then
+  fail "$check"
+fi
+pass "$check"
 
 check='server denies loopback destinations'
 mkdir "$work_dir/profiles"

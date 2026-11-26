@@ -278,25 +278,21 @@ func TestPurgeWithYesSkipsPrompt(t *testing.T) {
 	}
 }
 
-func TestInstallSkipsHopWithoutRoot(t *testing.T) {
+func TestInstallOnlyReportsHopping(t *testing.T) {
 	dir := initProxyTestState(t)
 	settings, err := ReadSettings(dir)
 	must(t, err)
 	settings.FastHop = "20000-20010"
 	must(t, writeJSON(dir, settingsFile, settings))
-	oldEUID, oldApply := installEUID, installApplyHop
-	defer func() { installEUID, installApplyHop = oldEUID, oldApply }()
-	applied := 0
-	installApplyHop = func(context.Context, string, uint16) error { applied++; return nil }
-	for _, test := range []struct {
-		euid, applied int
-		hint          bool
-	}{{1000, 0, true}, {0, 1, false}} {
-		applied = 0
-		installEUID = func() int { return test.euid }
+	t.Setenv("PATH", t.TempDir()) // An installer that invokes nft must fail.
+	oldEUID := installEUID
+	defer func() { installEUID = oldEUID }()
+	for _, euid := range []int{1000, 0} {
+		installEUID = func() int { return euid }
 		_, hints, err := Install(t.Context(), dir, "/usr/local/bin/pipe", "", nil)
-		if err != nil || applied != test.applied || strings.Contains(strings.Join(hints, "\n"), "applied by pipe-hop.service") != test.hint {
-			t.Fatalf("euid %d: applied=%d hints=%v err=%v", test.euid, applied, hints, err)
+		must(t, err)
+		if !strings.Contains(strings.Join(hints, "\n"), "supply --fast-hop and --fast-port") {
+			t.Fatalf("euid %d did not get explicit hop setup instructions: %v", euid, hints)
 		}
 	}
 }

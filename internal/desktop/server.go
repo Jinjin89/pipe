@@ -730,11 +730,11 @@ func (s *Server) previewProfile(r *http.Request) (any, error) {
 	if err := readJSON(r, &body); err != nil {
 		return nil, err
 	}
-	_, info, err := Preview(body.Link)
+	profile, info, err := Preview(body.Link)
 	if err != nil {
 		return nil, bad(err.Error())
 	}
-	return map[string]any{"name": info.Name, "server": info.Server, "routes": info.Routes,
+	return map[string]any{"name": info.Name, "server": info.Server, "cdn": profile.CDNEndpoint(), "routes": info.Routes,
 		"fingerprint": info.Fingerprint, "exists": s.profiles.Exists(info.Name)}, nil
 }
 

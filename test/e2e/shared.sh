@@ -4,65 +4,102 @@
 check='shared preserves an existing web server and installs Fast port hopping'
 https_port=443
 stealth_port=8443
-rescue_port=10001
-cdn=static.website.pipe.test
+rescue_port=2053
+website_domain=static.website.pipe.test
+cdn=rescue.edge.pipe.test
 proxy_domain=gate.other.test
 proxy_port=9443
 tls_target_port=18447
 state=$work_dir/state
 profile_host=$server_addr
 if [[ $scenario == relay ]]; then profile_host=$relay_target; fi
-website_pin=$("$fixture" cert "$work_dir/ca" "$cdn")
-rescue_address="127.0.0.1:$rescue_port"
+website_pin=$("$fixture" cert "$work_dir/ca" "$website_domain")
+rescue_pin=$("$fixture" cert "$work_dir/ca" "$cdn")
 : > "$work_dir/web.log"
 ip netns exec "$server_ns" "$fixture" serve --listen "$server_addr:443" --http "$server_addr:80" \
-  --ca "$work_dir/ca" --host "$cdn" --body 'existing website' --state "$state/server.json" \
-  --rescue "$rescue_address" >> "$work_dir/web.log" 2>&1 &
+  --ca "$work_dir/ca" --host "$website_domain" --body 'existing website' >> "$work_dir/web.log" 2>&1 &
 web_pid=$!
 wait_for_log "$web_pid" "$work_dir/web.log" 'TLS fixture ready' 8
-
-ip netns exec "$server_ns" "$bin" server init --mode auto --dir "$state" --domain "$profile_host" --fast-sni "$origin" \
-  --cdn-domain "$cdn" --rescue-listen "$rescue_address" --fast-hop 25000-25003 > "$work_dir/init.out"
 
 proxy_pin=$("$fixture" cert "$work_dir/ca" "$proxy_domain")
 [[ $website_pin != "$proxy_pin" ]]
 "$fixture" cert "$work_dir/ca" "$target_addr" >/dev/null
 printf '127.0.0.1 localhost\n%s %s\n' "$server_addr" "$proxy_domain" > "$work_dir/proxy-hosts"
-# Map the proxy name only within this fixture command's private mount namespace.
-ip netns exec "$server_ns" unshare --mount --propagation private -- bash -c '
-  mount --bind "$1" /etc/hosts
-  shift
-  exec "$@"
-' shared-proxy "$work_dir/proxy-hosts" "$bin" server proxy enable --dir "$state" --domain "$proxy_domain" \
-  --cert "$work_dir/ca/$proxy_domain.pem" --key "$work_dir/ca/$proxy_domain-key.pem" > "$work_dir/proxy-enable.out"
-grep -Fq "Open TCP $proxy_port" "$work_dir/proxy-enable.out"
-grep -Fq 'Restart pipe server run' "$work_dir/proxy-enable.out"
+if [[ $scenario == shared ]]; then
+  check='shared JSON setup uses dedicated ports beside the existing website'
+  mkdir "$work_dir/proxy-pem"
+  install -m 0400 -o "$setup_uid" -g "$setup_gid" "$work_dir/ca/$proxy_domain.pem" "$work_dir/proxy-pem/cert.pem"
+  install -m 0400 -o "$setup_uid" -g "$setup_gid" "$work_dir/ca/$proxy_domain-key.pem" "$work_dir/proxy-pem/key.pem"
+  chown "$setup_uid:$setup_gid" "$work_dir/proxy-pem"
+  cat > "$work_dir/setup.json" <<JSON
+{
+  "ip": "$profile_host",
+  "sni": "$proxy_domain",
+  "cert": { "file": "proxy-pem/cert.pem", "key": "proxy-pem/key.pem" },
+  "fast": { "port": $https_port, "hop": "25000-25003" },
+  "stealth": { "port": $stealth_port },
+  "proxy": { "port": $proxy_port },
+  "rescue": { "sni": "$cdn", "port": $rescue_port, "cert": "ca/$cdn.pem", "key": "ca/$cdn-key.pem" },
+  "device": "main"
+}
+JSON
+  setup_in_fixture "$work_dir/setup.json" "$work_dir/proxy-hosts" "$state" > "$work_dir/setup.out"
+  grep -Fq 'TCP 80 and 443 are in use, so Pipe uses the shared layout' "$work_dir/setup.out"
+  grep -Fq "Open TCP $proxy_port" "$work_dir/setup.out"
+  sed -n -e '/^pipe:\/\//p' -e '/^export https_proxy=/p' "$work_dir/setup.out" > "$work_dir/main.link"
+  pass "$check"
+  check='shared preserves an existing web server and installs Fast port hopping'
+else
+  ip netns exec "$server_ns" "$bin" server init --mode auto --dir "$state" --domain "$profile_host" --proxy-domain "$proxy_domain" \
+    --cdn-domain "$cdn" --rescue-port "$rescue_port" --rescue-cert "$work_dir/ca/$cdn.pem" \
+    --rescue-key "$work_dir/ca/$cdn-key.pem" --fast-hop 25000-25003 > "$work_dir/init.out"
+  # Map the proxy name only within this fixture command's private mount namespace.
+  ip netns exec "$server_ns" unshare --mount --propagation private -- bash -c '
+    mount --bind "$1" /etc/hosts
+    shift
+    exec "$@"
+  ' shared-proxy "$work_dir/proxy-hosts" "$bin" server proxy enable --dir "$state" --domain "$proxy_domain" \
+    --cert-method files --cert "$work_dir/ca/$proxy_domain.pem" --key "$work_dir/ca/$proxy_domain-key.pem" > "$work_dir/proxy-enable.out"
+  grep -Fq "Open TCP $proxy_port" "$work_dir/proxy-enable.out"
+  grep -Fq 'Restart pipe server run' "$work_dir/proxy-enable.out"
+  "$bin" server add main --dir "$state" > "$work_dir/main.link"
+fi
 : > "$work_dir/smart-target.log"
 ip netns exec "$server_ns" "$fixture" serve --listen "$target_addr:$tls_target_port" \
   --ca "$work_dir/ca" --host "$target_addr" --body 'pipe HTTPS target' >> "$work_dir/smart-target.log" 2>&1 &
 smart_target_pid=$!
 wait_for_log "$smart_target_pid" "$work_dir/smart-target.log" 'TLS fixture ready' 8
 
+# Even a read of installed units must see a fixture directory.
+shared_uninstall() {
+  ip netns exec "$server_ns" unshare --mount --propagation private -- bash -c '
+    mount --bind "$1" /etc/systemd/system
+    shift
+    exec "$@"
+  ' shared-uninstall "$work_dir/units" "$bin" server uninstall --dir "$state"
+}
+
 if [[ $scenario == shared ]]; then
+  # In-namespace Rescue clients dial the server's private address with a loopback source.
+  ip -n "$server_ns" route replace table local local "$server_addr/32" dev lo src 127.0.0.1
+  mkdir "$work_dir/units"
   ip netns exec "$server_ns" nft add table inet pipe_fixture
   for _ in 1 2; do
     ip netns exec "$server_ns" "$bin" server install --mode auto --dir "$state" > "$work_dir/install.out"
     grep -Fq 'Saved deployment mode shared.' "$work_dir/install.out"
     grep -Fq "Allow TCP $proxy_port for the HTTPS proxy" "$work_dir/install.out"
+    grep -Fq "Allow TCP $rescue_port for Rescue" "$work_dir/install.out"
   done
-  ip netns exec "$server_ns" "$bin" server uninstall --dir "$state"
+  shared_uninstall
 fi
 ip netns exec "$server_ns" "$bin" server hop-apply --fast-hop 25000-25003 --fast-port 443
 ip netns exec "$server_ns" nft list table inet pipe > "$work_dir/hop.nft"
 grep -Fq 'udp dport 25000-25003 redirect to :443' "$work_dir/hop.nft"
-"$bin" server add main --dir "$state" > "$work_dir/main.link"
-"$bin" server add revoke-me --dir "$state" > "$work_dir/revoke.link"
 IFS= read -r main_link < "$work_dir/main.link"
-IFS= read -r revoked_link < "$work_dir/revoke.link"
 main_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' "$work_dir/main.link")
-revoked_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' "$work_dir/revoke.link")
-[[ $main_link == pipe://*@"$profile_host"\?* && $main_link == *"fsni=$origin"* ]]
-[[ $main_proxy == https://main:*@"$proxy_domain:$proxy_port" && $revoked_proxy == https://revoke-me:*@"$proxy_domain:$proxy_port" ]]
+[[ $main_link == pipe://*@"$profile_host"\?* && $main_link == *"fsni=$proxy_domain"* ]]
+[[ $main_link == *"cdn=$cdn%3A$rescue_port"* ]]
+[[ $main_proxy == https://main:*@"$proxy_domain:$proxy_port" ]]
 [[ $("$bin" server proxy export main --dir "$state") == "export https_proxy=$main_proxy http_proxy=$main_proxy" ]]
 ws_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_path"])' "$state/server.json")
 
@@ -73,6 +110,7 @@ server_pid=$!
 wait_for_log "$server_pid" "$work_dir/server.log" \
   "Server listening on $server_addr:443 (UDP Fast) and $server_addr:8443 (TCP Stealth)" 8
 wait_for_log "$server_pid" "$work_dir/server.log" "HTTPS proxy listening on $server_addr:$proxy_port" 8
+wait_for_log "$server_pid" "$work_dir/server.log" "Rescue listening on $server_addr:$rescue_port" 8
 pass "$check"
 
 if [[ $scenario == relay ]]; then
@@ -120,7 +158,7 @@ if ip netns exec "$client_ns" curl --noproxy '*' --silent --insecure --max-time 
   fail "$check (bare-IP TLS handshake succeeded)"
 fi
 if ip netns exec "$client_ns" curl --noproxy '*' --silent --insecure --max-time 5 \
-  --resolve "$cdn:$proxy_port:$server_addr" "https://$cdn:$proxy_port/" >/dev/null; then
+  --resolve "$website_domain:$proxy_port:$server_addr" "https://$website_domain:$proxy_port/" >/dev/null; then
   fail "$check (website SNI was accepted on the proxy port)"
 fi
 pass "$check"
@@ -129,9 +167,10 @@ source "$repo_dir/test/e2e/https-proxy.sh"
 origin=$proxy_domain https_port=$proxy_port check_https_proxy
 
 shared_https() {
-  local name=$1 port=$2
+  local name=$1 port=$2 ns=$client_ns
+  if [[ $port == "$rescue_port" ]]; then ns=$server_ns; fi
   shift 2
-  ip netns exec "$client_ns" curl --noproxy '*' --fail --silent --show-error --max-time 8 \
+  ip netns exec "$ns" curl --noproxy '*' --fail --silent --show-error --max-time 8 \
     --cacert "$work_dir/ca/ca.pem" --resolve "$name:$port:$server_addr" "$@" "https://$name:$port/"
 }
 
@@ -146,7 +185,7 @@ version=$(shared_https "$proxy_domain" "$proxy_port" --http2 --pinnedpubkey "$pr
 cmp "$work_dir/proxy-site" "$work_dir/shared-h2.html"
 pass "$check"
 
-check='shared HTTP/3 serves the same cover'
+check='shared HTTP/3 serves the main cover even with the Rescue Host'
 python3 - "$state/server.json" > "$work_dir/fast-cert.der" <<'PY'
 import base64
 import json
@@ -156,30 +195,75 @@ with open(sys.argv[1]) as state:
     sys.stdout.buffer.write(base64.b64decode(json.load(state)["fast_certificate"]))
 PY
 ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
-  "https://$origin:$https_port/" "$work_dir/fast-cert.der" > "$work_dir/shared-h3.html"
+  "https://$proxy_domain:$https_port/" "$work_dir/fast-cert.der" > "$work_dir/shared-h3.html"
 cmp "$work_dir/proxy-site" "$work_dir/shared-h3.html"
+ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
+  "https://$proxy_domain:$https_port/" "$work_dir/fast-cert.der" "$cdn" > "$work_dir/shared-host-h3.html"
+cmp "$work_dir/proxy-site" "$work_dir/shared-host-h3.html"
 pass "$check"
 
 check='shared leaves the existing HTTP and HTTPS website intact'
-body=$(shared_https "$cdn" 443 --pinnedpubkey "$website_pin")
+body=$(shared_https "$website_domain" 443 --pinnedpubkey "$website_pin")
 [[ $body == 'existing website' ]]
-body=$(ip netns exec "$client_ns" curl --noproxy '*' --fail --silent --show-error --max-time 8 "http://$server_addr/")
+body=$(ip netns exec "$client_ns" curl --noproxy '*' --fail --silent --show-error --max-time 8 --resolve "$website_domain:80:$server_addr" "http://$website_domain/")
 [[ $body == 'existing website' ]]
 pass "$check"
 
-check='shared Rescue gives a bare 404 without VMess authentication'
-status=$(ip netns exec "$server_ns" curl --silent --show-error --max-time 5 --noproxy '*' \
-  -H "Host: $cdn" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Protocol: wrong' \
-  -o "$work_dir/rescue-404" --write-out '%{http_code}' "http://$rescue_address$ws_path")
-[[ $status == 404 && ! -s $work_dir/rescue-404 ]]
+check='shared Rescue closes a non-Cloudflare connection before TLS'
+ip netns exec "$client_ns" python3 - "$server_addr" "$rescue_port" <<'PY'
+import socket
+import sys
+
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3) as conn:
+    try:
+        assert conn.recv(1) == b""
+    except ConnectionResetError:
+        pass
+PY
 pass "$check"
 
-check='shared revocation preflight'
+check='shared Rescue rejects missing and wrong SNI from test loopback'
+if ip netns exec "$server_ns" curl --noproxy '*' --silent --insecure --max-time 5 \
+  "https://$server_addr:$rescue_port/" >/dev/null; then
+  fail "$check (bare-IP TLS handshake succeeded)"
+fi
+if ip netns exec "$server_ns" curl --noproxy '*' --silent --insecure --max-time 5 \
+  --resolve "$website_domain:$rescue_port:$server_addr" "https://$website_domain:$rescue_port/" >/dev/null; then
+  fail "$check (website SNI was accepted on the Rescue port)"
+fi
+pass "$check"
+
+check='shared Rescue serves its own cover to plain GET and unauthenticated upgrades'
+shared_https "$cdn" "$rescue_port" --http1.1 --pinnedpubkey "$rescue_pin" > "$work_dir/rescue.html"
+check_cover_page "$work_dir/rescue.html"
+if cmp -s "$work_dir/proxy-site" "$work_dir/rescue.html"; then fail "$check (same cover)"; fi
+shared_https "$cdn" "$rescue_port" --http1.1 \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' > "$work_dir/rescue-upgrade.html"
+cmp "$work_dir/rescue.html" "$work_dir/rescue-upgrade.html"
+rescue_get() {
+  ip netns exec "$server_ns" curl --silent --show-error --max-time 5 --noproxy '*' --http1.1 \
+    --cacert "$work_dir/ca/ca.pem" --resolve "$cdn:$rescue_port:$server_addr" "$@" \
+    --write-out '%{http_code}' "https://$cdn:$rescue_port$ws_path"
+}
+plain_status=$(rescue_get --output "$work_dir/rescue-plain")
+upgrade_status=$(rescue_get -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Protocol: wrong' \
+  --output "$work_dir/rescue-unauthenticated")
+[[ $plain_status == 404 && $upgrade_status == "$plain_status" ]]
+cmp "$work_dir/rescue-plain" "$work_dir/rescue-unauthenticated"
+pass "$check"
+
+check='shared device add reloads all tiers'
+"$bin" server add revoke-me --dir "$state" > "$work_dir/revoke.link"
+IFS= read -r revoked_link < "$work_dir/revoke.link"
+revoked_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' "$work_dir/revoke.link")
+[[ $revoked_proxy == https://revoke-me:*@"$proxy_domain:$proxy_port" ]]
+wait_for_log "$server_pid" "$work_dir/server.log" 'Reloaded 2 device credentials' 8
 for tier in fast stealth rescue; do
   start_client "$revoked_link" "$tier"
   check_target
   stop_client
 done
+pass "$check"
 "$bin" server revoke revoke-me --dir "$state" >/dev/null
 wait_for_log "$server_pid" "$work_dir/server.log" 'Reloaded 1 device credentials' 8
 for tier in fast stealth rescue; do
@@ -195,8 +279,37 @@ done
 
 origin=$proxy_domain https_port=$proxy_port check_https_proxy_revocation
 
+check='shared keeps Fast and Rescue available with the HTTPS proxy disabled and Stealth off'
+stop_pid "$server_pid"
+server_pid=
+"$bin" server proxy disable --dir "$state" >/dev/null
+: > "$work_dir/server.log"
+ip netns exec "$server_ns" "$bin" server run --dir "$state" --test-ca "$work_dir/ca" \
+  --test-ports --test-listen "$server_addr" >> "$work_dir/server.log" 2>&1 &
+server_pid=$!
+wait_for_log "$server_pid" "$work_dir/server.log" \
+  "Server listening on $server_addr:$https_port (UDP Fast)" 8
+grep -Fq 'Stealth is OFF:' "$work_dir/server.log"
+ip netns exec "$client_ns" python3 - "$server_addr" "$stealth_port" <<'PY'
+import errno
+import socket
+import sys
+
+with socket.socket() as conn:
+    conn.settimeout(3)
+    result = conn.connect_ex((sys.argv[1], int(sys.argv[2])))
+if result != errno.ECONNREFUSED:
+    raise SystemExit(f"expected Stealth TCP connection to be refused, got {result}")
+PY
+for tier in fast rescue; do
+  start_client "$main_link" "$tier"
+  check_target
+  stop_client
+done
+pass "$check"
+
 check='shared uninstall removes only the Fast hopping table'
-ip netns exec "$server_ns" "$bin" server uninstall --dir "$state"
+shared_uninstall
 if ip netns exec "$server_ns" nft list table inet pipe > /dev/null 2>&1; then fail "$check"; fi
 ip netns exec "$server_ns" nft list table inet pipe_fixture >/dev/null
 pass "$check"

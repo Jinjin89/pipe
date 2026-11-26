@@ -402,7 +402,7 @@ func TestProxyTLSFingerprintsAndRescueUserAgent(t *testing.T) {
 func TestSharedClientEndpointsUseIndependentPortsAndNames(t *testing.T) {
 	pin := [32]byte{45, 67}
 	profile := &link.Profile{
-		Host: "origin.example", CDN: "static.website.example", FastPort: 14443, StealthPort: 8443,
+		Host: "origin.example", CDN: "static.website.example", CDNPort: 2053, FastPort: 14443, StealthPort: 8443,
 		FastSNI: "fast.example", RealitySNI: "cover.example", FastPin: link.EncodeKey(pin), FastHop: "20000-40000",
 	}
 	options, err := BuildClient(ClientOptions{
@@ -417,11 +417,15 @@ func TestSharedClientEndpointsUseIndependentPortsAndNames(t *testing.T) {
 		port uint16
 		name string
 	}{
-		"fast": {14443, "fast.example"}, "stealth": {8443, "cover.example"}, "rescue": {443, "static.website.example"},
+		"fast": {14443, "fast.example"}, "stealth": {8443, "cover.example"}, "rescue": {2053, "static.website.example"},
 	} {
 		if out[tag]["server_port"] != want.port || out[tag]["tls"].(engine.Object)["server_name"] != want.name {
 			t.Errorf("wrong %s endpoint", tag)
 		}
+	}
+	rescue := out["rescue"]
+	if rescue["server"] != "10.83.0.1" || rescue["transport"].(engine.Object)["headers"].(engine.Object)["Host"] != profile.CDN {
+		t.Fatal("Rescue must dial the test address with the CDN hostname in the WebSocket Host header")
 	}
 	fast, fastTLS := out["fast"], out["fast"]["tls"].(engine.Object)
 	if fastTLS["certificate_path"] != nil || !reflect.DeepEqual(fastTLS["certificate_public_key_sha256"], [][]byte{pin[:]}) {

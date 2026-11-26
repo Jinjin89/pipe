@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +18,17 @@ import (
 )
 
 func runShared(ctx context.Context, options RunOptions, settings Settings, devices []Device, address string, log io.Writer) error {
-	if options.WWW != "" || options.WebUpstream != "" || options.CFOriginCA != "" {
-		return errors.New("shared mode leaves website and Cloudflare origin settings to the existing web server. Set a proxy cover with server proxy enable --www")
+	if options.CFOriginCA != "" && settings.rescuePort() == 0 {
+		fmt.Fprintln(log, "Warning: --cf-origin-ca is unused while shared Rescue is disabled")
 	}
-	page, err := generateCoverSite(settings.RealityPrivateKey)
+	if warning := webUpstreamWarning(options.WebUpstream); warning != "" {
+		fmt.Fprintln(log, "Warning:", warning)
+	}
+	var rescue engine.RescueAuthenticator
+	if err := rescue.SetUsers(rescueKeys(devices)); err != nil {
+		return err
+	}
+	decoy, err := makeDecoy(settings, options, rescue.Authenticate)
 	if err != nil {
 		return err
 	}
@@ -28,16 +36,18 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 	if err != nil {
 		return err
 	}
-	serveErrors := make(chan error, 2)
-	masquerade, err := serve(webServer(page, nil), "127.0.0.1", 0, serveErrors)
+	serveErrors := make(chan error, 4)
+	masquerade, err := serve(webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors)
 	if err != nil {
 		return fmt.Errorf("internal decoy listener: %w", err)
 	}
 	defer masquerade.Close()
-	masqueradePort := masquerade.Addr().(*net.TCPAddr).Port
+	listeners := serverListeners{masquerade: masquerade.Addr().(*net.TCPAddr).Port}
 	var certificate atomic.Pointer[tls.Certificate]
 	certificate.Store(initial)
-	getCertificate := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return certificate.Load(), nil }
+	getCertificate := fastCertificateForName(settings.fastName(), func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return certificate.Load(), nil
+	})
 	ctx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	defer func() {
@@ -67,39 +77,78 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 			}
 		}
 	})
-	var update func([]Device) error
-	if cfg := settings.HTTPSProxyListener; cfg != nil {
-		var proxyErr error
-		cover, err := proxyCover(cfg.WWW, page)
-		if err == nil {
-			proxy := newHTTPSProxy(cover, devices)
-			defer proxy.update(nil)
-			var stop func()
-			if stop, err = startSharedHTTPSProxy(ctx, options.Dir, address, *cfg, proxy, log, warn); err == nil {
-				defer stop()
-				update = func(next []Device) error {
-					proxy.update(next)
-					return nil
-				}
+	var rescueFailed func(error)
+	if settings.CDNDomain != "" {
+		if warning := RescuePortWarning(settings.sharedRescuePort()); warning != "" {
+			warn(warning)
+		}
+		stop, err := startSharedRescue(ctx, settings, options, address, decoy, log, warn)
+		if err != nil {
+			warnRescueOff(log, err)
+			settings.Rescue = nil
+		} else {
+			defer stop()
+			rescueFailed = func(err error) {
+				stop()
+				settings.Rescue = nil
+				warnRescueOff(log, err)
 			}
 		}
-		if proxyErr = err; proxyErr != nil {
-			warn(proxyErr.Error())
-			// Stealth's fallback must be a socket this process owns, or nothing.
-			settings.realityBlocked = "the HTTPS proxy that Stealth borrows did not start (" + proxyErr.Error() + ")"
+	}
+	var proxy *httpsProxy
+	var stealth *sharedStealth
+	if cfg := settings.HTTPSProxyListener; cfg != nil {
+		var err error
+		if cfg.retired() {
+			err = errors.New(retiredProxy)
+		} else {
+			var cover http.Handler
+			cover, err = proxyCover(cfg.WWW, decoy.main)
+			if err == nil {
+				proxy = newHTTPSProxy(cover, devices)
+			}
+		}
+		if proxy != nil {
+			var fatal chan<- error
+			if settings.realityTargetProblem() == nil {
+				fatal = serveErrors
+				stealth = newSharedStealth(settings.stealthName(), options.TestCA)
+			}
+			var stop func()
+			stop, err = startSharedHTTPSProxy(ctx, options.Dir, address, *cfg, proxy, log, warn, fatal, stealth)
+			if err == nil {
+				listeners.borrowProxy = stealth != nil
+				defer proxy.update(nil)
+				defer stop()
+			} else {
+				proxy.update(nil)
+				proxy = nil
+				stealth = nil
+			}
+		}
+		if err != nil {
+			warn("HTTPS proxy is OFF: " + err.Error())
+			// A failed bind must keep the proxy socket out of the Stealth configuration.
+			settings.realityBlocked = "the HTTPS proxy that Stealth borrows did not start (" + err.Error() + ")"
 		}
 	}
 	if err := settings.realityTargetProblem(); err != nil {
-		still := "Fast, Rescue and the HTTPS proxy keep running"
-		if settings.realityBlocked != "" {
-			still = "Fast and Rescue keep running"
+		warn("Stealth is OFF: " + err.Error())
+	}
+	update := func(next []Device) error {
+		if proxy != nil {
+			proxy.update(next)
 		}
-		fmt.Fprintf(log, "Error: Stealth is OFF: %v. %s.\n", err, still)
+		return rescue.SetUsers(rescueKeys(next))
 	}
 	makeConfig := func(address string, devices []Device) engine.Object {
-		return serverConfig(settings, devices, address, masqueradePort, 0, options.TestHosts)
+		return serverConfig(settings, devices, address, listeners, options.TestHosts)
 	}
-	return runEngine(ctx, options.Dir, settings, address, devices, getCertificate, makeConfig, log, serveErrors, update)
+	instance, boundAddress, err := startServerEngine(ctx, address, devices, getCertificate, makeConfig, listeners.borrowProxy, rescueFailed)
+	if err != nil {
+		return err
+	}
+	return runEngine(ctx, instance, options.Dir, settings, boundAddress, devices, makeConfig, log, serveErrors, update, stealth)
 }
 
 type synchronizedServerLog struct {

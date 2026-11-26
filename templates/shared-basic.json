@@ -1,7 +1,0 @@
-{
-  "mode": "shared",
-  "domain": "203.0.113.7",
-  "fast_sni": "vpn.example.org",
-  "fast_hop": "20000-40000",
-  "device": "phone"
-}

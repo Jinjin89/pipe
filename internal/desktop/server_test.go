@@ -324,6 +324,43 @@ func TestShowEndpoint(t *testing.T) {
 	}
 }
 
+func TestProfilePreviewCDN(t *testing.T) {
+	s, _, _, request := profileRelayTestServer(t)
+	for _, test := range []struct {
+		name string
+		host string
+		port uint16
+		want string
+	}{
+		{name: "without CDN"},
+		{name: "default CDN port", host: "cdn.example", want: "cdn.example"},
+		{name: "custom CDN port", host: "cdn.example", port: 2053, want: "cdn.example:2053"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := link.Profile{Host: "origin.example", Name: "preview", CDN: test.host, CDNPort: test.port}
+			raw, err := profile.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := `{"link":"` + raw + `"}`
+			w := request("POST", "/api/profiles/preview", body)
+			var preview map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &preview); err != nil || w.Code != http.StatusOK || preview["cdn"] != test.want {
+				t.Fatalf("preview returned %d %s (%v)", w.Code, w.Body, err)
+			}
+			if test.port != 0 {
+				if w := request("POST", "/api/profiles", body); w.Code != http.StatusOK {
+					t.Fatalf("save returned %d %s", w.Code, w.Body)
+				}
+				saved, err := s.profiles.Load("preview")
+				if err != nil || saved != profile {
+					t.Fatalf("saved profile dropped the Rescue endpoint: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestProfilesLifecycleNeverReturnsLink(t *testing.T) {
 	e := newEnv(t)
 	e.login()

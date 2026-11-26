@@ -174,9 +174,13 @@ func tierOutbounds(options ClientOptions) ([]engine.Object, engine.Relay, error)
 		return nil, engine.Relay{}, err
 	}
 	keys := link.Derive(p.Seed)
-	origin, cdn, cdnPort := p.Host, p.CDN, uint16(link.DefaultPort)
+	origin, cdn, cdnPort := p.Host, p.CDN, p.CDNEndpointPort()
 	if options.TestAddress.IsValid() {
-		origin, cdn, cdnPort = options.TestAddress.String(), options.TestAddress.String(), p.ServerPort()
+		origin = options.TestAddress.String()
+		cdn = origin
+		if p.CDNPort == 0 {
+			cdnPort = p.ServerPort()
+		}
 	}
 	// Hysteria2 requires the native QUIC TLS config, which uTLS cannot export.
 	fastTLS := clientTLS(p.FastServerName(), options.TestCAFile)

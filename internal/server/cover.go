@@ -80,13 +80,16 @@ var coverFooterFormats = [...]string{
 	"Kept by %[1]s in a small corner of %[2]s.",
 }
 
-func generateCoverSite(realityPrivateKey string) (coverPage, error) {
+const mainCoverLabel = "pipe/v1 cover-site"
+const rescueCoverLabel = "pipe/v1 rescue-cover-site"
+
+func generateCoverSite(realityPrivateKey, label string) (coverPage, error) {
 	// Both deployment modes already have this key, including older states.
 	secret, err := link.DecodeKey(realityPrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("derive default website seed: %w", err)
 	}
-	seed, err := hkdf.Key(sha256.New, secret[:], nil, "pipe/v1 cover-site", 32)
+	seed, err := hkdf.Key(sha256.New, secret[:], nil, label, 32)
 	clear(secret[:])
 	if err != nil {
 		return nil, fmt.Errorf("derive default website seed: %w", err)

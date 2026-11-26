@@ -12,7 +12,7 @@ import (
 )
 
 func TestBuildProbeNamedEndpoints(t *testing.T) {
-	profile := link.Profile{Host: "origin.example", CDN: "cdn.example", FastPin: link.EncodeKey([32]byte{1})}
+	profile := link.Profile{Host: "origin.example", CDN: "cdn.example", CDNPort: 2053, FastPin: link.EncodeKey([32]byte{1})}
 	options := ProbeOptions{Profile: profile, Relay: "relay.example:8444/444", IPv6: true, Interface: "uplink0"}
 	compiled, err := BuildProbe(options)
 	if err != nil {
@@ -43,6 +43,9 @@ func TestBuildProbeNamedEndpoints(t *testing.T) {
 		if !reflect.DeepEqual(outbound, clientTiers[tier]) || outbound["domain_resolver"].(engine.Object)["server"] != proxyBootstrapDoH {
 			t.Fatalf("probe's %s outbound differs from the client tier", tier)
 		}
+	}
+	if rescue := outbounds["rescue"]; rescue["server"] != profile.CDN || rescue["server_port"] != profile.CDNPort {
+		t.Fatalf("Rescue probe endpoint = %v:%v", rescue["server"], rescue["server_port"])
 	}
 	dns := compiled.Config["dns"].(engine.Object)
 	if len(dns) != 2 || dns["final"] != domesticDoH {

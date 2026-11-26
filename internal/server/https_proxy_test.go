@@ -403,7 +403,7 @@ func TestDialOrderInterleavesIPv4First(t *testing.T) {
 }
 
 func TestProxyCoverDefaultsToFastSite(t *testing.T) {
-	page, err := generateCoverSite(testCoverKey(1))
+	page, err := generateCoverSite(testCoverKey(1), mainCoverLabel)
 	if err != nil {
 		t.Fatal(err)
 	}

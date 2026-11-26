@@ -17,16 +17,16 @@ Your own private VPN: one small server, and apps on your phone and laptop that c
   - **Smart:** Chinese and local sites go direct, and everything else goes through pipe.
   - **Global:** everything goes through pipe.
   - **Direct:** pipe is paused.
-- **Layout:** setup checks your server and picks one by itself.
-  - **standalone:** ports 80/443 are free, so pipe takes them and is the website.
-  - **shared:** a website (e.g. nginx) already uses 80/443, so pipe runs beside it and doesn't touch it.
+- **Layout:** you never pick it; setup checks your server.
+  - **Alone:** TCP 80/443 are free, so pipe takes them and is the website.
+  - **Next to a website:** a website already uses 80/443, so pipe uses its own ports and never touches it.
 - **HTTPS proxy:** a small website with a real certificate on your own DNS-only name. It has two jobs:
-  - **Stealth's cover site.** In the shared layout, Stealth needs it (see below).
+  - **Stealth's cover site.** Next to a website, Stealth needs it (see below).
   - **Terminal proxy (optional).** A single `export https_proxy=… http_proxy=…` line lets any terminal use your server with nothing installed.
 
 ## How the data flows
 
-The shared layout is shown. Names are examples: `vpn.example.org` is your own DNS-only name, and `rescue.example.com` is your Cloudflare name.
+The next-to-a-website layout is shown. Names are examples: `vpn.example.org` is your own DNS-only name, and `rescue.example.com` is your Cloudflare name.
 
 ```
                         Your server (<server IP>)
@@ -44,7 +44,7 @@ The shared layout is shown. Names are examples: `vpn.example.org` is your own DN
  │          │                        real certificate and a small web page:
  │          │                        they see a normal website, nothing else
  │          │
- │          │── Rescue ── rescue.example.com ─► Cloudflare ─► nginx ─► pipe ─► Internet
+ │          │── Rescue ── rescue.example.com ─► Cloudflare ─► TCP 2053 ─► pipe ─► Internet
  └──────────┘
 
  Terminal (optional):
@@ -65,7 +65,7 @@ The shared layout is shown. Names are examples: `vpn.example.org` is your own DN
 
 Auto tries Fast, then Stealth, then Rescue. To never show the server IP on your network, pin the Rescue route. It is slower.
 
-The standalone layout is the same, except that pipe owns TCP 443: Stealth and the cover site are on 443.
+When pipe has 80/443 to itself it is the same, except that Stealth, the cover site and Rescue are all on TCP 443.
 
 # Part 1: Deploy the server
 
@@ -89,46 +89,41 @@ go build -trimpath -tags with_gvisor,with_quic,with_utls,with_acme,badlinkname,t
 ### Step 2: Generate the config
 **Fastest, on a new server with nothing else on it:** point a DNS name at the server (an `A` record, DNS only), then run one line and skip to the **Next steps** below:
 ```sh
-./pipe server setup --yes --mode standalone --domain vpn.example.com --fast-hop 20000-40000 --device phone
+./pipe server setup --yes --sni vpn.example.com --fast-hop 20000-40000 --device phone
 ```
-pipe gets its own certificate for that name. For anything else, use a template:
+pipe gets its own certificate for that name. For anything else, use the setup file:
 
-1. **Pick the template for your situation** and copy it to `setup.json`:
-
-   | Your situation | Template |
-   |---|---|
-   | New server, nothing else on it | `standalone.json` |
-   | New server, plus Rescue through Cloudflare (your domain's DNS is on Cloudflare) | `standalone-cloudflare.json` |
-   | A website already runs on the server; just Fast (no Stealth without a proxy domain) | `shared-basic.json` |
-   | Website on **nginx in Docker**; plus Rescue + HTTPS proxy | `shared-nginx-docker.json` |
-   | Website on **nginx installed on the server**; plus Rescue + HTTPS proxy | `shared-nginx-host.json` |
-   | HTTPS proxy whose certificate comes through an **Alibaba Cloud DNS** key | `shared-proxy-alidns.json` |
-   | HTTPS proxy whose certificate comes through a **Cloudflare DNS** token | `shared-proxy-cloudflare-dns.json` |
-   | HTTPS proxy with **your own certificate files** | `shared-proxy-own-cert.json` |
-
+1. **Write the template** (it already has this server's IP and the ports it would use):
    ```sh
-   cp templates/shared-nginx-docker.json setup.json      # use your template's name
+   ./pipe server setup --template > setup.json
    ```
-   Or let pipe write one pre-filled with this server's IP and Docker network: `./pipe server setup --template > setup.json`.
-2. **Replace the example values** (`example.com`, `203.0.113.7` …) with yours:
+   ```json
+   {
+     "ip": "203.0.113.7",
+     "sni": "proxy.example.com",
+     "cert": { "dns": "cloudflare", "token_file": "/root/cf-token" },
+     "fast": { "port": 443, "hop": "20000-40000" },
+     "stealth": { "port": 8443 },
+     "proxy": { "port": 9443 },
+     "rescue": { "sni": "static.example.com", "port": 2053, "cert": "/root/origin.pem", "key": "/root/origin.key" },
+     "device": "phone"
+   }
+   ```
+2. **Fill in yours.** Every key is one real thing:
 
-   | Field | Must fill? | What it is: where to find it |
-   |---|---|---|
-   | `mode` | yes | `standalone` if nothing uses ports 80/443, `shared` if a website does. Check with `ss -ltn \| grep -E ':(80\|443) '`. Pre-filled. |
-   | `domain` | yes | standalone: a DNS name with an `A` record pointing at the server. shared: the server's public IP (`curl -4 ifconfig.me`). Pre-filled in shared. |
-   | `fast_sni` | shared | any domain you own; it needs no DNS record. Tip: the same as `proxy_domain`. |
-   | `cdn_domain` | recommended | the Rescue subdomain, e.g. `static.your-site.com`. In Cloudflare: add an `A` record pointing at the server with the orange cloud ON, set SSL to Full (strict) and turn WebSockets ON. `""` = no Rescue. |
-   | `rescue_listen` | if `cdn_domain` | where nginx reaches pipe. nginx in Docker: `docker inspect <nginx> --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'` + `:18080`. nginx on the host: `127.0.0.1:18080`. |
-   | `reality_dest` | no | Leave out, or `self`. Stealth in shared mode always borrows your own HTTPS proxy site, so it needs `proxy_domain`. Without a proxy domain you get Fast and Rescue only, and setup says so. Any other value is refused. |
-   | `fast_hop` | recommended | keep `20000-40000`, and open that UDP range in the firewall. |
-   | `proxy_domain` | for Stealth in shared mode | also for `export https_proxy`: a **second** domain with an `A` record pointing at the server, DNS only. `""` = no Stealth in shared mode. |
-   | `proxy_cert_method` | optional | keep `auto` (no API key needed). |
-   | `device` | yes | a name for your first device, e.g. `phone`. |
-   | `dns`, `dns_key_file`, `dns_token_file` | only for `"dns"` | the DNS provider (`alidns` or `cloudflare`) and the key/token file. Alibaba: RAM console > Users > Create AccessKey; Cloudflare: My Profile > API Tokens. |
-   | `cert`, `key` | only for `"files"` | your certificate chain and private key files, e.g. certbot's `fullchain.pem` and `privkey.pem`. |
+   | Key | What it is |
+   |---|---|
+   | `ip` | the address your devices connect to. Leave it out to use `sni`. |
+   | `sni` | your own DNS-only name (an `A` record pointing at the server, grey cloud). Fast, Stealth and the HTTPS proxy use it. |
+   | `cert` | how `sni` gets its certificate. Leave it out when TCP 80 is free (automatic). Otherwise `{ "dns": "cloudflare", "token_file": … }` (a token with Zone Read and DNS Edit on that zone), `{ "dns": "alidns", "key_file": … }`, or `{ "file": …, "key": … }`. |
+   | `fast` | UDP `port` and the optional `hop` range (open it in the firewall). |
+   | `stealth`, `proxy` | their TCP `port`. `proxy` is the HTTPS proxy for `export https_proxy`; Stealth borrows its site, so without `proxy` there is no Stealth when port 443 is taken. |
+   | `rescue` | `sni`: your Cloudflare name (orange cloud, different from `sni` above). `port`: Cloudflare passes HTTPS only on 443, 2053, 2083, 2087, 2096 and 8443. `cert`/`key`: a Cloudflare **Origin Certificate** for that name (SSL/TLS > Origin Server > Create Certificate, valid 15 years). Pipe answers on that port only to Cloudflare's addresses. |
+   | `device` | a name for your first device, e.g. `phone`. |
 
-   **Moving an older shared server to `self`:** older versions could borrow a third-party site. That is no longer supported: the server still starts, but Stealth stays off (Fast, Rescue and the HTTPS proxy keep running). Put `"reality_dest": "self"` in the file (the server needs a proxy domain) and run setup again, or run `pipe server reality`. Only the Stealth target changes. Keys, devices and all other settings stay. Saved device links need the new Stealth name: set `rsni=<proxy domain>` in each link, or add the device again.
+   **Leave out `proxy` or `rescue` and that part is off.** Fast always runs. Stealth needs a real website to hide behind: it always runs when pipe has port 443, and next to a website it runs only with `proxy` (without it, pick Auto in the app; the Stealth route won't connect). The `fast` and `stealth` sections only set ports. There is no mode to pick: when TCP 80 and 443 are free, pipe uses them itself (everything on 443, certificates automatic) and ignores the ports and certificates above; when a website already has them, pipe uses its own ports and never touches the website. Setup says which one it chose.
 
+   **Moving a server set up before 0.7.3:** update your apps to 0.7.3 first. Write the full file with your current names (a `proxy` or `rescue` you leave out is turned off), add the `rescue` section, and run setup again. Keys, devices and all other settings stay. Then open the Rescue port and remove pipe's old file from your nginx. Saved device links need the Rescue port: change `cdn=<name>` to `cdn=<name>:2053` in each link (setup prints the exact value), or add the device again under a new name.
 3. **Run setup with it:**
    ```sh
    ./pipe server setup --config setup.json
@@ -140,23 +135,17 @@ Setup writes these files:
 |---|---|
 | `/var/lib/pipe/server.json` | the server config |
 | `/var/lib/pipe/devices.json` and the key files | your devices' keys |
-| `/var/lib/pipe/install/` | the service files, plus `pipe-nginx.conf` for the shared layout |
+| `/var/lib/pipe/install/` | the service files |
 
 It also prints your phone's **device link and QR code**. The server shows it only once. After you import it, Pipe keeps it for you: **Profiles → Device link → Show** (desktop) or **Settings → Device link → Show** (Android) shows the link, its QR code and the HTTPS proxy line again. They stay hidden until you click.
 
 Before you run pipe, finish the parts outside it (setup prints these as **Next steps**):
-1. **DNS:** point each domain you entered at the server IP.
-   - The Rescue subdomain: Cloudflare **orange cloud on**. In Cloudflare, also turn **WebSockets** on and set SSL to **Full (strict)**.
-   - Every other domain: **DNS only**.
-2. **nginx** (shared layout only): give nginx the file setup wrote, then reload it:
-   ```sh
-   install -m 0600 /var/lib/pipe/install/pipe-nginx.conf /etc/nginx/conf.d/pipe.conf
-   nginx -t && nginx -s reload
-   ```
-   For nginx in Docker, put the file in its mounted config folder instead, then run `docker exec <container> nginx -t` and `docker exec <container> nginx -s reload`.
-3. **Firewall:** in your VPS provider's panel, open the ports setup listed.
-   - standalone: TCP 80, TCP 443, UDP 443 and UDP 20000-40000
-   - shared: UDP 443, UDP 20000-40000 and TCP 8443. With the HTTPS proxy, also TCP 9443, and TCP 80 open to everyone.
+1. **DNS:** point each name you entered at the server IP.
+   - The Rescue name: Cloudflare **orange cloud on**. In Cloudflare, also turn **WebSockets** on and set SSL to **Full (strict)**.
+   - `sni`: **DNS only**.
+2. **Firewall:** in your VPS provider's panel, open the ports setup listed.
+   - pipe has 80/443 to itself: TCP 80, TCP 443, the Fast UDP port (443) and the hop range
+   - next to a website: the Fast UDP port (443), the hop range and the TCP ports in your file (8443, 9443 and 2053 by default). If your provider's firewall can, open the Rescue port only to [Cloudflare's addresses](https://www.cloudflare.com/ips/); pipe refuses everyone else there anyway.
 
 ### Step 3: Run it
 ```sh
@@ -251,7 +240,7 @@ If the direct path to your server is slow, put a relay in between: client → re
 3. **On each device**, open the server's profile in the app, paste that server's relay code under **Relay**, and switch it on. In a terminal, use `pipe run 'pipe://…' --relay <relay code>`. The home screen shows "via <relay>" while the relay is used.
 
 - **The relay fails or is switched off:** Pipe goes direct within a second and tries the relay again a minute later (sooner after a network change). The status then shows "relay not reachable, direct". A code that belongs to another server fails the same safe way.
-- **Fast uses the relay only when the link has a Fast pin** (shared-mode servers, where the server's line includes `--udp`). Standalone servers relay Stealth only. Rescue never uses the relay.
+- **Fast uses the relay only when the link has a Fast pin** (servers next to a website, where the server's line includes `--udp`). A server that has 80/443 to itself relays Stealth only. Rescue never uses the relay.
 - **The code shows a private IP** (some cloud VPSes): run the line again with `--host <the VPS's public IP or name>` added.
 - **A server's IP or ports changed:** run its new line on the relay. A server keeps its relay ports, and so its code, whenever they're still free.
 - **On the relay:** `pipe relay status` lists each server with its code and traffic. `pipe relay remove --to <server IP>` drops one server, and `pipe relay remove` deletes everything and restores the VPS's network settings. A new `pipe` binary on the relay needs no reinstall.
@@ -266,8 +255,7 @@ pipe run 'pipe://…' --tier fast                # on a laptop: test one route (
 - **Fast broke after a firewall reload:** `systemctl restart pipe-hop` (a reload with `flush ruleset` removes the hop rule).
 - **HTTPS proxy certificate not issued yet:**
   - the proxy domain's DNS record must point at the server (DNS only)
-  - for `http`/`nginx`, TCP 80 must be open to everyone
-  - for `nginx`, the nginx file must be copied and nginx reloaded
+  - for `http`, TCP 80 must be open to everyone
   - then run `systemctl restart pipe`
 - **The `https_proxy` line is detectable from inside China** (TLS inside TLS). Inside China, use `pipe run` or the app instead.
 
@@ -293,13 +281,12 @@ With `pipe run` running, a terminal can use it too: `export https_proxy=http://1
 ## Server reference
 
 ### HTTPS proxy certificate
-The HTTPS proxy uses a second, DNS-only domain on TCP 9443. Pipe gets and renews its certificate by itself, with one of four methods. `auto` picks the method for you:
+The HTTPS proxy uses a second, DNS-only domain on TCP 9443. Pipe gets and renews its certificate by itself, with one of three methods. `auto` picks `http` when port 80 is free:
 
 | Method | When | What you do |
 |---|---|---|
 | `http` | nothing listens on port 80 | open TCP 80 |
-| `nginx` | nginx owns port 80 | copy the nginx file setup writes; open TCP 80 to everyone |
-| `dns` | port 80 is not usable | paste your DNS key when asked (it is hidden and stored owner-only) |
+| `dns` | port 80 is used by a website | paste your DNS key when asked (it is hidden and stored owner-only) |
 | `files` | you already have a certificate | give `--cert` and `--key` (both readable by user `pipe`) |
 
 DNS keys need only small permissions:
@@ -309,10 +296,10 @@ DNS keys need only small permissions:
 ### Without questions
 Setup also runs non-interactively, for scripts:
 ```sh
-./pipe server setup --yes --mode shared --domain 203.0.113.7 --fast-sni www.example.com \
-  --cdn-domain static.example.com --rescue-listen 172.17.0.1:18080 \
-  --fast-hop 20000-40000 \
-  --proxy-domain proxy.example.org --device phone
+./pipe server setup --yes --ip 203.0.113.7 --sni proxy.example.org --fast-hop 20000-40000 \
+  --dns cloudflare --dns-token-file cf-token \
+  --rescue-sni static.example.com --rescue-cert origin.pem --rescue-key origin.key \
+  --device phone
 ```
 `pipe server setup --help` lists every flag. To do every step by hand, see `docs/DEPLOY_MANUAL.md`.
 

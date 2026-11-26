@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"pipe/internal/engine"
@@ -35,6 +36,13 @@ type RunOptions struct {
 	WebUpstream string
 	CFOriginCA  string
 	Log         io.Writer
+}
+
+type serverListeners struct {
+	masquerade, probe  int
+	mainTLS, rescueTLS uint16
+	borrowProxy        bool
+	allowLoopback      bool
 }
 
 func Run(ctx context.Context, options RunOptions) error {
@@ -72,20 +80,38 @@ func Run(ctx context.Context, options RunOptions) error {
 	if settings.Mode == Shared {
 		return runShared(ctx, options, settings, devices, address, log)
 	}
+	return runStandalone(ctx, options, settings, devices, address, log)
+}
+
+func runStandalone(ctx context.Context, options RunOptions, settings Settings, devices []Device, address string, log io.Writer) error {
+	disableRescue := func(err error) {
+		settings.CDNDomain = ""
+		warnRescueOff(log, err)
+	}
+	if settings.rescueMatchesFastName() {
+		disableRescue(fmt.Errorf("%w. Set a distinct rescue.sni in setup JSON", errRescueFastName))
+	}
+	if !options.TestPorts {
+		if warning := RescuePortWarning(settings.rescuePort()); warning != "" {
+			fmt.Fprintln(log, "Warning:", warning)
+		}
+	}
 	var originCA *x509.CertPool
 	if options.CFOriginCA != "" {
-		if settings.CDNDomain == "" {
-			return errors.New("--cf-origin-ca requires a configured CDN domain")
-		}
-		originCA, err = loadCFOriginCA(options.CFOriginCA)
-		if err != nil {
-			return err
+		if settings.rescuePort() == 0 {
+			fmt.Fprintln(log, "Warning: --cf-origin-ca is unused while standalone Rescue is disabled")
+		} else {
+			var err error
+			originCA, err = loadCFOriginCA(options.CFOriginCA)
+			if err != nil {
+				disableRescue(fmt.Errorf("load --cf-origin-ca: %w", err))
+			}
 		}
 	}
 	var rescue engine.RescueAuthenticator
-	if settings.CDNDomain != "" {
+	if settings.rescuePort() != 0 {
 		if err := rescue.SetUsers(rescueKeys(devices)); err != nil {
-			return err
+			disableRescue(fmt.Errorf("configure Rescue authentication: %w", err))
 		}
 	}
 	if warning := webUpstreamWarning(options.WebUpstream); warning != "" {
@@ -96,25 +122,44 @@ func Run(ctx context.Context, options RunOptions) error {
 		return err
 	}
 	var getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	var currentCertificate func(string) *tls.Certificate
 	var httpHandler = redirectHTTPS(settings)
 	var obtain = func(context.Context) error { return nil }
 	if options.TestPorts {
-		certificate, err := testCertificate(options.TestCA, settings)
+		certificates, err := testCertificates(options.TestCA, settings.mainNames())
 		if err != nil {
 			return err
 		}
-		getCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return certificate, nil }
+		if name := strings.ToLower(settings.CDNDomain); name != "" && certificates[name] == nil {
+			cdn, err := testCertificates(options.TestCA, []string{name})
+			if err != nil {
+				disableRescue(fmt.Errorf("prepare Rescue test certificate: %w", err))
+			} else {
+				certificates[name] = cdn[name]
+			}
+		}
+		currentCertificate = func(name string) *tls.Certificate { return certificates[strings.ToLower(name)] }
+		getCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if cert := currentCertificate(hello.ServerName); cert != nil {
+				return cert, nil
+			}
+			return nil, errTLSName
+		}
 	} else {
-		config, issuer, stop, err := managedCertificates(options.Dir, settings)
+		config, issuer, cache, err := managedCertificates(options.Dir, settings)
 		if err != nil {
 			return err
 		}
-		defer stop()
+		defer cache.Stop()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
 		getCertificate = config.GetCertificate
+		currentCertificate = func(name string) *tls.Certificate { return cachedCertificate(cache, name) }
 		httpHandler = issuer.HTTPChallengeHandler(httpHandler)
-		obtain = func(ctx context.Context) error { return config.ManageSync(ctx, settings.names()) }
+		obtain = func(ctx context.Context) error { return manageStandaloneCertificates(ctx, config, settings, log) }
 	}
-	serveErrors := make(chan error, 4)
+	serveErrors := make(chan error, 5)
 	redirect, err := serve(webServer(httpHandler, nil), address, settings.Ports.HTTP, serveErrors)
 	if err != nil {
 		return fmt.Errorf("HTTP redirect listener: %w", err)
@@ -124,19 +169,41 @@ func Run(ctx context.Context, options RunOptions) error {
 		return fmt.Errorf("obtain HTTPS certificates: %w", err)
 	}
 	var proxy *httpsProxy
-	tlsSite := decoy
+	tlsSite := decoy.main
 	if settings.proxyEnabled() {
-		proxy = newHTTPSProxy(decoy, devices)
+		proxy = newHTTPSProxy(decoy.main, devices)
 		defer proxy.update(nil)
 		tlsSite = proxy
 	}
-	decoyServer := webServer(tlsSite, decoyTLSConfig(settings, getCertificate, originCA))
+	decoyServer := webServer(tlsSite, strictProxyTLS(settings.webName(), getCertificate))
 	website, err := serve(decoyServer, "127.0.0.1", settings.Ports.Decoy, serveErrors)
 	if err != nil {
 		return fmt.Errorf("decoy HTTPS listener: %w", err)
 	}
 	defer website.Close()
-	masquerade, err := serve(webServer(decoy, nil), "127.0.0.1", 0, serveErrors)
+	listeners := serverListeners{mainTLS: settings.Ports.Decoy, allowLoopback: options.TestPorts}
+	var rescueFailed func(error)
+	var checkRescueCertificate func() error
+	if settings.rescuePort() != 0 {
+		// Only the source-restricted CDN front route can reach this private TLS site.
+		domain := settings.CDNDomain
+		checkRescueCertificate = func() error {
+			return rescueCertificateProblem(domain, currentCertificate(domain))
+		}
+		cdnTLS := standaloneRescueTLSConfig(domain, getCertificate, originCA, checkRescueCertificate)
+		cdn, err := serve(webServer(decoy, cdnTLS), "127.0.0.1", 0, serveErrors)
+		if err != nil {
+			disableRescue(fmt.Errorf("internal Rescue TLS listener: %w", err))
+		} else {
+			defer cdn.Close()
+			listeners.rescueTLS = uint16(cdn.Addr().(*net.TCPAddr).Port)
+			rescueFailed = func(err error) {
+				_ = cdn.Close()
+				disableRescue(err)
+			}
+		}
+	}
+	masquerade, err := serve(webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors)
 	if err != nil {
 		return fmt.Errorf("internal decoy listener: %w", err)
 	}
@@ -146,27 +213,39 @@ func Run(ctx context.Context, options RunOptions) error {
 		return fmt.Errorf("internal probe listener: %w", err)
 	}
 	defer probe.Close()
+	listeners.masquerade = masquerade.Addr().(*net.TCPAddr).Port
+	listeners.probe = probe.Addr().(*net.TCPAddr).Port
 	makeConfig := func(address string, devices []Device) engine.Object {
-		return serverConfig(settings, devices, address, masquerade.Addr().(*net.TCPAddr).Port, probe.Addr().(*net.TCPAddr).Port, options.TestHosts)
+		return serverConfig(settings, devices, address, listeners, options.TestHosts)
 	}
 	update := func(next []Device) error {
 		if proxy != nil {
 			proxy.update(next)
 		}
-		if settings.CDNDomain != "" {
+		if settings.rescuePort() != 0 {
 			return rescue.SetUsers(rescueKeys(next))
 		}
 		return nil
 	}
-	return runEngine(ctx, options.Dir, settings, address, devices, getCertificate, makeConfig, log, serveErrors, update)
+	instance, boundAddress, err := startServerEngine(ctx, address, devices, fastCertificateForName(settings.fastName(), getCertificate), makeConfig, false, rescueFailed)
+	if err != nil {
+		return err
+	}
+	if settings.rescuePort() != 0 {
+		if err := checkRescueCertificate(); err != nil {
+			warnRescueOff(log, err)
+		}
+	}
+	return runEngine(ctx, instance, options.Dir, settings, boundAddress, devices, makeConfig, log, serveErrors, update, nil)
 }
 
-func runEngine(ctx context.Context, dir string, settings Settings, address string, devices []Device,
+func startServerEngine(ctx context.Context, address string, devices []Device,
 	getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error),
-	makeConfig func(string, []Device) engine.Object, log io.Writer, serveErrors <-chan error,
-	update func([]Device) error,
-) error {
-	instance, httpsAddress, err := bindWithIPv4Fallback(address, func(address string) (*engine.Instance, error) {
+	makeConfig func(string, []Device) engine.Object,
+	pauseStealth bool,
+	rescueFailed func(error),
+) (*engine.Instance, string, error) {
+	start := func(address string) (*engine.Instance, error) {
 		instance, err := engine.New(ctx, engine.Options{
 			Config: makeConfig(address, devices), GetCertificate: getCertificate, Server: true,
 			DeviceIDs: deviceIDs(devices),
@@ -174,23 +253,53 @@ func runEngine(ctx context.Context, dir string, settings Settings, address strin
 		if err != nil {
 			return nil, fmt.Errorf("configure server engine: %w", err)
 		}
+		if pauseStealth {
+			// Keep the inbound configured for credential reloads while its socket stays closed.
+			if err := instance.SetInboundEnabled("stealth", false); err != nil {
+				instance.Close()
+				return nil, err
+			}
+		}
 		// The engine closes all partially started listeners if Start fails.
 		if err := instance.Start(); err != nil {
 			return nil, fmt.Errorf("start server engine: %w", err)
 		}
 		return instance, nil
-	})
-	if err != nil {
-		return err
 	}
+	instance, boundAddress, err := bindWithIPv4Fallback(address, start)
+	if err == nil || rescueFailed == nil || ctx.Err() != nil {
+		return instance, boundAddress, err
+	}
+	rescueFailed(err)
+	instance, boundAddress, retryErr := bindWithIPv4Fallback(address, start)
+	if retryErr != nil {
+		return nil, boundAddress, errors.Join(err, fmt.Errorf("start without Rescue: %w", retryErr))
+	}
+	return instance, boundAddress, nil
+}
+
+func runEngine(ctx context.Context, instance *engine.Instance, dir string, settings Settings, address string, devices []Device,
+	makeConfig func(string, []Device) engine.Object, log io.Writer, serveErrors <-chan error,
+	update func([]Device) error, stealth *sharedStealth,
+) error {
 	defer instance.Close()
-	if settings.Mode == Shared && settings.realityTargetProblem() != nil {
-		fmt.Fprintf(log, "Server listening on %s (UDP Fast). Stealth is off\n", addrPort(httpsAddress, settings.fastPort()))
-	} else if settings.Mode != Shared && settings.fastPort() == settings.stealthPort() {
-		fmt.Fprintf(log, "Server listening on %s (TCP and UDP)\n", addrPort(httpsAddress, settings.fastPort()))
-	} else {
+	warn := func(message string) { fmt.Fprintln(log, "Warning:", message) }
+	stealthListening := settings.Mode != Shared
+	if stealth != nil {
+		var err error
+		stealthListening, err = stealth.refresh(instance, warn)
+		if err != nil {
+			return err
+		}
+	}
+	switch {
+	case !stealthListening:
+		fmt.Fprintf(log, "Server listening on %s (UDP Fast)\n", addrPort(address, settings.fastPort()))
+	case settings.Mode != Shared && settings.fastPort() == settings.stealthPort():
+		fmt.Fprintf(log, "Server listening on %s (TCP and UDP)\n", addrPort(address, settings.fastPort()))
+	default:
 		fmt.Fprintf(log, "Server listening on %s (UDP Fast) and %s (TCP Stealth)\n",
-			addrPort(httpsAddress, settings.fastPort()), addrPort(httpsAddress, settings.stealthPort()))
+			addrPort(address, settings.fastPort()), addrPort(address, settings.stealthPort()))
 	}
 	changes := time.NewTicker(500 * time.Millisecond)
 	defer changes.Stop()
@@ -202,6 +311,16 @@ func runEngine(ctx context.Context, dir string, settings Settings, address strin
 		case err := <-serveErrors:
 			return err
 		case <-changes.C:
+			if stealth != nil {
+				active, err := stealth.refresh(instance, warn)
+				if err != nil {
+					return err
+				}
+				if active && !stealthListening {
+					fmt.Fprintf(log, "Stealth listening on %s\n", addrPort(address, settings.stealthPort()))
+				}
+				stealthListening = active
+			}
 			next, err := ReadDevices(dir)
 			if err != nil {
 				if message := err.Error(); message != lastWarning {
@@ -219,7 +338,7 @@ func runEngine(ctx context.Context, dir string, settings Settings, address strin
 					return fmt.Errorf("reload web authentication: %w", err)
 				}
 			}
-			if err := instance.ReloadInbounds(makeConfig(httpsAddress, next), deviceIDs(next)); err != nil {
+			if err := instance.ReloadInbounds(makeConfig(address, next), deviceIDs(next)); err != nil {
 				return fmt.Errorf("reload server credentials: %w", err)
 			}
 			devices = next
@@ -265,8 +384,9 @@ func testListenAddress(raw string) (string, error) {
 func redirectHTTPS(settings Settings) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := settings.webName()
-		if settings.CDNDomain != "" && strings.EqualFold(requestHost(r.Host), settings.CDNDomain) {
-			host = settings.CDNDomain
+		if !equalDNS(requestHost(r.Host), host) {
+			http.NotFound(w, r)
+			return
 		}
 		if settings.stealthPort() != 443 {
 			host = addrPort(host, settings.stealthPort())
@@ -287,6 +407,11 @@ func serve(server *http.Server, host string, port uint16, failures chan<- error)
 	if err != nil {
 		return nil, err
 	}
+	return serveOn(server, listener, failures), nil
+}
+
+func serveOn(server *http.Server, listener net.Listener, failures chan<- error) net.Listener {
+	web := &webListener{Listener: listener, server: server}
 	go func() {
 		var err error
 		if server.TLSConfig != nil {
@@ -294,26 +419,28 @@ func serve(server *http.Server, host string, port uint16, failures chan<- error)
 		} else {
 			err = server.Serve(listener)
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+		if err != nil && !web.closing.Load() {
 			failures <- fmt.Errorf("web listener %s: %w", listener.Addr(), err)
 		}
 	}()
-	return &webListener{Listener: listener, server: server}, nil
+	return web
 }
 
 type webListener struct {
 	net.Listener
-	server *http.Server
+	server  *http.Server
+	closing atomic.Bool
 }
 
 func (l *webListener) Close() error {
 	// Close both sides in case shutdown races the Serve goroutine's startup.
+	l.closing.Store(true)
 	err := l.server.Close()
 	_ = l.Listener.Close()
 	return err
 }
 
-func serverConfig(settings Settings, devices []Device, address string, masqueradePort, probePort int, testHosts map[string]netip.Addr) engine.Object {
+func serverConfig(settings Settings, devices []Device, address string, listeners serverListeners, testHosts map[string]netip.Addr) engine.Object {
 	vlessUsers := make([]engine.Object, 0, len(devices))
 	fastUsers := make([]engine.Object, 0, len(devices))
 	rescueUsers := make([]engine.Object, 0, len(devices))
@@ -329,17 +456,8 @@ func serverConfig(settings Settings, devices []Device, address string, masquerad
 		emptySID := sha256.Sum256([]byte("pipe/empty/reality-sid/" + settings.RealityPrivateKey))
 		shortIDs = []string{hex.EncodeToString(emptySID[:8])}
 	}
-	realityHandshake := engine.Object{"server": "127.0.0.1", "server_port": settings.Ports.Decoy}
-	if settings.HTTPSProxyListener != nil {
-		// Shared mode: always our own HTTPS proxy site, whatever the saved address
-		// says, reached where it listens (loopback when it listens on every address).
-		proxyHost := "127.0.0.1"
-		if ip, err := netip.ParseAddr(address); err == nil && !ip.IsUnspecified() {
-			proxyHost = ip.String()
-		}
-		realityHandshake = engine.Object{"server": proxyHost, "server_port": settings.HTTPSProxyListener.Port}
-	}
-	realityInbound := func(name, tag, listen string, port uint16) engine.Object {
+	realityHandshake := engine.Object{"server": "127.0.0.1", "server_port": listeners.mainTLS}
+	realityInbound := func(name, tag, listen string, port uint16, handshake engine.Object) engine.Object {
 		return engine.Object{
 			"type": "vless", "tag": tag, "listen": listen, "listen_port": port, "users": vlessUsers,
 			"tls": engine.Object{
@@ -347,12 +465,12 @@ func serverConfig(settings Settings, devices []Device, address string, masquerad
 				"reality": engine.Object{
 					"enabled": true, "private_key": settings.RealityPrivateKey, "short_id": shortIDs,
 					"max_time_difference": "1m",
-					"handshake":           realityHandshake,
+					"handshake":           handshake,
 				},
 			},
 		}
 	}
-	masquerade := engine.Object{"type": "proxy", "url": "http://127.0.0.1:" + strconv.Itoa(masqueradePort), "rewrite_host": false}
+	masquerade := engine.Object{"type": "proxy", "url": "http://127.0.0.1:" + strconv.Itoa(listeners.masquerade), "rewrite_host": false}
 	inbounds := []engine.Object{{
 		"type": "hysteria2", "tag": "fast", "listen": address, "listen_port": settings.fastPort(), "users": fastUsers,
 		"bbr_profile": "standard", "ignore_client_bandwidth": true,
@@ -362,36 +480,39 @@ func serverConfig(settings Settings, devices []Device, address string, masquerad
 	outbounds := []engine.Object{{"type": "direct", "tag": "direct"}, {"type": "direct", "tag": "probe-direct"}}
 	var routeRules []engine.Object
 	switch {
-	case settings.Mode == Shared && settings.realityTargetProblem() != nil:
-		// Stealth stays off. Fast, Rescue and the HTTPS proxy are unaffected.
+	case settings.Mode == Shared && listeners.borrowProxy:
+		// Use the running HTTPS proxy's address. A wildcard listener is reachable on loopback.
+		proxyHost := "127.0.0.1"
+		if ip, err := netip.ParseAddr(address); err == nil && !ip.IsUnspecified() {
+			proxyHost = ip.String()
+		}
+		handshake := engine.Object{"server": proxyHost, "server_port": settings.HTTPSProxyListener.Port}
+		inbounds = append(inbounds, realityInbound(settings.stealthName(), "stealth", address, settings.stealthPort(), handshake))
 	case settings.Mode == Shared:
-		// The fallback is our own HTTPS proxy site, so any SNI gets that site's strict answer.
-		inbounds = append(inbounds, realityInbound(strings.ToLower(settings.RealitySNI), "stealth", address, settings.stealthPort()))
-	case settings.CDNDomain == "":
-		inbounds = append(inbounds, realityInbound(settings.webName(), "stealth", address, settings.stealthPort()))
+		// Stealth requires a running HTTPS proxy.
+	case settings.rescuePort() == 0:
+		inbounds = append(inbounds, realityInbound(settings.webName(), "stealth", address, settings.stealthPort(), realityHandshake))
 	default:
 		// The pinned REALITY inlet accepts one server name. Use sing-box's
 		// TLS sniffer to forward the original bytes to the corresponding inlet.
 		inbounds = append(inbounds,
-			realityInbound(settings.webName(), "stealth", "127.0.0.1", settings.Ports.RealityOrigin),
-			realityInbound(settings.CDNDomain, "stealth-cdn", "127.0.0.1", settings.Ports.RealityCDN),
+			realityInbound(settings.webName(), "stealth", "127.0.0.1", settings.Ports.RealityOrigin, realityHandshake),
+			realityInbound(settings.CDNDomain, "stealth-cdn", "127.0.0.1", settings.Ports.RealityCDN,
+				engine.Object{"server": "127.0.0.1", "server_port": listeners.rescueTLS}),
 			engine.Object{"type": "direct", "tag": engine.RealityFrontTag, "listen": address, "listen_port": settings.stealthPort(), "network": "tcp"},
 		)
 		outbounds = append(outbounds, engine.Object{"type": "direct", "tag": "front-direct"})
 		routeRules = append(routeRules,
 			engine.Object{"inbound": engine.RealityFrontTag, "action": "sniff", "sniffer": "tls", "timeout": "500ms"},
-			engine.Object{"inbound": engine.RealityFrontTag, "protocol": "tls", "domain": settings.CDNDomain, "outbound": "front-direct", "override_address": "127.0.0.1", "override_port": settings.Ports.RealityCDN},
+			engine.Object{"inbound": engine.RealityFrontTag, "protocol": "tls", "domain": settings.CDNDomain,
+				"source_ip_cidr": rescueSourceCIDRs(listeners.allowLoopback), "outbound": "front-direct",
+				"override_address": "127.0.0.1", "override_port": settings.Ports.RealityCDN},
 			engine.Object{"inbound": engine.RealityFrontTag, "protocol": "tls", "domain": settings.webName(), "outbound": "front-direct", "override_address": "127.0.0.1", "override_port": settings.Ports.RealityOrigin},
-			// sing-box replays the buffered bytes, including partial ClientHellos.
-			engine.Object{"inbound": engine.RealityFrontTag, "outbound": "front-direct", "override_address": "127.0.0.1", "override_port": settings.Ports.Decoy},
+			// The fallback accepts the main name only, including if sniffing timed out.
+			engine.Object{"inbound": engine.RealityFrontTag, "outbound": "front-direct", "override_address": "127.0.0.1", "override_port": listeners.mainTLS},
 		)
 	}
-	if settings.CDNDomain != "" && settings.Mode == Shared {
-		inbounds = append(inbounds, engine.Object{
-			"type": engine.SharedRescue, "tag": "rescue", "listen": settings.RescueListen,
-			"host": settings.CDNDomain, "path": settings.WSPath, "users": rescueUsers,
-		})
-	} else if settings.CDNDomain != "" {
+	if settings.rescuePort() != 0 {
 		inbounds = append(inbounds, engine.Object{
 			"type": "vmess", "tag": "rescue", "listen": "127.0.0.1", "listen_port": settings.Ports.VMess, "users": rescueUsers,
 			"transport": engine.Object{
@@ -401,7 +522,7 @@ func serverConfig(settings Settings, devices []Device, address string, masquerad
 	}
 	probe := engine.Object{
 		"domain": engine.ProbeDomain, "network": "tcp", "port": 80,
-		"outbound": "probe-direct", "override_address": "127.0.0.1", "override_port": probePort,
+		"outbound": "probe-direct", "override_address": "127.0.0.1", "override_port": listeners.probe,
 	}
 	if settings.Mode == Shared {
 		outbounds[1]["type"] = engine.InMemoryProbe

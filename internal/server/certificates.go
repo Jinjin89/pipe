@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -12,10 +13,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -26,16 +29,22 @@ const TestRootFile = "ca.pem"
 const httpsCertificateStorage = "certificates"
 
 func (s Settings) names() []string {
-	names := []string{s.webName()}
-	for _, name := range []string{s.fastName(), s.CDNDomain} {
-		if name != "" && !slices.Contains(names, name) {
-			names = append(names, name)
-		}
+	names := s.mainNames()
+	if s.CDNDomain != "" && !slices.Contains(names, s.CDNDomain) {
+		names = append(names, s.CDNDomain)
 	}
 	return names
 }
 
-func managedCertificates(dir string, settings Settings) (*certmagic.Config, *certmagic.ACMEIssuer, func(), error) {
+func (s Settings) mainNames() []string {
+	names := []string{s.webName()}
+	if name := s.fastName(); name != "" && name != names[0] {
+		names = append(names, name)
+	}
+	return names
+}
+
+func managedCertificates(dir string, settings Settings) (*certmagic.Config, *certmagic.ACMEIssuer, *certmagic.Cache, error) {
 	path := filepath.Join(dir, httpsCertificateStorage)
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, nil, nil, err
@@ -44,11 +53,7 @@ func managedCertificates(dir string, settings Settings) (*certmagic.Config, *cer
 	cache := certmagic.NewCache(certmagic.CacheOptions{
 		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return config, nil },
 	})
-	config = certmagic.New(cache, certmagic.Config{
-		Storage:            &certmagic.FileStorage{Path: path},
-		DefaultServerName:  settings.webName(),
-		FallbackServerName: settings.webName(),
-	})
+	config = certmagic.New(cache, certmagic.Config{Storage: &certmagic.FileStorage{Path: path}})
 	issuer := certmagic.NewACMEIssuer(config, certmagic.ACMEIssuer{
 		CA:                      certmagic.LetsEncryptProductionCA,
 		Agreed:                  true,
@@ -56,10 +61,31 @@ func managedCertificates(dir string, settings Settings) (*certmagic.Config, *cer
 		AltHTTPPort:             int(settings.Ports.HTTP),
 	})
 	config.Issuers = []certmagic.Issuer{issuer}
-	return config, issuer, cache.Stop, nil
+	return config, issuer, cache, nil
 }
 
-func testCertificate(dir string, settings Settings) (*tls.Certificate, error) {
+func cachedCertificate(cache *certmagic.Cache, name string) *tls.Certificate {
+	matches := cache.AllMatchingCertificates(strings.ToLower(name))
+	if len(matches) == 0 {
+		return nil
+	}
+	return &matches[0].Certificate
+}
+
+func manageStandaloneCertificates(ctx context.Context, config *certmagic.Config, settings Settings, log io.Writer) error {
+	names := settings.mainNames()
+	if err := config.ManageSync(ctx, names); err != nil {
+		return err
+	}
+	if name := settings.CDNDomain; name != "" && !slices.Contains(names, name) {
+		if err := config.ManageAsync(ctx, []string{name}); err != nil {
+			fmt.Fprintf(log, "Warning: start background certificate management for Rescue: %v\n", err)
+		}
+	}
+	return nil
+}
+
+func testCertificates(dir string, names []string) (map[string]*tls.Certificate, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -73,6 +99,22 @@ func testCertificate(dir string, settings Settings) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	certificates := make(map[string]*tls.Certificate, len(names))
+	for _, name := range names {
+		name = strings.ToLower(name)
+		if certificates[name] != nil {
+			continue
+		}
+		cert, err := issueLeaf(name, now, 24*time.Hour, root, rootKey)
+		if err != nil {
+			return nil, err
+		}
+		certificates[name] = cert
+	}
+	return certificates, nil
+}
+
+func issueLeaf(name string, now time.Time, lifetime time.Duration, issuer *x509.Certificate, issuerKey *ecdsa.PrivateKey) (*tls.Certificate, error) {
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -82,11 +124,14 @@ func testCertificate(dir string, settings Settings) (*tls.Certificate, error) {
 		return nil, err
 	}
 	leaf := &x509.Certificate{
-		SerialNumber: serial, DNSNames: settings.names(),
-		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour),
+		SerialNumber: serial, DNSNames: []string{name},
+		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(lifetime),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, leaf, root, &leafKey.PublicKey, rootKey)
+	if issuer == nil {
+		issuer, issuerKey = leaf, leafKey
+	}
+	der, err := x509.CreateCertificate(rand.Reader, leaf, issuer, &leafKey.PublicKey, issuerKey)
 	if err != nil {
 		return nil, err
 	}
@@ -95,6 +140,32 @@ func testCertificate(dir string, settings Settings) (*tls.Certificate, error) {
 		return nil, err
 	}
 	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: leafKey, Leaf: parsedLeaf}, nil
+}
+
+func fastCertificateForName(name string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if !equalDNS(hello.ServerName, name) {
+			return nil, errTLSName
+		}
+		cert, err := getCertificate(hello)
+		if err != nil {
+			return nil, err
+		}
+		if cert == nil || len(cert.Certificate) == 0 {
+			return nil, errors.New("missing Fast TLS certificate")
+		}
+		leaf := cert.Leaf
+		if leaf == nil {
+			leaf, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return nil, err
+			}
+		}
+		if len(leaf.DNSNames) != 1 || len(leaf.IPAddresses) != 0 || !equalDNS(leaf.DNSNames[0], name) {
+			return nil, fmt.Errorf("Fast TLS certificate must cover only %s", name)
+		}
+		return cert, nil
+	}
 }
 
 func loadOrCreateTestRoot(dir string, now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,65 +17,59 @@ import (
 
 const sysctlConfig = "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\n"
 
-// installEUID and installApplyHop are variables so tests can avoid root and nft.
-var (
-	installEUID     = os.Geteuid
-	installApplyHop = ApplyFastHop
-)
+var installEUID = os.Geteuid
 
-func Install(ctx context.Context, dir, executable string, mode DeployMode, warn func(string)) ([]string, []string, error) {
-	settings, err := ReadSettings(dir)
+func Install(_ context.Context, dir, executable string, mode DeployMode, _ func(string)) ([]string, []string, error) {
+	root := installEUID() == 0
+	var settings Settings
+	var err error
+	if root {
+		run := setupRun{opts: SetupOptions{Dir: dir}}
+		settings, err = run.readSetupSettings()
+	} else {
+		settings, err = ReadSettings(dir)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 	if mode != "" && mode != Auto && mode != settings.Mode {
 		return nil, nil, fmt.Errorf("server was initialized in %s mode", settings.Mode)
 	}
-	if settings.Mode == Shared {
-		if err := settings.realityTargetProblem(); err != nil && warn != nil {
-			warn("Stealth will be off: " + err.Error())
+	var paths []string
+	if !root {
+		paths, err = GenerateInstall(dir, executable)
+		if err != nil {
+			return paths, nil, err
 		}
-	}
-	paths, err := GenerateInstall(dir, executable)
-	if err != nil {
-		return paths, nil, err
 	}
 	hints := []string{
 		fmt.Sprintf("Saved deployment mode %s.", settings.Mode),
-		fmt.Sprintf("Allow clients from any IP on UDP %d and TCP %d.", settings.fastPort(), settings.stealthPort()),
+		fmt.Sprintf("Allow clients from any IP on Fast UDP %d.", settings.fastPort()),
 	}
-	if settings.FastHop != "" {
-		if installEUID() == 0 {
-			if err := installApplyHop(ctx, settings.FastHop, settings.fastPort()); err != nil {
-				return paths, nil, err
-			}
-		} else {
-			hints = append(hints, "Fast port hopping is applied by pipe-hop.service (or run pipe server hop-apply as root).")
-		}
+	if settings.realityTargetProblem() == nil {
+		hints = append(hints, fmt.Sprintf("Allow clients from any IP on Stealth TCP %d.", settings.stealthPort()))
 	}
+	hints = append(hints, "Use sudo pipe server setup --yes with the same --dir to render and install the systemd units and sysctl file as root.")
 	if settings.FastHop == "" {
 		hints = append(hints, "For connections from CN, consider initializing with --fast-hop 20000-40000.")
 	} else {
 		hints = append(hints, "Allow the Fast UDP hopping range "+settings.FastHop+".",
-			"Copy the generated pipe-hop.service into /etc/systemd/system, then run:",
-			"systemctl daemon-reload",
-			"systemctl enable --now pipe-hop.service")
+			"Fast port hopping is applied by pipe-hop.service. To configure it with setup, supply --fast-hop and --fast-port.")
 	}
 	switch settings.Mode {
 	case Standalone:
 		hints = append(hints, fmt.Sprintf("Allow TCP %d for ACME HTTP-01.", settings.Ports.HTTP))
 	case Shared:
 		hints = append(hints, "Keep the existing website's TCP 443 restriction.")
-		if cfg := settings.HTTPSProxyListener; cfg != nil {
+		if cfg := settings.HTTPSProxyListener; cfg != nil && !cfg.retired() {
 			hints = append(hints, fmt.Sprintf("Allow TCP %d for the HTTPS proxy on its DNS-only domain.", cfg.Port))
-			if cfg.method() == "http" || cfg.method() == "nginx" {
+			if cfg.method() == "http" {
 				hints = append(hints, "Allow public TCP 80 for HTTPS proxy HTTP-01.")
 			}
 		}
-		if settings.RescueListen != "" {
-			hints = append(hints, "Allow the reverse proxy's bridge to reach "+settings.RescueListen+" if required.",
-				"Cloudflare Rescue subdomain: WebSockets on, SSL Full (strict), exempt it from Bot Fight Mode, and bypass caching. Cloudflare can close idle WebSockets after 100 s.",
-				nginxLocation(settings))
+		if port := settings.sharedRescuePort(); port != 0 {
+			hints = append(hints, fmt.Sprintf("Allow TCP %d for Rescue. Only Cloudflare needs it.", port),
+				"Cloudflare Rescue subdomain: enable WebSockets, use SSL Full (strict), and bypass caching. Cloudflare can close idle WebSockets after 100 s.")
 		}
 	}
 	return paths, hints, nil
@@ -106,8 +99,8 @@ func GenerateInstall(dir, executable string) ([]string, error) {
 		}
 		paths = append(paths, filepath.Join(output, file.name))
 	}
-	if nginxConfig(settings) == "" {
-		path := filepath.Join(output, "pipe-nginx.conf")
+	for _, name := range []string{"pipe-rescue.nginx", "pipe-nginx.conf"} {
+		path := filepath.Join(output, name)
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return paths, err
 		}
@@ -121,6 +114,28 @@ type installFile struct {
 }
 
 func installArtifacts(settings Settings, state, executable string) []installFile {
+	firewall := fmt.Sprintf("# Add to your existing input chain.\nudp dport %d accept\n", settings.fastPort())
+	if settings.realityTargetProblem() == nil {
+		firewall += fmt.Sprintf("tcp dport %d accept\n", settings.stealthPort())
+	}
+	if settings.Mode == Standalone {
+		firewall += fmt.Sprintf("tcp dport %d accept # ACME HTTP-01\n", settings.Ports.HTTP)
+	} else if cfg := settings.HTTPSProxyListener; cfg != nil && !cfg.retired() {
+		firewall += fmt.Sprintf("tcp dport %d accept # HTTPS forward proxy\n", cfg.Port)
+		if cfg.method() == "http" {
+			firewall += "tcp dport 80 accept # ACME HTTP-01\n"
+		}
+	}
+	if settings.FastHop != "" {
+		firewall += fmt.Sprintf("# In prerouting, allow udp dport %s before translation to %d.\n", settings.FastHop, settings.fastPort())
+	}
+	files := systemInstallFiles(state, executable, SetupFast{Port: settings.fastPort(), Hop: settings.FastHop})
+	return append(files, installFile{"pipe.nft", firewall, 0644})
+}
+
+const hopServiceUnit = "pipe-hop.service"
+
+func systemInstallFiles(state, executable string, fast SetupFast) []installFile {
 	unit := fmt.Sprintf(`[Unit]
 Description=Pipe server
 Wants=network-online.target
@@ -140,30 +155,11 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 `, unitArgument(executable), unitArgument(state))
-	firewall := fmt.Sprintf("# Add to your existing input chain before its drop rule.\ntcp dport %d accept\nudp dport %d accept\n", settings.stealthPort(), settings.fastPort())
-	if settings.Mode == Standalone {
-		firewall += fmt.Sprintf("tcp dport %d accept # ACME HTTP-01\n", settings.Ports.HTTP)
-	} else if cfg := settings.HTTPSProxyListener; cfg != nil {
-		firewall += fmt.Sprintf("tcp dport %d accept # HTTPS forward proxy\n", cfg.Port)
-		if cfg.method() == "http" || cfg.method() == "nginx" {
-			firewall += "tcp dport 80 accept # ACME HTTP-01\n"
-		}
-	}
-	if settings.FastHop != "" {
-		firewall += fmt.Sprintf("# In prerouting, allow udp dport %s before translation to %d.\n", settings.FastHop, settings.fastPort())
-	}
 	files := []installFile{
 		{"pipe.service", unit, 0644},
 		{"90-pipe.conf", sysctlConfig, 0644},
-		{"pipe.nft", firewall, 0644},
 	}
-	if settings.Mode == Shared && settings.RescueListen != "" {
-		files = append(files, installFile{"pipe-rescue.nginx", nginxLocation(settings), 0600})
-	}
-	if nginx := nginxConfig(settings); nginx != "" {
-		files = append(files, installFile{"pipe-nginx.conf", nginx, 0600})
-	}
-	if settings.FastHop != "" {
+	if fast.Hop != "" {
 		hopUnit := fmt.Sprintf(`[Unit]
 Description=Pipe Fast UDP port hopping
 After=nftables.service
@@ -179,99 +175,10 @@ ExecStart=%s server hop-apply --fast-hop %s --fast-port %d
 
 [Install]
 WantedBy=multi-user.target
-`, unitArgument(executable), settings.FastHop, settings.fastPort())
-		files = append(files, installFile{"pipe-hop.service", hopUnit, 0644})
+`, unitArgument(executable), fast.Hop, fast.Port)
+		files = append(files, installFile{hopServiceUnit, hopUnit, 0644})
 	}
 	return files
-}
-
-func nginxLocation(settings Settings) string {
-	listen, _ := privateRescueAddress(settings.RescueListen)
-	return fmt.Sprintf(`location = %s {
-    proxy_pass http://%s;
-    proxy_http_version 1.1;
-    proxy_set_header Host $http_host;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 1h;
-    proxy_buffering off;
-    access_log off;
-}
-`, settings.WSPath, listen)
-}
-
-// hostListensIPv6 reports whether this host can open IPv6 sockets: nginx
-// refuses a whole config whose [::] listen it cannot open (D20 for nginx).
-var hostListensIPv6 = func() bool {
-	listener, err := net.Listen("tcp6", "[::]:0")
-	if err != nil {
-		return !ipv6Unavailable(err)
-	}
-	_ = listener.Close()
-	return true
-}
-
-// nginxListen is one listen line, plus its IPv6 twin when the host has IPv6.
-func nginxListen(port string) string {
-	line := "    listen " + port + ";\n"
-	if hostListensIPv6() {
-		line += "    listen [::]:" + port + ";\n"
-	}
-	return line
-}
-
-func nginxConfig(settings Settings) string {
-	if settings.Mode != Shared {
-		return ""
-	}
-	var out strings.Builder
-	if settings.RescueListen != "" {
-		location := strings.TrimSuffix(nginxLocation(settings), "\n")
-		fmt.Fprintf(&out, `server {
-%s    server_name %s;
-    # Uses the http-level certificate. Otherwise, add your certificate and key directives here.
-
-    %s
-    location / { return 404; }
-}
-`, nginxListen("443 ssl"), settings.CDNDomain, strings.ReplaceAll(location, "\n", "\n    "))
-	}
-	if cfg := settings.HTTPSProxyListener; cfg != nil && cfg.method() == "nginx" {
-		if out.Len() != 0 {
-			out.WriteByte('\n')
-		}
-		out.WriteString(nginxACMEBlock(*cfg))
-	}
-	return out.String()
-}
-
-func nginxACMEBlock(cfg httpsProxyListenerConfig) string {
-	return fmt.Sprintf(`server {
-    # Open TCP 80 to all IPs in the provider firewall for HTTP-01.
-%s    server_name %s;
-
-    location ^~ /.well-known/acme-challenge/ {
-        # Override any inherited Cloudflare-only allowlist for ACME validators.
-        allow all;
-        limit_except GET { deny all; }
-        proxy_pass http://%s;
-        proxy_set_header Host $http_host;
-        access_log off;
-    }
-    location / { return 404; }
-}
-`, nginxListen("80"), cfg.Domain, cfg.ACMEListen)
-}
-
-func ProxyACMENginx(dir string) (string, error) {
-	settings, err := ReadSettings(dir)
-	if err != nil {
-		return "", err
-	}
-	if cfg := settings.HTTPSProxyListener; cfg != nil && cfg.method() == "nginx" {
-		return nginxACMEBlock(*cfg), nil
-	}
-	return "", nil
 }
 
 const hopTableComment = "pipe Fast port hopping"

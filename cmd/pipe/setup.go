@@ -13,104 +13,162 @@ import (
 )
 
 func runServerSetup(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("pipe server setup", flag.ContinueOnError)
-	var o server.SetupOptions
-	fs.BoolVar(&o.Yes, "yes", false, "do not ask questions; use flags and defaults")
-	fs.StringVar(&o.Dir, "dir", "/var/lib/pipe", "server state directory")
-	fs.StringVar(&o.Mode, "mode", "", "standalone or shared (default: detected)")
-	fs.StringVar(&o.Domain, "domain", "", "server DNS name (shared mode: or public IP)")
-	fs.StringVar(&o.FastSNI, "fast-sni", "", "Fast TLS DNS name (required for an IP address)")
-	fs.StringVar(&o.CDNDomain, "cdn-domain", "", "optional CDN DNS name for Rescue")
-	fs.StringVar(&o.RescueListen, "rescue-listen", "", "shared Rescue listener, private IP:port")
-	fs.StringVar(&o.RealityDest, "reality-dest", "", "only \"self\" (the default): Stealth borrows your HTTPS proxy site, so it needs proxy-domain")
-	fs.StringVar(&o.FastHop, "fast-hop", "", "Fast UDP hopping range, for example 20000-40000")
-	fs.StringVar(&o.ProxyDomain, "proxy-domain", "", "shared mode: DNS-only HTTPS proxy hostname")
-	fs.StringVar(&o.ProxyCertMethod, "proxy-cert-method", "", "auto, http, nginx, dns or files")
-	fs.StringVar(&o.ACMEListen, "acme-listen", "", "private IP:port for the nginx ACME method")
-	fs.StringVar(&o.DNS, "dns", "", "ACME DNS-01 provider (cloudflare or alidns)")
-	fs.StringVar(&o.DNSKeyFile, "dns-key-file", "", "AliDNS AccessKey file")
-	fs.StringVar(&o.DNSTokenFile, "dns-token-file", "", "Cloudflare API token file")
-	fs.StringVar(&o.Cert, "cert", "", "TLS certificate chain file (must stay readable by user pipe)")
-	fs.StringVar(&o.Key, "key", "", "TLS private key file (must stay readable by user pipe)")
-	fs.StringVar(&o.Device, "device", "", "device name to add (default phone on a fresh install)")
-	var configPath string
-	var template bool
-	fs.BoolVar(&template, "template", false, "print a commented JSON setup file to stdout and exit (--mode picks the layout)")
-	fs.StringVar(&configPath, "config", "", "JSON file with setup options (implies --yes)")
-	if err := parseFlags(fs, args); err != nil {
+	if len(args) > 0 && args[0] == server.ApplySetupUpdateCommand {
+		if len(args) != 3 {
+			return errors.New("invalid setup update")
+		}
+		return server.ApplySetupUpdate(ctx, args[1], args[2])
+	}
+	o, template, err := parseSetupOptions(args)
+	if err != nil {
 		return err
-	}
-	if fs.NArg() != 0 {
-		return errors.New("server setup takes only flags")
-	}
-	if template {
-		if configPath != "" {
-			return errors.New("--template and --config cannot be used together")
-		}
-		env, err := server.NewSetupEnv(os.Stdin, os.Stdout)
-		if err != nil {
-			return err
-		}
-		return printSetupTemplate(env, os.Stdout, server.DeployMode(o.Mode))
-	}
-	if configPath != "" {
-		cfg, err := server.LoadSetupConfig(configPath)
-		if err != nil {
-			return err
-		}
-		set := map[string]bool{}
-		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-		o = mergeSetupConfig(cfg, o, set)
 	}
 	env, err := server.NewSetupEnv(os.Stdin, os.Stdout)
 	if err != nil {
 		return err
 	}
+	if template {
+		env.Out = os.Stderr
+		return printSetupTemplate(env, os.Stdout, o.Dir)
+	}
 	return server.Setup(ctx, env, o)
 }
 
-// mergeSetupConfig applies the JSON values, then lets flags that were set
-// explicitly override them. A config implies --yes.
-func mergeSetupConfig(cfg, flags server.SetupOptions, set map[string]bool) server.SetupOptions {
-	out := cfg
-	out.Yes = true
-	if out.Dir == "" {
-		out.Dir = flags.Dir
+func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
+	fs := flag.NewFlagSet("pipe server setup", flag.ContinueOnError)
+	var flags server.SetupOptions
+	var cert server.SetupCertificate
+	var proxy server.SetupPort
+	var rescue server.SetupRescue
+	fs.BoolVar(&flags.Yes, "yes", false, "do not ask questions; use flags and defaults")
+	fs.StringVar(&flags.Dir, "dir", "/var/lib/pipe", "server state directory")
+	fs.StringVar(&flags.IP, "ip", "", "IP address for device links (default: the SNI name)")
+	fs.StringVar(&flags.SNI, "sni", "", "server DNS-only name for Fast, Stealth and the HTTPS proxy")
+	fs.StringVar(&cert.DNS, "dns", "", "certificate DNS provider (cloudflare or alidns)")
+	fs.StringVar(&cert.TokenFile, "dns-token-file", "", "owner-only Cloudflare API token file")
+	fs.StringVar(&cert.KeyFile, "dns-key-file", "", "owner-only AliDNS AccessKey file")
+	fs.StringVar(&cert.File, "cert", "", "TLS certificate chain file (readable by user pipe)")
+	fs.StringVar(&cert.Key, "key", "", "TLS private key file (readable only by user pipe)")
+	registerPortFlag(fs, &flags.Fast.Port, "fast-port", "Fast UDP port (default 443)")
+	fs.StringVar(&flags.Fast.Hop, "fast-hop", "", "optional Fast UDP hopping range, for example 20000-40000")
+	registerPortFlag(fs, &flags.Stealth.Port, "stealth-port", "Stealth TCP port (default 443 standalone, 8443 shared)")
+	registerPortFlag(fs, &proxy.Port, "proxy-port", "HTTPS proxy TCP port (default 443 standalone, 9443 shared)")
+	fs.BoolVar(&flags.NoProxy, "no-proxy", false, "disable the HTTPS proxy and shared Stealth")
+	fs.StringVar(&rescue.SNI, "rescue-sni", "", "optional Rescue CDN DNS name (empty disables Rescue)")
+	registerPortFlag(fs, &rescue.Port, "rescue-port", "Rescue TLS port (default 443 standalone, 2053 shared)")
+	fs.StringVar(&rescue.Cert, "rescue-cert", "", "shared Rescue certificate chain file")
+	fs.StringVar(&rescue.Key, "rescue-key", "", "shared Rescue owner-only private key file")
+	fs.StringVar(&flags.Device, "device", "", "device name to add (default phone on a fresh install)")
+	var configPath string
+	var template bool
+	fs.BoolVar(&template, "template", false, "print the JSON setup template for this host")
+	fs.StringVar(&configPath, "config", "", "JSON setup file (implies --yes)")
+	if err := parseFlags(fs, args); err != nil {
+		return server.SetupOptions{}, false, err
 	}
-	fields := []struct {
+	if fs.NArg() != 0 {
+		return server.SetupOptions{}, false, errors.New("server setup takes only flags")
+	}
+	if template && configPath != "" {
+		return server.SetupOptions{}, false, errors.New("--template and --config cannot be used together")
+	}
+	var o server.SetupOptions
+	if configPath != "" {
+		var err error
+		o, err = server.LoadSetupConfig(configPath)
+		if err != nil {
+			return o, false, err
+		}
+	}
+	o.Dir, o.Yes, o.NoProxy = flags.Dir, o.Yes || flags.Yes, flags.NoProxy
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	for _, f := range []struct {
 		name string
 		dst  *string
 		src  string
 	}{
-		{"dir", &out.Dir, flags.Dir},
-		{"mode", &out.Mode, flags.Mode},
-		{"domain", &out.Domain, flags.Domain},
-		{"fast-sni", &out.FastSNI, flags.FastSNI},
-		{"cdn-domain", &out.CDNDomain, flags.CDNDomain},
-		{"rescue-listen", &out.RescueListen, flags.RescueListen},
-		{"reality-dest", &out.RealityDest, flags.RealityDest},
-		{"fast-hop", &out.FastHop, flags.FastHop},
-		{"proxy-domain", &out.ProxyDomain, flags.ProxyDomain},
-		{"proxy-cert-method", &out.ProxyCertMethod, flags.ProxyCertMethod},
-		{"acme-listen", &out.ACMEListen, flags.ACMEListen},
-		{"dns", &out.DNS, flags.DNS},
-		{"dns-key-file", &out.DNSKeyFile, flags.DNSKeyFile},
-		{"dns-token-file", &out.DNSTokenFile, flags.DNSTokenFile},
-		{"cert", &out.Cert, flags.Cert},
-		{"key", &out.Key, flags.Key},
-		{"device", &out.Device, flags.Device},
-	}
-	for _, f := range fields {
+		{"ip", &o.IP, flags.IP}, {"sni", &o.SNI, flags.SNI},
+		{"device", &o.Device, flags.Device}, {"fast-hop", &o.Fast.Hop, flags.Fast.Hop},
+	} {
 		if set[f.name] {
 			*f.dst = f.src
 		}
 	}
-	return out
+	if set["fast-port"] {
+		o.Fast.Port = flags.Fast.Port
+	}
+	if set["stealth-port"] {
+		o.Stealth = flags.Stealth
+	}
+	if o.NoProxy {
+		if set["proxy-port"] {
+			return o, false, errors.New("--no-proxy cannot be combined with --proxy-port")
+		}
+		o.Proxy = nil
+	} else if set["proxy-port"] || (set["no-proxy"] && o.Proxy == nil) {
+		o.Proxy = &proxy
+	}
+	if set["rescue-sni"] && rescue.SNI == "" {
+		o.Rescue, o.ClearRescue = nil, true
+	} else if set["rescue-sni"] || set["rescue-port"] || set["rescue-cert"] || set["rescue-key"] {
+		if o.Rescue == nil {
+			o.Rescue = new(server.SetupRescue)
+		}
+		if set["rescue-sni"] {
+			o.Rescue.SNI = rescue.SNI
+		}
+		if set["rescue-port"] {
+			o.Rescue.Port = rescue.Port
+		}
+		if set["rescue-cert"] {
+			o.Rescue.Cert = rescue.Cert
+		}
+		if set["rescue-key"] {
+			o.Rescue.Key = rescue.Key
+		}
+	}
+	o.Cert = mergeSetupCertificate(o.Cert, cert, set)
+	return o, template, nil
+}
+
+func mergeSetupCertificate(base *server.SetupCertificate, flags server.SetupCertificate, set map[string]bool) *server.SetupCertificate {
+	dns := set["dns"] || set["dns-token-file"] || set["dns-key-file"]
+	files := set["cert"] || set["key"]
+	if !dns && !files {
+		return base
+	}
+	var cert server.SetupCertificate
+	if base != nil {
+		cert = *base
+	}
+	if !dns {
+		cert.DNS, cert.TokenFile, cert.KeyFile = "", "", ""
+	}
+	if !files {
+		cert.File, cert.Key = "", ""
+	}
+	if set["dns"] && cert.DNS != flags.DNS {
+		cert.DNS, cert.TokenFile, cert.KeyFile = flags.DNS, "", ""
+	}
+	for _, f := range []struct {
+		name string
+		dst  *string
+		src  string
+	}{
+		{"dns-token-file", &cert.TokenFile, flags.TokenFile}, {"dns-key-file", &cert.KeyFile, flags.KeyFile},
+		{"cert", &cert.File, flags.File}, {"key", &cert.Key, flags.Key},
+	} {
+		if set[f.name] {
+			*f.dst = f.src
+		}
+	}
+	return &cert
 }
 
 // printSetupTemplate writes the template. It does not need root.
-func printSetupTemplate(env server.SetupEnv, w io.Writer, layout server.DeployMode) error {
-	data, err := server.SetupTemplateFor(env, layout)
+func printSetupTemplate(env server.SetupEnv, w io.Writer, dir string) error {
+	data, err := server.SetupTemplateFor(env, dir)
 	if err != nil {
 		return err
 	}

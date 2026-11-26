@@ -12,8 +12,8 @@ import (
 const realitySelf = "self"
 
 var (
-	errSelfNeedsProxy = errors.New("reality_dest self needs the HTTPS proxy on its own domain (proxy_domain)")
-	errRealityNotSelf = errors.New("REALITY now always borrows your own HTTPS proxy site: use reality_dest self (it needs proxy_domain)")
+	errSelfNeedsProxy = errors.New("Stealth needs the HTTPS proxy on its own domain (proxy_domain)")
+	errRealityNotSelf = errors.New("reality_dest is retired and accepts only self")
 )
 
 func equalDNS(a, b string) bool { return strings.EqualFold(a, b) }
@@ -37,6 +37,8 @@ func (s Settings) realityTargetProblem() error {
 		return errors.New(s.realityBlocked)
 	case s.RealityDest == "" || s.HTTPSProxyListener == nil:
 		return errors.New("Stealth in shared mode borrows your own HTTPS proxy site, which is not enabled (pipe server proxy enable)")
+	case s.HTTPSProxyListener.retired():
+		return errors.New(retiredProxy)
 	case s.RealityDest != realitySelf:
 		return errors.New("the saved REALITY target " + s.RealityDest + " is no longer supported. Run: pipe server reality")
 	}
@@ -64,6 +66,9 @@ func SetRealityTarget(dir string) (bool, error) {
 	}
 	if !settings.borrowProxySite() {
 		return false, nil
+	}
+	if err := settings.validateSharedTCPPorts(settings.HTTPSProxyListener); err != nil {
+		return false, err
 	}
 	settings.Ports.RealityOrigin = 0
 	return true, writeJSON(dir, settingsFile, settings)

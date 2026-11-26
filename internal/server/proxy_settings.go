@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 
 	"pipe/internal/engine"
 	"pipe/internal/link"
+	"pipe/internal/localfile"
 
 	"github.com/caddyserver/certmagic"
 )
@@ -34,7 +36,7 @@ type httpsProxyListenerConfig struct {
 	Domain     string `json:"domain"`
 	Port       uint16 `json:"port"`
 	CertMethod string `json:"cert_method,omitempty"`
-	ACMEListen string `json:"acme_listen,omitempty"`
+	ACMEListen string `json:"acme_listen,omitempty"` // retired
 	DNS        string `json:"dns,omitempty"`
 	DNSSecret  string `json:"dns_secret,omitempty"`
 	Cert       string `json:"cert,omitempty"`
@@ -53,11 +55,21 @@ func (cfg httpsProxyListenerConfig) method() string {
 	return "files"
 }
 
+const retiredProxy = "HTTPS proxy nginx certificate mode is retired. Add a proxy section and configure cert.dns or cert.file and cert.key in setup JSON (keys and devices are kept)"
+
+func (cfg httpsProxyListenerConfig) retired() bool {
+	return cfg.method() == "nginx" || cfg.ACMEListen != ""
+}
+
+func validProxyDNSSecretName(name string) bool {
+	nonce, ok := strings.CutPrefix(name, proxyDNSSecretPrefix)
+	return ok && isHex(nonce, 16)
+}
+
 type ProxyEnableOptions struct {
 	Domain       string
 	Port         uint16
 	CertMethod   string
-	ACMEListen   string
 	DNS          string
 	DNSTokenFile string
 	DNSKeyFile   string
@@ -72,15 +84,19 @@ type ProxyEnableOptions struct {
 type proxySetup struct {
 	lookup     func(context.Context, string, string) ([]netip.Addr, error)
 	interfaces func() ([]net.Addr, error)
-	issue      func(context.Context, string, string, certmagic.DNSProvider) error
-	probeHTTP  func() (occupied, web bool, err error)
+	issue      func(context.Context, string, string, certmagic.DNSProvider, bool) error
+	probeHTTP  func() (occupied bool, err error)
 }
 
 func EnableProxy(ctx context.Context, dir string, opts ProxyEnableOptions) error {
-	return enableProxy(ctx, dir, opts, proxySetup{
+	return enableProxy(ctx, dir, opts, realProxySetup())
+}
+
+func realProxySetup() proxySetup {
+	return proxySetup{
 		lookup: net.DefaultResolver.LookupNetIP, interfaces: net.InterfaceAddrs,
 		issue: issueProxyCertificate, probeHTTP: probeProxyHTTP,
-	})
+	}
 }
 
 func enableProxy(ctx context.Context, dir string, opts ProxyEnableOptions, setup proxySetup) error {
@@ -99,34 +115,45 @@ func enableProxy(ctx context.Context, dir string, opts ProxyEnableOptions, setup
 		opts.Inform(fmt.Sprintf("HTTPS proxy certificate method: %s (%s).", method, reason))
 	}
 	opts.CertMethod = method
-	cfg, secretSource, err := proxyConfigForEnable(settings, opts)
+	cfg, secretSource, err := proxyConfigForEnable(opts)
 	if err != nil {
 		return err
 	}
-	if err := settings.validateProxyListener(cfg); err != nil {
+	if err := settings.validateProxyEnable(cfg); err != nil {
 		return err
 	}
 	cfg.Domain = strings.ToLower(cfg.Domain)
-	if cfg.WWW != "" {
-		if _, err := proxyCover(cfg.WWW, nil); err != nil {
-			return err
-		}
-	}
-	if equalDNS(cfg.Domain, settings.fastName()) && opts.Warn != nil {
-		opts.Warn("The HTTPS proxy domain also appears as the Fast TLS name")
-	}
-	if err := checkProxyDNS(ctx, cfg.Domain, setup, opts.Warn); err != nil {
+	secret, err := prepareProxyCertificate(ctx, dir, &cfg, settings.HTTPSProxyListener, secretSource, opts, setup)
+	if err != nil {
 		return err
 	}
+	defer clear(secret)
+	// Issuing a certificate can take minutes. Device revocations and other
+	// state updates use this lock, so acquire it only for the commit.
+	return saveEnabledProxy(dir, cfg, secret, opts.Warn)
+}
+
+// prepareProxyCertificate checks the inputs and obtains DNS certificates before
+// the caller changes the active listener configuration.
+func prepareProxyCertificate(ctx context.Context, dir string, cfg, previous *httpsProxyListenerConfig, secretSource string, opts ProxyEnableOptions, setup proxySetup) ([]byte, error) {
+	if cfg.WWW != "" {
+		if _, err := proxyCover(cfg.WWW, nil); err != nil {
+			return nil, err
+		}
+	}
+	if err := checkProxyDNS(ctx, cfg.Domain, setup, opts.Warn); err != nil {
+		return nil, err
+	}
 	var secret []byte
-	switch cfg.CertMethod {
+	switch cfg.method() {
 	case "files":
-		if _, err := loadProxyPEM(cfg, time.Now()); err != nil {
-			return err
+		if _, err := loadProxyPEM(*cfg, time.Now()); err != nil {
+			return nil, err
 		}
 	case "dns":
 		var provider certmagic.DNSProvider
 		var data []byte
+		var err error
 		if secretSource != "" {
 			provider, data, err = readProxyDNSSecret(cfg.DNS, secretSource)
 		} else if opts.ReadSecret == nil {
@@ -144,42 +171,50 @@ func enableProxy(ctx context.Context, dir string, opts ProxyEnableOptions, setup
 			clear(raw)
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		secret = data
+		changed := true
+		if previous != nil && previous.DNSSecret != "" && previous.DNS == cfg.DNS && equalDNS(previous.Domain, cfg.Domain) {
+			old, err := localfile.Read(filepath.Join(dir, previous.DNSSecret), 4096, true)
+			changed = err != nil || !bytes.Equal(old, secret)
+			clear(old)
+		}
+		if !changed {
+			cfg.DNSSecret = previous.DNSSecret
+			clear(secret)
+			secret = nil
+		}
 		issueCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-		err = setup.issue(issueCtx, dir, cfg.Domain, provider)
+		err = setup.issue(issueCtx, dir, cfg.Domain, provider, changed)
 		timedOut := errors.Is(issueCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {
+			clear(secret)
 			if timedOut {
-				return fmt.Errorf("initial HTTPS proxy DNS-01 issuance timed out for %s", cfg.Domain)
+				return nil, fmt.Errorf("initial HTTPS proxy DNS-01 issuance timed out for %s", cfg.Domain)
 			}
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return nil, ctx.Err()
 			}
 			// Provider errors can contain credentials or signed requests.
-			return fmt.Errorf("initial HTTPS proxy DNS-01 issuance failed for %s. Check the DNS zone and provider credentials", cfg.Domain)
+			return nil, fmt.Errorf("initial HTTPS proxy DNS-01 issuance failed for %s. Check the DNS zone and provider credentials", cfg.Domain)
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		clear(secret)
+		return nil, err
 	}
-	// Issuing a certificate can take minutes. Device revocations and other
-	// state updates use this lock, so acquire it only for the commit.
-	return saveEnabledProxy(dir, cfg, secret, opts.Warn)
+	return secret, nil
 }
 
-func proxyConfigForEnable(settings Settings, opts ProxyEnableOptions) (httpsProxyListenerConfig, string, error) {
+func proxyConfigForEnable(opts ProxyEnableOptions) (httpsProxyListenerConfig, string, error) {
 	cfg := httpsProxyListenerConfig{Domain: opts.Domain, Port: opts.Port, CertMethod: opts.CertMethod, DNS: opts.DNS}
 	if opts.Port == 0 {
 		cfg.Port = DefaultProxyPort
 	}
 	hasFiles := opts.CertFile != "" || opts.KeyFile != ""
 	hasDNS := opts.DNS != "" || opts.DNSTokenFile != "" || opts.DNSKeyFile != ""
-	if opts.ACMEListen != "" && cfg.CertMethod != "nginx" {
-		return cfg, "", errors.New("--acme-listen requires --cert-method nginx")
-	}
 	var source string
 	switch cfg.CertMethod {
 	case "files":
@@ -207,25 +242,12 @@ func proxyConfigForEnable(settings Settings, opts ProxyEnableOptions) (httpsProx
 		var nonce [16]byte
 		rand.Read(nonce[:])
 		cfg.DNSSecret = proxyDNSSecretPrefix + hex.EncodeToString(nonce[:])
-	case "http", "nginx":
+	case "http":
 		if hasFiles || hasDNS {
 			return cfg, "", errors.New("HTTP-01 cannot be combined with certificate files or DNS settings")
 		}
-		if cfg.CertMethod == "nginx" {
-			address := opts.ACMEListen
-			if address == "" {
-				rescue, err := netip.ParseAddrPort(settings.RescueListen)
-				if err != nil {
-					return cfg, "", errors.New("--acme-listen is required for nginx when Rescue is disabled")
-				}
-				address = netip.AddrPortFrom(rescue.Addr(), 18081).String()
-			}
-			listener, err := privateListenerAddress(address, "--acme-listen")
-			if err != nil {
-				return cfg, "", err
-			}
-			cfg.ACMEListen = listener.String()
-		}
+	default:
+		return cfg, "", errors.New("certificate method must be http, dns or files")
 	}
 	if opts.WWW != "" {
 		www, err := filepath.Abs(opts.WWW)
@@ -237,6 +259,13 @@ func proxyConfigForEnable(settings Settings, opts ProxyEnableOptions) (httpsProx
 	return cfg, source, nil
 }
 
+func (s Settings) validateProxyEnable(cfg httpsProxyListenerConfig) error {
+	if s.RealityDest == "" {
+		s.RealityDest = realitySelf
+	}
+	return s.validateProxyListener(cfg)
+}
+
 func (s Settings) validateProxyListener(cfg httpsProxyListenerConfig) error {
 	if !link.ValidDNSName(cfg.Domain) {
 		return errors.New("HTTPS proxy --domain must be a DNS name")
@@ -245,10 +274,15 @@ func (s Settings) validateProxyListener(cfg httpsProxyListenerConfig) error {
 	if cdn != "" && (domain == cdn || strings.HasSuffix(domain, "."+cdn) || strings.HasSuffix(cdn, "."+domain)) {
 		return errors.New("the HTTPS proxy domain must be separate from the CDN domain")
 	}
-	if err := s.checkProxyPort(cfg.Port); err != nil {
+	if err := s.validateSharedTCPPorts(&cfg); err != nil {
 		return err
 	}
-	rescue, _ := netip.ParseAddrPort(s.RescueListen)
+	if cfg.DNSSecret != "" && !validProxyDNSSecretName(cfg.DNSSecret) {
+		return errors.New("invalid saved HTTPS proxy certificate configuration")
+	}
+	if cfg.retired() {
+		return nil
+	}
 	if cfg.WWW != "" && !filepath.IsAbs(cfg.WWW) {
 		return errors.New("saved HTTPS proxy web directory must be absolute")
 	}
@@ -256,45 +290,20 @@ func (s Settings) validateProxyListener(cfg httpsProxyListenerConfig) error {
 	noFiles := cfg.Cert == "" && cfg.Key == ""
 	switch cfg.method() {
 	case "files":
-		if cfg.ACMEListen == "" && noDNS && filepath.IsAbs(cfg.Cert) && filepath.IsAbs(cfg.Key) {
+		if noDNS && filepath.IsAbs(cfg.Cert) && filepath.IsAbs(cfg.Key) {
 			return nil
 		}
 	case "dns":
-		nonce, ok := strings.CutPrefix(cfg.DNSSecret, proxyDNSSecretPrefix)
-		if cfg.ACMEListen == "" && noFiles && ok && isHex(nonce, 16) &&
+		if noFiles && cfg.DNSSecret != "" &&
 			(cfg.DNS == proxyDNSCloudflare || cfg.DNS == proxyDNSAliDNS) {
 			return nil
 		}
 	case "http":
-		if cfg.ACMEListen == "" && noDNS && noFiles {
-			return nil
-		}
-	case "nginx":
 		if noDNS && noFiles {
-			listener, err := privateListenerAddress(cfg.ACMEListen, "--acme-listen")
-			if err != nil {
-				return err
-			}
-			switch listener.Port() {
-			case 80, 443, s.stealthPort(), cfg.Port:
-				return errors.New("--acme-listen conflicts with a reserved port or an existing listener")
-			}
-			if listener == rescue {
-				return errors.New("--acme-listen and --rescue-listen must be distinct")
-			}
 			return nil
 		}
 	}
 	return errors.New("invalid saved HTTPS proxy certificate configuration")
-}
-
-func (s Settings) checkProxyPort(port uint16) error {
-	rescue, _ := netip.ParseAddrPort(s.RescueListen)
-	switch port {
-	case 0, 80, 443, s.stealthPort(), rescue.Port():
-		return errors.New("HTTPS proxy port conflicts with a reserved port or an existing tier")
-	}
-	return nil
 }
 
 func checkProxyDNS(ctx context.Context, domain string, setup proxySetup, warn func(string)) error {
@@ -351,20 +360,24 @@ func saveEnabledProxy(dir string, cfg httpsProxyListenerConfig, secret []byte, w
 	if settings.Mode != Shared {
 		return errStandaloneProxy
 	}
-	if err := settings.validateProxyListener(cfg); err != nil {
+	if err := settings.validateProxyEnable(cfg); err != nil {
 		return err
 	}
 	devices, err := ReadDevices(dir)
 	if err != nil {
 		return err
 	}
-	if cfg.DNSSecret != "" {
+	previous := settings.HTTPSProxyListener
+	if cfg.DNSSecret != "" && len(secret) == 0 && (previous == nil || previous.DNSSecret != cfg.DNSSecret) {
+		return errors.New("HTTPS proxy DNS credentials changed during setup; retry the command")
+	}
+	if len(secret) != 0 {
 		if err := writeAtomic(dir, cfg.DNSSecret, secret, 0600); err != nil {
 			return fmt.Errorf("store HTTPS proxy DNS credentials: %w", err)
 		}
 	}
-	previous := settings.HTTPSProxyListener
 	settings.HTTPSProxyListener = &cfg
+	settings.LastProxyDomain = ""
 	// Stealth borrows the proxy site: a new proxy domain or port moves the
 	// REALITY name and fallback along with it, so Stealth never points at a
 	// dead site. An older third-party target is left for "pipe server reality".
@@ -375,20 +388,30 @@ func saveEnabledProxy(dir string, cfg httpsProxyListenerConfig, secret []byte, w
 		linksChanged = settings.RealitySNI != previous
 	}
 	if err := writeJSON(dir, settingsFile, settings); err != nil {
-		_ = removeProxyDNSSecret(dir, &cfg)
+		if len(secret) != 0 {
+			_ = removeProxyDNSSecret(dir, &cfg)
+		}
 		return err
 	}
 	if linksChanged && len(devices) > 0 && warn != nil {
 		warn("Stealth follows the HTTPS proxy domain. Device links need the new Stealth name: in each saved link, set rsni=<proxy domain> (or add the device again)")
 	}
-	if warn != nil {
-		for _, d := range devices {
-			if d.HTTPSProxyPassword == "" {
-				warn(fmt.Sprintf("Re-add device %q to give it an HTTPS proxy password", d.Name))
-			}
+	warnMissingProxyPasswords(devices, warn)
+	if previous != nil && previous.DNSSecret != cfg.DNSSecret {
+		return removeProxyDNSSecret(dir, previous)
+	}
+	return nil
+}
+
+func warnMissingProxyPasswords(devices []Device, warn func(string)) {
+	if warn == nil {
+		return
+	}
+	for _, d := range devices {
+		if d.HTTPSProxyPassword == "" {
+			warn(fmt.Sprintf("Re-add device %q to give it an HTTPS proxy password", d.Name))
 		}
 	}
-	return removeProxyDNSSecret(dir, previous)
 }
 
 func DisableProxy(dir string) error {
@@ -409,6 +432,7 @@ func DisableProxy(dir string) error {
 		return nil
 	}
 	settings.HTTPSProxyListener = nil
+	settings.LastProxyDomain = previous.Domain
 	if settings.RealityDest == realitySelf {
 		// Stealth borrows the proxy site, so it goes off with it.
 		settings.RealityDest, settings.RealitySNI, settings.RealityAddress = "", "", ""

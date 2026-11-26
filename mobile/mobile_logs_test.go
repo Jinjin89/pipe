@@ -214,7 +214,7 @@ func TestLogsClearVersion(t *testing.T) {
 	if err := json.Unmarshal([]byte(Logs(0)), &out); err != nil || len(out.Entries) != 0 || !strings.Contains(Logs(0), `"entries":[]`) {
 		t.Fatalf("clear %+v", out)
 	}
-	if Version() != version.Version || version.Version != "0.7.2-alpha" {
+	if Version() != version.Version || version.Version != "0.7.3-alpha" {
 		t.Fatal(Version())
 	}
 	if Status() == "" {

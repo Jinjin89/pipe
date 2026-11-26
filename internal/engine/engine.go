@@ -130,7 +130,6 @@ func New(ctx context.Context, options Options) (*Instance, error) {
 	registerInbound(in, instance.reloads, options.Server, C.TypeVMess, vmess.NewInbound)
 	out := outbound.NewRegistry()
 	if options.Server {
-		registerInbound(in, instance.reloads, true, SharedRescue, newSharedRescue)
 		outbound.Register(out, InMemoryProbe, newProbeOutbound)
 	}
 	block.RegisterOutbound(out)

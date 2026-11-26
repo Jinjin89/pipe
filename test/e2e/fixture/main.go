@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -20,8 +19,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -42,10 +39,14 @@ func main() {
 	case "serve":
 		serve(os.Args[2:])
 	case "fetch-http3":
-		if len(os.Args) != 5 {
-			log.Fatal("use fetch-http3 ADDRESS URL TRUST_FILE")
+		if len(os.Args) < 5 || len(os.Args) > 6 {
+			log.Fatal("use fetch-http3 ADDRESS URL TRUST_FILE [HOST]")
 		}
-		if err := fetchHTTP3(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+		var host string
+		if len(os.Args) == 6 {
+			host = os.Args[5]
+		}
+		if err := fetchHTTP3(os.Args[2], os.Args[3], os.Args[4], host); err != nil {
 			log.Fatal(err)
 		}
 	default:
@@ -124,26 +125,8 @@ func serve(args []string) {
 	certDir := flags.String("ca", "", "fixture certificate directory")
 	host := flags.String("host", "", "certificate name")
 	site := flags.String("body", "", "response body")
-	state := flags.String("state", "", "Pipe server.json for the Rescue route")
-	backend := flags.String("rescue", "", "private Rescue address")
 	_ = flags.Parse(args)
-	rescue := &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(&url.URL{Scheme: "http", Host: *backend})
-			r.Out.Host = r.In.Host
-		},
-	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if *state != "" {
-			var settings struct {
-				Path string `json:"ws_path"`
-			}
-			data, err := os.ReadFile(*state)
-			if err == nil && json.Unmarshal(data, &settings) == nil && settings.Path == r.URL.EscapedPath() {
-				rescue.ServeHTTP(w, r)
-				return
-			}
-		}
 		if r.Header.Get("Proxy-Authorization") != "" {
 			http.Error(w, "proxy credentials reached the target", http.StatusBadRequest)
 			return

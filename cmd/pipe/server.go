@@ -22,7 +22,7 @@ import (
 
 func runServer(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprintln(os.Stderr, "Usage: pipe server <setup | init | add | revoke | list | run | install | uninstall | proxy | reality | hop-apply | relay-command> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: pipe server <setup | init | add | revoke | list | run | install | uninstall | proxy | rescue | reality | hop-apply | relay-command> [options]")
 		return nil
 	}
 	command := args[0]
@@ -45,19 +45,23 @@ func runServer(ctx context.Context, args []string) error {
 		fs.StringVar(&domain, "domain", "", "DNS-only direct hostname")
 		fs.StringVar(&cdn, "cdn-domain", "", "optional CDN DNS name")
 		fs.StringVar(&deployMode, "mode", "auto", "auto, standalone or shared")
-		fs.StringVar(&initOptions.FastSNI, "fast-sni", "", "Fast TLS DNS name (required for literal IP endpoints)")
+		fs.StringVar(&initOptions.FastSNI, "fast-sni", "", "Fast TLS DNS name (defaults to the proxy domain in shared mode when set)")
+		fs.StringVar(&initOptions.ProxyDomain, "proxy-domain", "", "shared HTTPS proxy hostname to use as the default Fast TLS name")
 		fs.StringVar(&initOptions.FastHop, "fast-hop", "", "Fast UDP hopping range")
-		fs.StringVar(&initOptions.RealityDest, "reality-dest", "", "only \"self\" (the default): Stealth borrows your HTTPS proxy site, set up with server proxy enable")
-		fs.StringVar(&initOptions.RescueListen, "rescue-listen", "", "shared Rescue HTTP listener on a private IP:port")
+		fs.StringVar(&initOptions.RealityDest, "reality-dest", "", "retired setting that accepts only self")
+		registerRescueFlags(fs, &initOptions.Rescue)
 		fs.BoolVar(&initOptions.NoHTTPSProxy, "no-https-proxy", false, "disable standalone HTTPS forward proxy")
 		registerPortFlag(fs, &initOptions.Ports.HTTP, "http-port", "standalone HTTP/ACME port (default 80)")
 		registerPortFlag(fs, &initOptions.Ports.HTTPS, "https-port", "base port for Fast and standalone Stealth (default 443)")
 		registerPortFlag(fs, &initOptions.Ports.Fast, "fast-port", "Fast UDP port (default 443)")
 		registerPortFlag(fs, &initOptions.Ports.Stealth, "stealth-port", "Stealth TCP port (default 443 standalone, 8443 shared)")
 		registerPortFlag(fs, &initOptions.Ports.Decoy, "decoy-port", "standalone loopback TLS website port")
-		registerPortFlag(fs, &initOptions.Ports.VMess, "vmess-port", "standalone loopback WS port")
+		registerPortFlag(fs, &initOptions.Ports.VMess, "vmess-port", "loopback VMess port for Rescue")
 		registerPortFlag(fs, &initOptions.Ports.RealityOrigin, "reality-origin-port", "standalone loopback REALITY origin port when using a CDN")
 		registerPortFlag(fs, &initOptions.Ports.RealityCDN, "reality-cdn-port", "standalone loopback REALITY CDN port")
+	case "rescue":
+		fs.StringVar(&cdn, "cdn-domain", "", "shared Rescue CDN hostname (empty disables Rescue)")
+		registerRescueFlags(fs, &initOptions.Rescue)
 	case "reality":
 		fs.StringVar(&initOptions.RealityDest, "reality-dest", "", "only \"self\" (the default)")
 	case "add":
@@ -105,6 +109,27 @@ func runServer(ctx context.Context, args []string) error {
 			return err
 		}
 		_, err := fmt.Fprintln(os.Stdout, "Initialized server state in", options.Dir)
+		return err
+	case "rescue":
+		var cdnDomain *string
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "cdn-domain" {
+				cdnDomain = &cdn
+			}
+		})
+		if cdnDomain == nil && initOptions.Rescue == (server.RescueConfig{}) {
+			return errors.New("server rescue requires --cdn-domain or dedicated Rescue options")
+		}
+		port, err := server.SetRescue(options.Dir, cdnDomain, initOptions.Rescue)
+		if err != nil {
+			return err
+		}
+		if port == 0 {
+			fmt.Fprintln(os.Stdout, "Shared Rescue disabled.")
+		} else {
+			fmt.Fprintf(os.Stdout, "Shared Rescue configured. Open TCP %d in the firewall.\n", port)
+		}
+		_, err = fmt.Fprintln(os.Stdout, "Keys and devices are kept. Restart the server. Update saved links or add devices under new names to get links with the current Rescue settings.")
 		return err
 	case "reality":
 		if err := server.CheckRealityDest(initOptions.RealityDest); err != nil {
@@ -238,8 +263,7 @@ func runServerProxy(ctx context.Context, args []string) error {
 	case "enable":
 		fs.StringVar(&opts.Domain, "domain", "", "DNS-only hostname for the HTTPS proxy")
 		registerPortFlag(fs, &opts.Port, "port", "HTTPS proxy TCP port (default 9443)")
-		fs.StringVar(&opts.CertMethod, "cert-method", "auto", "certificate method: auto, http, nginx, dns or files")
-		fs.StringVar(&opts.ACMEListen, "acme-listen", "", "nginx method: private IP:port for HTTP-01 (default rescue IP:18081)")
+		fs.StringVar(&opts.CertMethod, "cert-method", "", "certificate method: auto, http, dns or files (default: infer from options or auto)")
 		fs.StringVar(&opts.DNS, "dns", "", "ACME DNS-01 provider (cloudflare or alidns)")
 		fs.StringVar(&opts.DNSTokenFile, "dns-token-file", "", "owner-only Cloudflare API token file")
 		fs.StringVar(&opts.DNSKeyFile, "dns-key-file", "", "owner-only AliDNS AccessKey file")
@@ -270,11 +294,8 @@ func runServerProxy(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stdout, "HTTPS proxy enabled for %s. Open TCP %d in the firewall.\n", strings.ToLower(opts.Domain), opts.Port)
-		if method := enabledMethod(dir); method == "http" || method == "nginx" {
+		if method := enabledMethod(dir); method == "http" {
 			fmt.Fprintln(os.Stdout, "The certificate is requested when pipe server run starts. TCP 80 must be open to all IPs.")
-			if method == "nginx" {
-				fmt.Fprintln(os.Stdout, "pipe server install writes install/pipe-nginx.conf. Copy it into nginx.")
-			}
 		}
 		fmt.Fprintln(os.Stdout, "Use pipe server proxy export <name> --dir <state> to retrieve an existing device's export line.")
 	case "disable":
@@ -309,6 +330,12 @@ func runServerProxy(ctx context.Context, args []string) error {
 	}
 	_, err = fmt.Fprintln(os.Stdout, "Restart pipe server run to apply the change (for example, systemctl restart pipe).")
 	return err
+}
+
+func registerRescueFlags(fs *flag.FlagSet, cfg *server.RescueConfig) {
+	registerPortFlag(fs, &cfg.Port, "rescue-port", "shared Rescue TLS port (default 2053)")
+	fs.StringVar(&cfg.Cert, "rescue-cert", "", "shared Rescue certificate chain file")
+	fs.StringVar(&cfg.Key, "rescue-key", "", "shared Rescue owner-only private key file")
 }
 
 func registerPortFlag(fs *flag.FlagSet, port *uint16, name, help string) {

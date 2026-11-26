@@ -20,8 +20,9 @@ import (
 )
 
 func TestIncompleteTLSHelloUsesDecoyListener(t *testing.T) {
-	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example", Ports: TestPorts()}
-	config := serverConfig(settings, nil, "127.0.0.1", 20001, 20002, nil)
+	settings := Settings{Mode: Standalone, Domain: "origin.example", CDNDomain: "cdn.example", Ports: TestPorts()}
+	listeners := serverListeners{masquerade: 20001, probe: 20002, mainTLS: settings.Ports.Decoy, rescueTLS: 20003}
+	config := serverConfig(settings, nil, "127.0.0.1", listeners, nil)
 	var routes []engine.Object
 	for _, rule := range config["route"].(engine.Object)["rules"].([]engine.Object) {
 		if rule["inbound"] == engine.RealityFrontTag {
@@ -34,18 +35,29 @@ func TestIncompleteTLSHelloUsesDecoyListener(t *testing.T) {
 		routes[3]["protocol"] != nil || routes[3]["domain"] != nil || routes[3]["override_port"] != settings.Ports.Decoy {
 		t.Fatal("only a complete ClientHello for a known SNI should use REALITY")
 	}
+	if got := routes[1]["source_ip_cidr"].([]string); !slices.Equal(got, rescueSourceCIDRs(false)) || slices.Contains(got, "127.0.0.0/8") {
+		t.Fatalf("unexpected production Rescue source ranges: %v", got)
+	}
+	cdnInbound := config["inbounds"].([]engine.Object)[2]
+	cdnHandshake := cdnInbound["tls"].(engine.Object)["reality"].(engine.Object)["handshake"].(engine.Object)
+	if cdnInbound["tag"] != "stealth-cdn" || cdnHandshake["server_port"] != listeners.rescueTLS {
+		t.Fatalf("CDN REALITY must reach its private TLS listener: %v", cdnHandshake)
+	}
 }
 
 func TestDecoyConcealsRescuePathWithoutCredentials(t *testing.T) {
 	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example", WSPath: "/ws/private", RealityPrivateKey: testCoverKey(1)}
 	for _, test := range []struct {
 		name     string
+		sni      string
 		options  RunOptions
 		known    bool
 		callAuth bool
 	}{
-		{name: "unknown device", callAuth: true},
-		{name: "known device without origin certificate", options: RunOptions{CFOriginCA: "ca.pem"}, known: true},
+		{name: "unknown device", sni: settings.CDNDomain, callAuth: true},
+		{name: "known device without origin certificate", sni: settings.CDNDomain, options: RunOptions{CFOriginCA: "ca.pem"}, known: true},
+		{name: "known device with origin SNI", sni: settings.Domain, known: true},
+		{name: "known device with empty SNI", known: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			called := false
@@ -57,7 +69,7 @@ func TestDecoyConcealsRescuePathWithoutCredentials(t *testing.T) {
 				t.Fatal(err)
 			}
 			req := httptest.NewRequest(http.MethodGet, "https://"+settings.CDNDomain+settings.WSPath, nil)
-			req.TLS.ServerName = settings.CDNDomain
+			req.TLS.ServerName = test.sni
 			req.Header.Set("Upgrade", "websocket")
 			req.Header.Set("Connection", "Upgrade")
 			recorder := httptest.NewRecorder()
@@ -134,20 +146,27 @@ func (f testDecoyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func TestOriginPullCAIsRequestedOnlyOnCDNSNI(t *testing.T) {
 	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example"}
 	roots := x509.NewCertPool()
-	config := decoyTLSConfig(settings, nil, roots)
-	ordinary, err := config.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.Domain})
-	if err != nil || ordinary != nil || config.ClientAuth != tls.NoClientCert {
+	origin := strictProxyTLS(settings.Domain, nil)
+	_, err := origin.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.Domain})
+	if err != nil || origin.ClientAuth != tls.NoClientCert {
 		t.Fatalf("origin TLS should retain its normal certificate behavior: %v", err)
 	}
-	cdn, err := config.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.CDNDomain})
-	if err != nil || cdn == nil || cdn.ClientAuth != tls.VerifyClientCertIfGiven || cdn.ClientCAs != roots {
-		t.Fatalf("CDN TLS should verify supplied certificates against the configured pull CA: %v", err)
+	cdn := rescueTLSConfig(settings.CDNDomain, nil, roots)
+	_, err = cdn.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.CDNDomain})
+	if err != nil || cdn.ClientAuth != tls.RequireAndVerifyClientCert || cdn.ClientCAs != roots {
+		t.Fatalf("CDN TLS should require a certificate trusted by the configured pull CA: %v", err)
+	}
+	if _, err := origin.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.CDNDomain}); err == nil {
+		t.Fatal("the main TLS listener accepted a CDN ClientHello")
+	}
+	if _, err := cdn.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.Domain}); err == nil {
+		t.Fatal("the Rescue TLS listener accepted a main ClientHello")
 	}
 }
 
 func TestHysteriaMasqueradePreservesHostAndUsesSeparateListener(t *testing.T) {
 	settings := Settings{Domain: "origin.example", Ports: TestPorts()}
-	config := serverConfig(settings, nil, "127.0.0.1", 20001, 20002, nil)
+	config := serverConfig(settings, nil, "127.0.0.1", serverListeners{masquerade: 20001, probe: 20002, mainTLS: settings.Ports.Decoy}, nil)
 	masquerade := config["inbounds"].([]engine.Object)[0]["masquerade"].(engine.Object)
 	if masquerade["rewrite_host"] != false || !strings.HasSuffix(masquerade["url"].(string), ":20001") {
 		t.Fatal("masquerade must preserve the incoming Host on its own listener")

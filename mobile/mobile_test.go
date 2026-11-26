@@ -55,9 +55,9 @@ func TestParseLinkPublicSummary(t *testing.T) {
 	}
 }
 
-func TestParseLinkShowsCustomPort(t *testing.T) {
+func TestParseLinkShowsCustomPorts(t *testing.T) {
 	_, profile := sampleProfile(t)
-	profile.Port = 8443
+	profile.Port, profile.CDNPort = 8443, 2053
 	raw, err := profile.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -67,8 +67,8 @@ func TestParseLinkShowsCustomPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fields linkSummary
-	if err := json.Unmarshal([]byte(summary), &fields); err != nil || fields.Domain != "origin.example:8443" {
-		t.Fatalf("custom endpoint = %q, %v", fields.Domain, err)
+	if err := json.Unmarshal([]byte(summary), &fields); err != nil || fields.Domain != "origin.example:8443" || fields.CDN != "cdn.example:2053" {
+		t.Fatalf("custom endpoints = %q and %q, %v", fields.Domain, fields.CDN, err)
 	}
 }
 

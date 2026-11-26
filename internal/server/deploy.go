@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,9 +26,10 @@ type InitOptions struct {
 	Mode         DeployMode
 	Ports        Ports
 	FastSNI      string
+	ProxyDomain  string // Default Fast SNI for shared initialization.
 	FastHop      string
 	RealityDest  string // retired: only "self" is accepted, as a no-op
-	RescueListen string
+	Rescue       RescueConfig
 	NoHTTPSProxy bool
 	Warn         func(string)
 }
@@ -35,7 +37,7 @@ type InitOptions struct {
 func deployment(domain, cdn string, opts InitOptions) (Settings, error) {
 	s := Settings{
 		Mode: opts.Mode, Domain: domain, CDNDomain: cdn, FastSNI: opts.FastSNI,
-		FastHop: opts.FastHop, RescueListen: opts.RescueListen, Ports: opts.Ports,
+		FastHop: opts.FastHop, Ports: opts.Ports,
 	}
 	if s.Ports.HTTPS == 0 {
 		s.Ports.HTTPS = 443
@@ -61,16 +63,25 @@ func deployment(domain, cdn string, opts InitOptions) (Settings, error) {
 	s.HTTPSProxy = &enabled
 	switch s.Mode {
 	case Standalone:
+		if s.rescueMatchesFastName() {
+			return s, errRescueFastName
+		}
 		s.assignInternalPorts()
-		if opts.RealityDest != "" || s.RescueListen != "" {
-			return s, errors.New("--reality-dest and a private Rescue listener require shared mode")
+		if opts.ProxyDomain != "" || opts.Rescue != (RescueConfig{}) {
+			return s, errors.New("--proxy-domain and dedicated Rescue options require shared mode")
 		}
 	case Shared:
+		if opts.ProxyDomain != "" && !link.ValidDNSName(opts.ProxyDomain) {
+			return s, errors.New("--proxy-domain must be a DNS name")
+		}
+		if s.FastSNI == "" {
+			s.FastSNI = strings.ToLower(opts.ProxyDomain)
+		}
 		if s.Ports.Stealth == 0 {
 			s.Ports.Stealth = 8443
 		}
-		if s.CDNDomain != "" && s.RescueListen == "" {
-			return s, errors.New("shared mode with a CDN requires --rescue-listen")
+		if err := s.configureRescue(opts.Rescue); err != nil {
+			return s, err
 		}
 	default:
 		return s, errors.New("--mode must be auto, standalone or shared")
@@ -81,6 +92,10 @@ func deployment(domain, cdn string, opts InitOptions) (Settings, error) {
 	if s.Mode == Shared {
 		if err := s.refreshFastCertificate(time.Now()); err != nil {
 			return s, err
+		}
+	} else if opts.Warn != nil {
+		if warning := RescuePortWarning(s.rescuePort()); warning != "" {
+			opts.Warn(warning)
 		}
 	}
 	return s, nil
@@ -157,22 +172,15 @@ func detectMode(httpPort, stealthPort, fastPort uint16,
 	return mode, false, nil
 }
 
-func privateRescueAddress(raw string) (netip.AddrPort, error) {
-	return privateListenerAddress(raw, "--rescue-listen")
-}
-
-func privateListenerAddress(raw, flag string) (netip.AddrPort, error) {
-	ap, err := netip.ParseAddrPort(raw)
-	ip := ap.Addr().Unmap()
-	if err != nil || ap.Port() == 0 || ap.Addr().Zone() != "" || !(ip.IsLoopback() || ip.IsPrivate()) {
-		return netip.AddrPort{}, fmt.Errorf("%s requires a literal loopback or private IP address and a nonzero port", flag)
-	}
-	return netip.AddrPortFrom(ip, ap.Port()), nil
-}
-
 func (s *Settings) normalizeDeployment() error {
-	if !link.ValidHost(s.Domain) || (!link.ValidDNSName(s.Domain) && s.FastSNI == "") {
-		return errors.New("invalid server domain (literal IPs require --fast-sni)")
+	if !link.ValidHost(s.Domain) {
+		return errors.New("invalid server domain")
+	}
+	if !link.ValidDNSName(s.Domain) && s.FastSNI == "" {
+		if s.Mode == Shared {
+			return errors.New("literal IPs require --fast-sni or --proxy-domain")
+		}
+		return errors.New("literal IPs require --fast-sni")
 	}
 	if s.CDNDomain != "" && (!link.ValidDNSName(s.CDNDomain) || equalDNS(s.Domain, s.CDNDomain)) {
 		return errors.New("CDN domain must be a distinct DNS name")
@@ -190,7 +198,7 @@ func (s *Settings) normalizeDeployment() error {
 		if s.HTTPSProxyListener != nil {
 			return errors.New("a separate HTTPS proxy requires shared mode")
 		}
-		if s.RealityDest != "" || s.RealitySNI != "" || s.RealityAddress != "" || s.RescueListen != "" ||
+		if s.RealityDest != "" || s.RealitySNI != "" || s.RealityAddress != "" || s.RescueListen != "" || s.Rescue != nil ||
 			len(s.FastPrivateKey) != 0 || len(s.FastCertificate) != 0 {
 			return errors.New("shared deployment fields are invalid in standalone mode")
 		}
@@ -209,26 +217,18 @@ func (s *Settings) normalizeDeployment() error {
 		if s.HTTPSProxy != nil && *s.HTTPSProxy {
 			return errors.New("the built-in HTTPS proxy requires standalone mode")
 		}
-		if (s.CDNDomain == "") != (s.RescueListen == "") {
-			return errors.New("shared mode requires a private Rescue listener exactly when a CDN is configured")
-		}
-		if s.Ports.Decoy != 0 || s.Ports.VMess != 0 || s.Ports.RealityCDN != 0 {
+		if s.Ports.Decoy != 0 || s.Ports.RealityCDN != 0 {
 			return errors.New("standalone loopback ports are invalid in shared mode")
 		}
-		if s.RescueListen != "" {
-			listen, err := privateRescueAddress(s.RescueListen)
-			if err != nil {
-				return err
-			}
-			if listen.Port() == s.stealthPort() {
-				return errors.New("the shared Rescue and Stealth TCP ports must differ")
-			}
-			s.RescueListen = listen.String()
+		if err := s.validateRescue(); err != nil {
+			return err
 		}
 		if s.HTTPSProxyListener != nil {
 			if err := s.validateProxyListener(*s.HTTPSProxyListener); err != nil {
 				return err
 			}
+		} else if err := s.validateSharedTCPPorts(nil); err != nil {
+			return err
 		}
 	default:
 		return errors.New("invalid saved deploy mode")
@@ -287,6 +287,13 @@ func (s Settings) webName() string {
 	return s.FastSNI
 }
 
+func (s Settings) stealthName() string {
+	if s.Mode == Shared && link.ValidDNSName(s.RealitySNI) {
+		return strings.ToLower(s.RealitySNI)
+	}
+	return s.webName()
+}
+
 func (s Settings) proxyEnabled() bool {
 	return s.Mode == Standalone && (s.HTTPSProxy == nil || *s.HTTPSProxy)
 }
@@ -295,7 +302,7 @@ func (s Settings) proxyEndpoint() (string, uint16) {
 	if s.proxyEnabled() {
 		return s.webName(), s.stealthPort()
 	}
-	if s.Mode == Shared && s.HTTPSProxyListener != nil {
+	if s.Mode == Shared && s.HTTPSProxyListener != nil && !s.HTTPSProxyListener.retired() {
 		return s.HTTPSProxyListener.Domain, s.HTTPSProxyListener.Port
 	}
 	return "", 0

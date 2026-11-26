@@ -54,15 +54,17 @@ type Settings struct {
 	RealityDest        string                    `json:"reality_dest,omitempty"`
 	RealitySNI         string                    `json:"reality_sni,omitempty"`
 	RealityAddress     string                    `json:"reality_address,omitempty"`
-	RescueListen       string                    `json:"rescue_listen,omitempty"`
+	RescueListen       string                    `json:"rescue_listen,omitempty"` // retired
+	Rescue             *RescueConfig             `json:"rescue,omitempty"`
 	FastSNI            string                    `json:"fast_sni,omitempty"`
 	FastHop            string                    `json:"fast_hop,omitempty"`
 	FastPrivateKey     []byte                    `json:"fast_private_key,omitempty"`
 	FastCertificate    []byte                    `json:"fast_certificate,omitempty"`
 	HTTPSProxy         *bool                     `json:"https_proxy,omitempty"`
 	HTTPSProxyListener *httpsProxyListenerConfig `json:"https_proxy_listener,omitempty"`
+	LastProxyDomain    string                    `json:"last_proxy_domain,omitempty"`
 
-	// realityBlocked is set at run time, never saved: why Stealth must stay off.
+	// realityBlocked records why Stealth cannot borrow the HTTPS proxy at run time.
 	realityBlocked string
 }
 
@@ -114,7 +116,13 @@ func InitWithOptions(dir, domain, cdn string, options InitOptions) error {
 	settings.RealityPrivateKey = link.EncodeKey([32]byte(key.Bytes()))
 	settings.RealityPublicKey = link.EncodeKey([32]byte(key.PublicKey().Bytes()))
 	settings.WSPath = "/ws/" + hex.EncodeToString(pathSecret[:])
-	return writeJSON(dir, settingsFile, settings)
+	if err := settings.storeRescueFiles(dir); err != nil {
+		return err
+	}
+	if err := writeJSON(dir, settingsFile, settings); err != nil {
+		return errors.Join(err, removeRescueFiles(dir, settings.Rescue))
+	}
+	return nil
 }
 
 func ReadSettings(dir string) (Settings, error) {
@@ -226,10 +234,7 @@ func AddWithProxy(dir, name string, testPorts bool) (string, *qr.Code, string, e
 	if err != nil {
 		return "", nil, "", err
 	}
-	profile := link.Profile{PublicKey: publicKey, Host: settings.Domain, CDN: settings.CDNDomain, Name: name}
-	if settings.CDNDomain != "" {
-		profile.WSPath = settings.WSPath
-	}
+	profile := link.Profile{PublicKey: publicKey, Host: settings.Domain, Name: name}
 	if testPorts && settings.Mode == Standalone {
 		settings.Ports = TestPorts()
 	}
@@ -237,13 +242,16 @@ func AddWithProxy(dir, name string, testPorts bool) (string, *qr.Code, string, e
 	if settings.Mode == Standalone && settings.fastPort() == settings.stealthPort() && settings.fastPort() != link.DefaultPort {
 		profile.Port = settings.fastPort()
 	}
+	if port := settings.rescuePort(); port != 0 {
+		profile.CDN, profile.WSPath = settings.CDNDomain, settings.WSPath
+		if port != link.DefaultPort {
+			profile.CDNPort = port
+		}
+	}
 	profile.FastPort, profile.StealthPort = settings.fastPort(), settings.stealthPort()
 	profile.FastHop, profile.FastSNI = settings.FastHop, settings.FastSNI
-	profile.RealitySNI = settings.webName()
+	profile.RealitySNI = settings.stealthName()
 	if settings.Mode == Shared {
-		if settings.RealitySNI != "" {
-			profile.RealitySNI = settings.RealitySNI
-		}
 		profile.FastPin, err = settings.fastPin()
 		if err != nil {
 			return "", nil, "", err

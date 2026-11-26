@@ -49,7 +49,7 @@ func ParseLink(raw string) (string, error) {
 	}
 	fingerprint := sha256.Sum256(profile.PublicKey[:])
 	summary := linkSummary{
-		Name: profile.Name, Domain: domain, CDN: profile.CDN,
+		Name: profile.Name, Domain: domain, CDN: profile.CDNEndpoint(),
 		KeyFingerprint: "SHA-256 " + hex.EncodeToString(fingerprint[:]),
 	}
 	if profile.FastPort != 0 || profile.StealthPort != 0 || profile.FastSNI != "" || profile.RealitySNI != "" ||

@@ -6,215 +6,282 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+
+	"pipe/templates"
 )
 
 func writeSetupConfig(t *testing.T, body string) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "setup.json")
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return p
+	path := filepath.Join(t.TempDir(), "setup.json")
+	must(t, os.WriteFile(path, []byte(body), 0600))
+	return path
 }
 
-// Every scenario template in templates/ must load and keep exactly the
-// fields its situation needs.
-func TestSetupTemplatesLoad(t *testing.T) {
-	shared := SetupOptions{Mode: "shared", Domain: "203.0.113.7", FastHop: "20000-40000", Device: "phone"}
-	full := shared
-	full.RealityDest = "self"
-	full.FastSNI, full.CDNDomain, full.ProxyDomain, full.ProxyCertMethod = "proxy.example.org", "static.example.com", "proxy.example.org", "auto"
-	proxy := shared
-	proxy.RealityDest = "self"
-	proxy.FastSNI, proxy.ProxyDomain = "proxy.example.org", "proxy.example.org"
-	with := func(o SetupOptions, f func(*SetupOptions)) SetupOptions { f(&o); return o }
-	want := map[string]SetupOptions{
-		"standalone.json":            {Mode: "standalone", Domain: "vpn.example.com", FastHop: "20000-40000", Device: "phone"},
-		"standalone-cloudflare.json": {Mode: "standalone", Domain: "vpn.example.com", CDNDomain: "static.example.com", FastHop: "20000-40000", Device: "phone"},
-		"shared-basic.json":          with(shared, func(o *SetupOptions) { o.FastSNI = "vpn.example.org" }),
-		"shared-nginx-docker.json":   with(full, func(o *SetupOptions) { o.RescueListen = "172.17.0.1:18080" }),
-		"shared-nginx-host.json":     with(full, func(o *SetupOptions) { o.RescueListen = "127.0.0.1:18080" }),
-		"shared-proxy-alidns.json": with(proxy, func(o *SetupOptions) {
-			o.ProxyCertMethod, o.DNS, o.DNSKeyFile = "dns", "alidns", "/root/alidns.key"
-		}),
-		"shared-proxy-cloudflare-dns.json": with(proxy, func(o *SetupOptions) {
-			o.ProxyCertMethod, o.DNS, o.DNSTokenFile = "dns", "cloudflare", "/root/cloudflare.token"
-		}),
-		"shared-proxy-own-cert.json": with(proxy, func(o *SetupOptions) {
-			o.ProxyCertMethod, o.Cert, o.Key = "files", "/path/to/fullchain.pem", "/path/to/privkey.pem"
-		}),
-	}
-	files, err := filepath.Glob("../../templates/*.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != len(want) {
-		t.Fatalf("templates/ has %d files, the test knows %d", len(files), len(want))
-	}
-	for _, path := range files {
-		got, err := LoadSetupConfig(path)
-		if err != nil {
-			t.Fatalf("%s: %v", path, err)
-		}
-		if w, ok := want[filepath.Base(path)]; !ok || got != w {
-			t.Fatalf("%s: got %+v want %+v", path, got, w)
-		}
+func setupConfigOptions(t *testing.T, body string) SetupOptions {
+	t.Helper()
+	opts, err := LoadSetupConfig(writeSetupConfig(t, body))
+	must(t, err)
+	return opts
+}
+
+func TestLoadSetupConfigSections(t *testing.T) {
+	path := writeSetupConfig(t, `{
+		"ip":"2001:db8::1", "sni":"gate.example.com",
+		"cert":{"dns":"cloudflare","token_file":"keys/cf-token"},
+		"fast":{"port":5353,"hop":"20000-40000"}, "stealth":{"port":8443},
+		"proxy":{"port":9443},
+		"rescue":{"sni":"cdn.other.net","port":2096,"cert":"origin.pem","key":"origin.key"},
+		"device":"tablet"
+	}`)
+	got, err := LoadSetupConfig(path)
+	must(t, err)
+	dir := filepath.Dir(path)
+	want := SetupOptions{FromConfig: true, Yes: true, SetupConfig: SetupConfig{
+		IP: "2001:db8::1", SNI: "gate.example.com",
+		Cert: &SetupCertificate{DNS: "cloudflare", TokenFile: filepath.Join(dir, "keys", "cf-token")},
+		Fast: SetupFast{Port: 5353, Hop: "20000-40000"}, Stealth: SetupPort{Port: 8443},
+		Proxy:  &SetupPort{Port: 9443},
+		Rescue: &SetupRescue{SNI: "cdn.other.net", Port: 2096, Cert: filepath.Join(dir, "origin.pem"), Key: filepath.Join(dir, "origin.key")},
+		Device: "tablet",
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsed setup differs from the expected options: %+v", got)
 	}
 }
 
-func TestLoadSetupConfigUnknownKey(t *testing.T) {
-	for _, key := range []string{"domian", "access_key_secret", "token"} {
-		_, err := LoadSetupConfig(writeSetupConfig(t, `{"`+key+`":"x"}`))
-		if err == nil || !strings.Contains(err.Error(), key) {
-			t.Fatalf("key %s: error %v", key, err)
+func TestLoadSetupConfigCertificateChoices(t *testing.T) {
+	for _, tc := range []struct {
+		body, method string
+	}{
+		{`{"sni":"gate.example","proxy":{}}`, ""},
+		{`{"sni":"gate.example","cert":{"dns":"cloudflare","token_file":"cloudflare.token"}}`, "dns"},
+		{`{"sni":"gate.example","cert":{"dns":"alidns","key_file":"ali.key"}}`, "dns"},
+		{`{"sni":"gate.example","cert":{"file":"cert.pem","key":"key.pem"}}`, "files"},
+	} {
+		opts := setupConfigOptions(t, tc.body)
+		proxy, err := setupCertificateOptions(opts.Cert)
+		must(t, err)
+		if proxy.CertMethod != tc.method || opts.Rescue != nil {
+			t.Fatalf("method %q and Rescue %v for %s", proxy.CertMethod, opts.Rescue, tc.body)
 		}
 	}
 }
 
-func TestLoadSetupConfigComment(t *testing.T) {
-	got, err := LoadSetupConfig(writeSetupConfig(t, `{"_comment":"note","_help":"h","mode":"shared"}`))
-	if err != nil || got.Mode != "shared" {
-		t.Fatalf("got %+v, %v", got, err)
-	}
-}
-
-func TestLoadSetupConfigRelativePaths(t *testing.T) {
-	p := writeSetupConfig(t, `{"mode":"shared","reality_dest":"self","proxy_domain":"p.example.org","proxy_cert_method":"files","cert":"c.pem","key":"/abs/k.pem"}`)
-	dir := filepath.Dir(p)
-	got, err := LoadSetupConfig(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Cert != filepath.Join(dir, "c.pem") || got.Key != "/abs/k.pem" {
-		t.Fatalf("paths: %+v", got)
-	}
-	p = writeSetupConfig(t, `{"mode":"shared","proxy_domain":"p.example.org","proxy_cert_method":"dns","dns":"alidns","dns_key_file":"k/ali","dns_token_file":"t"}`)
-	got, err = LoadSetupConfig(p)
-	if err != nil || got.DNSKeyFile != filepath.Join(filepath.Dir(p), "k/ali") || got.DNSTokenFile != "" {
-		t.Fatalf("dns: %+v %v", got, err)
-	}
-}
-
-func TestLoadSetupConfigClearsUnused(t *testing.T) {
-	load := func(body string) SetupOptions {
-		t.Helper()
-		got, err := LoadSetupConfig(writeSetupConfig(t, body))
-		if err != nil {
-			t.Fatal(err)
+func TestLoadSetupConfigOldFormat(t *testing.T) {
+	for _, body := range []string{
+		`{"mode":"shared","domain":"gate.example"}`,
+		`{"sni":"gate.example","fast_sni":"other.example"}`,
+		`{"cdn_domain":"cdn.example"}`,
+		`{"proxy_domain":"gate.example"}`,
+		`{"proxy_cert_method":"nginx"}`,
+		`{"acme_listen":"127.0.0.1:80"}`,
+		`{"rescue_listen":"127.0.0.1:18080"}`,
+		`{"reality_dest":"self"}`,
+		`{"cert":"fullchain.pem"}`,
+	} {
+		_, err := LoadSetupConfig(writeSetupConfig(t, body))
+		if err == nil || !strings.Contains(err.Error(), "this is the old setup format; run `pipe server setup --template > setup.json`") {
+			t.Fatalf("old config %s got %v", body, err)
 		}
-		return got
-	}
-	const files = `"dns":"alidns","dns_key_file":"/k","dns_token_file":"/t","cert":"/c","key":"/k2","acme_listen":"10.0.0.1:1"`
-	got := load(`{"mode":"shared","proxy_domain":"p.example.org","proxy_cert_method":"auto",` + files + `}`)
-	if got.DNS != "" || got.DNSKeyFile != "" || got.DNSTokenFile != "" || got.Cert != "" || got.Key != "" || got.ACMEListen == "" {
-		t.Fatalf("auto: %+v", got)
-	}
-	got = load(`{"mode":"shared","proxy_domain":"p.example.org","proxy_cert_method":"files",` + files + `}`)
-	if got.Cert != "/c" || got.Key != "/k2" || got.DNS != "" || got.ACMEListen != "" {
-		t.Fatalf("files: %+v", got)
-	}
-	got = load(`{"mode":"shared","proxy_domain":"p.example.org","proxy_cert_method":"dns",` + files + `}`)
-	if got.DNS != "alidns" || got.DNSKeyFile != "/k" || got.DNSTokenFile != "" || got.Cert != "" {
-		t.Fatalf("dns: %+v", got)
-	}
-	got = load(`{"mode":"shared","proxy_cert_method":"files","reality_dest":"self",` + files + `}`)
-	if got.ProxyCertMethod != "" || got.DNS != "" || got.Cert != "" || got.Key != "" || got.ACMEListen != "" {
-		t.Fatalf("no proxy domain: %+v", got)
-	}
-	got = load(`{"mode":"standalone","fast_sni":"a","rescue_listen":"b","reality_dest":"self","proxy_domain":"p.example.org","proxy_cert_method":"auto","cdn_domain":"c.example.com"}`)
-	want := SetupOptions{Mode: "standalone", CDNDomain: "c.example.com"}
-	if got != want {
-		t.Fatalf("standalone: %+v", got)
 	}
 }
 
-func TestLoadSetupConfigBadInput(t *testing.T) {
-	for _, body := range []string{`{"mode":"shared"} {}`, `{"mode":"shared"} x`, `{} []`, `[]`, ``, `{"mode":1}`} {
+func TestLoadSetupConfigRejectsUnsupportedFieldsAndTypes(t *testing.T) {
+	for _, body := range []string{
+		`{"sni":"gate.example","web":"/var/www"}`,
+		`{"sni":"gate.example","stealth":{"target":"elsewhere.example"}}`,
+		`{"sni":"gate.example","proxy":{"sni":"elsewhere.example"}}`,
+		`{"sni":"gate.example","proxy":{"web":"/var/www"}}`,
+		`{"sni":"gate.example","cert":{"dns":"cloudflare","token":"inline-token"}}`,
+		`{"fast":{"port":65536}}`, `{"proxy":{"port":"9443"}}`, `{"rescue":true}`,
+		`null`, `[]`, `{} {}`, `{"sni":`,
+	} {
 		if _, err := LoadSetupConfig(writeSetupConfig(t, body)); err == nil {
-			t.Fatalf("expected error for %q", body)
+			t.Errorf("accepted %s", body)
 		}
 	}
 }
 
 func TestLoadSetupConfigSizeLimit(t *testing.T) {
-	body := `{"_comment":"` + strings.Repeat("a", maxSetupConfigBytes) + `"}`
+	body := `{"sni":"` + strings.Repeat("x", maxSetupConfigBytes) + `"}`
 	if _, err := LoadSetupConfig(writeSetupConfig(t, body)); err == nil {
-		t.Fatal("expected size error")
+		t.Fatal("accepted an oversized setup file")
 	}
 	if _, err := LoadSetupConfig(filepath.Join(t.TempDir(), "missing.json")); err == nil {
-		t.Fatal("expected missing file error")
+		t.Fatal("accepted a missing setup file")
 	}
 }
 
-func TestSetupTemplateLoads(t *testing.T) {
-	for _, layout := range []DeployMode{Standalone, Shared} {
-		p := writeSetupConfig(t, string(SetupTemplate(layout, SetupDetection{})))
-		got, err := LoadSetupConfig(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := SetupOptions{Mode: string(layout), Domain: "vpn.example.com", CDNDomain: "static.example.com", FastHop: "20000-40000", Device: "phone"}
-		if layout == Shared {
-			want = SetupOptions{
-				Mode: "shared", Domain: "203.0.113.7", FastSNI: "proxy.example.org",
-				CDNDomain: "static.example.com", RescueListen: "172.17.0.1:18080",
-				RealityDest: "self", FastHop: "20000-40000",
-				ProxyDomain: "proxy.example.org", ProxyCertMethod: "auto", Device: "phone",
+func TestSetupTemplateRoundTrip(t *testing.T) {
+	example := setupConfigOptions(t, string(templates.Setup))
+	for _, tc := range []struct {
+		name       string
+		busy       int
+		unknown    bool
+		shared     bool
+		expectsDNS bool
+	}{
+		{name: "free"},
+		{name: "busy 80", busy: 80, shared: true, expectsDNS: true},
+		{name: "busy 443", busy: 443, shared: true},
+		{name: "unknown", unknown: true, shared: true, expectsDNS: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := SetupEnv{
+				GOOS: "darwin", EUID: 1000,
+				Interfaces: func() ([]SetupInterface, error) {
+					return []SetupInterface{{Addrs: []netip.Addr{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("198.51.100.7")}}}, nil
+				},
+				PortProbe: func(port int) (bool, bool) { return port == tc.busy, tc.unknown },
 			}
-		}
-		if got != want {
-			t.Fatalf("%s: got %+v want %+v", layout, got, want)
-		}
+			data, err := SetupTemplateFor(env, t.TempDir())
+			must(t, err)
+			opts := setupConfigOptions(t, string(data))
+			want := example.SetupConfig
+			want.IP = "198.51.100.7"
+			if !tc.shared {
+				want.Stealth.Port = 443
+				want.Proxy = &SetupPort{Port: 443}
+				want.Rescue = &SetupRescue{SNI: example.Rescue.SNI, Port: 443}
+			}
+			if !tc.expectsDNS {
+				want.Cert = nil
+			}
+			if !reflect.DeepEqual(opts.SetupConfig, want) {
+				t.Fatalf("unexpected generated template:\n%s", data)
+			}
+		})
+	}
+	data, err := SetupTemplateFor(SetupEnv{PortProbe: func(int) (bool, bool) { return false, false }}, t.TempDir())
+	must(t, err)
+	if got := setupConfigOptions(t, string(data)).IP; got != "" {
+		t.Fatalf("template should omit IP without a public address, got %q", got)
 	}
 }
 
-func TestSetupTemplateDetected(t *testing.T) {
-	d := SetupDetection{
-		PublicIPs:      []netip.Addr{netip.MustParseAddr("198.51.100.9")},
-		Bridges:        []netip.Addr{netip.MustParseAddr("172.17.0.1"), netip.MustParseAddr("172.21.0.1")},
-		NetworkBridges: []netip.Addr{netip.MustParseAddr("172.21.0.1")},
-	}
-	out := string(SetupTemplate(Shared, d))
-	for _, want := range []string{`"domain": "198.51.100.9"`, `"rescue_listen": "172.21.0.1:18080"`} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("missing %q in\n%s", want, out)
-		}
-	}
-	for _, layout := range []DeployMode{Standalone, Shared} {
-		if strings.Contains(string(SetupTemplate(layout, d)), `"_`) {
-			t.Fatalf("%s template has note keys", layout)
-		}
-	}
-}
-
-func TestSetupTemplateForNoRoot(t *testing.T) {
-	env := SetupEnv{
-		GOOS: "linux", EUID: 1000,
-		Interfaces: func() ([]SetupInterface, error) { return nil, nil },
-		PortProbe:  func(int) (bool, bool) { return true, true },
-	}
-	out, err := SetupTemplateFor(env, Auto)
-	if err != nil || !strings.Contains(string(out), `"mode": "shared"`) {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	env.PortProbe = func(int) (bool, bool) { return false, true }
-	out, err = SetupTemplateFor(env, "")
-	if err != nil || !strings.Contains(string(out), `"mode": "standalone"`) {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	if _, err := SetupTemplateFor(env, "bogus"); err == nil {
-		t.Fatal("expected layout error")
+func TestSetupTemplateUsesSelectedSavedSettings(t *testing.T) {
+	for _, mode := range []DeployMode{Standalone, Shared} {
+		t.Run(string(mode), func(t *testing.T) {
+			h := newSetupHarness(t, "")
+			h.env.PortProbe = func(int) (bool, bool) {
+				t.Fatal("template probed live ports despite saved settings")
+				return false, false
+			}
+			const dir = "/chosen-state"
+			state := h.env.path(dir)
+			must(t, InitWithOptions(state, "203.0.113.8", "", InitOptions{Mode: mode, FastSNI: "fast.example",
+				Ports: Ports{Fast: 2443, Stealth: 7443}}))
+			saved, err := ReadSettings(state)
+			must(t, err)
+			name := "fast.example"
+			proxyPort := uint16(7443)
+			if mode == Shared {
+				name, proxyPort = "gate.example", 9643
+				saved.HTTPSProxyListener = &httpsProxyListenerConfig{Domain: name, Port: proxyPort, CertMethod: "http"}
+				saved.CDNDomain, saved.RescueListen = "cdn.example", "127.0.0.1:18080"
+				must(t, writeJSON(state, settingsFile, saved))
+			}
+			data, err := SetupTemplateFor(h.env, dir)
+			must(t, err)
+			cfg := setupConfigOptions(t, string(data))
+			if cfg.IP != "203.0.113.8" || cfg.SNI != name || cfg.Stealth.Port != 7443 ||
+				cfg.Proxy == nil || cfg.Proxy.Port != proxyPort || cfg.Fast != (SetupFast{}) {
+				t.Fatalf("template did not use saved settings:\n%s", data)
+			}
+			if mode == Shared && (cfg.Rescue == nil || cfg.Rescue.SNI != "cdn.example" || cfg.Rescue.Port != DefaultRescuePort || cfg.Rescue.Cert == "") {
+				t.Fatalf("shared migration fields missing:\n%s", data)
+			}
+		})
 	}
 }
 
-func TestLoadSetupConfigUnderscoreKeys(t *testing.T) {
-	got, err := LoadSetupConfig(writeSetupConfig(t, `{"_a":1,"_b":{"x":[1]},"_c":null,"_d":true,"mode":"shared"}`))
-	if err != nil || got.Mode != "shared" {
-		t.Fatalf("got %+v, %v", got, err)
+func TestSetupTemplateMigrationRequiresAuthorizedHopping(t *testing.T) {
+	saved := SetupFast{Port: 2443, Hop: "25000-25010"}
+	for _, tc := range []struct {
+		name       string
+		installed  SetupFast
+		writable   bool
+		authorized bool
+	}{
+		{name: "unit absent"},
+		{name: "target differs", installed: SetupFast{Port: 2444, Hop: saved.Hop}},
+		{name: "range differs", installed: SetupFast{Port: saved.Port, Hop: "26000-26010"}},
+		{name: "writable unit", installed: saved, writable: true},
+		{name: "authorized", installed: saved, authorized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.installed.Hop != "" && os.Geteuid() != 0 {
+				t.Skip("requires a root-owned fixture")
+			}
+			h := newSetupHarness(t, "")
+			h.exists = true
+			must(t, InitWithOptions(h.env.path(setupStateDir), "origin.example", "", InitOptions{
+				Mode: Standalone, FastHop: saved.Hop, Ports: Ports{Fast: saved.Port},
+			}))
+			for _, file := range systemInstallFiles(setupStateDir, setupBinary, tc.installed) {
+				if file.name != hopServiceUnit {
+					continue
+				}
+				dir := h.env.path(setupUnitDir)
+				must(t, os.MkdirAll(dir, 0755))
+				path := filepath.Join(dir, file.name)
+				must(t, os.WriteFile(path, []byte(file.contents), file.mode))
+				if tc.writable {
+					must(t, os.Chmod(path, 0664))
+				}
+			}
+			data, err := SetupTemplateFor(h.env, "")
+			must(t, err)
+			opts := setupConfigOptions(t, string(data))
+			notes := strings.Count(h.out.String(), "Add the intended fast.hop and fast.port")
+			if tc.authorized {
+				if opts.Fast != tc.installed || notes != 0 {
+					t.Fatalf("authorized settings missing or produced a note: %s%s", data, h.out.String())
+				}
+				must(t, h.run(opts))
+				return
+			}
+			if opts.Fast != (SetupFast{}) || notes != 1 {
+				t.Fatalf("template must omit unconfirmed hopping inputs and print one note: %s%s", data, h.out.String())
+			}
+			if err := h.run(opts); err == nil || len(h.cmds) != 0 {
+				t.Fatalf("applying the generated config did not refuse the unconfirmed settings: %v, commands %v", err, h.argvs())
+			}
+		})
 	}
-	if _, err := LoadSetupConfig(writeSetupConfig(t, `{"_a":1,"bad":2}`)); err == nil || !strings.Contains(err.Error(), "bad") {
-		t.Fatalf("error %v", err)
+}
+
+func TestSetupPrivilegedInputsRequireTrustedPath(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("Linux root file validation")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "operator")
+	must(t, os.Mkdir(dir, 0755))
+	dst := filepath.Join(dir, "setup.json")
+	must(t, os.WriteFile(dst, []byte(`{"sni":"origin.example"}`), 0600))
+	if _, err := LoadSetupConfig(dst); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "alias")
+	must(t, os.Symlink(dir, alias))
+	if _, err := LoadSetupConfig(filepath.Join(alias, "setup.json")); err == nil {
+		t.Fatal("setup followed a symlink parent")
+	}
+	must(t, os.Chmod(dir, 0775))
+	if _, err := LoadSetupConfig(dst); err == nil || !strings.Contains(err.Error(), "owned or writable by user pipe") {
+		t.Fatalf("writable config parent: %v", err)
+	}
+	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil {
+		t.Fatal("setup staged a credential with a writable parent")
+	}
+	must(t, os.Chmod(dir, 0755))
+	must(t, os.Chown(dir, 990, 990))
+	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil {
+		t.Fatal("setup staged a credential in a service-owned directory")
 	}
 }

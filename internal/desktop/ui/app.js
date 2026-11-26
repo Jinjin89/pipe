@@ -850,6 +850,7 @@ async function startImport(link, field) {
     const kv = h('dl', { class: 'kv' },
       h('dt', {}, 'Name'), h('dd', {}, inp),
       h('dt', {}, 'Server'), h('dd', {}, p.server),
+      p.cdn ? [h('dt', {}, 'CDN'), h('dd', {}, p.cdn)] : null,
       h('dt', {}, 'Routes'), h('dd', { class: 'pmeta' }, (p.routes || []).map((r) => h('span', { class: 'pill ' + r }, ROUTE_NAMES[r] || r))),
       h('dt', {}, 'Key'), h('dd', { class: 'fp' }, p.fingerprint || '—'));
     const body = h('div', {}, h('p', { class: 'muted small-text' }, 'Check that this matches your server before saving.'), kv,

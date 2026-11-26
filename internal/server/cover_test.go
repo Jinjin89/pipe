@@ -29,15 +29,15 @@ func testCoverKey(index uint64) string {
 
 func TestCoverSiteDeterministic(t *testing.T) {
 	key := testCoverKey(1)
-	page, err := generateCoverSite(key)
+	page, err := generateCoverSite(key, mainCoverLabel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := generateCoverSite(key)
+	again, err := generateCoverSite(key, mainCoverLabel)
 	if err != nil || !bytes.Equal(page, again) {
 		t.Fatalf("the same key should give the same page: %v", err)
 	}
-	different, err := generateCoverSite(testCoverKey(2))
+	different, err := generateCoverSite(testCoverKey(2), mainCoverLabel)
 	if err != nil || bytes.Equal(page, different) {
 		t.Fatalf("different keys should give different pages: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestCoverSiteDiversity(t *testing.T) {
 	smallest, largest := 6<<10, 0
 	for i := range samples {
 		key := testCoverKey(uint64(i))
-		page, err := generateCoverSite(key)
+		page, err := generateCoverSite(key, mainCoverLabel)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,7 +322,7 @@ func TestCoverRenderEscapesTextAndChecksCSS(t *testing.T) {
 }
 
 func TestCoverPageServesStaticContent(t *testing.T) {
-	page, err := generateCoverSite(testCoverKey(1))
+	page, err := generateCoverSite(testCoverKey(1), mainCoverLabel)
 	if err != nil {
 		t.Fatal(err)
 	}

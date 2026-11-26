@@ -43,10 +43,26 @@ type Profile struct {
 	FastPin     string
 	FastHop     string
 	HTTPSProxy  string // Optional HTTPS proxy address (hp=<host>[:<port>]); port defaults to DefaultPort.
-	CDN         string
+	CDN         string // Rescue's DNS name.
+	CDNPort     uint16 // Rescue's Cloudflare port (cdn=<name>[:<port>]); zero means DefaultPort.
 	WSPath      string
 	SubID       string
 	Name        string
+}
+
+func (p Profile) CDNEndpointPort() uint16 {
+	if p.CDNPort != 0 {
+		return p.CDNPort
+	}
+	return DefaultPort
+}
+
+// CDNEndpoint returns the CDN name with a non-default port suffix, if configured.
+func (p Profile) CDNEndpoint() string {
+	if p.CDN == "" || p.CDNEndpointPort() == DefaultPort {
+		return p.CDN
+	}
+	return net.JoinHostPort(p.CDN, strconv.Itoa(int(p.CDNPort)))
 }
 
 func (p Profile) FastEndpointPort() uint16 {
@@ -135,7 +151,17 @@ func Parse(raw string) (Profile, error) {
 	if err != nil {
 		return Profile{}, fmt.Errorf("invalid REALITY public key (pbk): %w", err)
 	}
-	profile.CDN, profile.WSPath = query.Get("cdn"), query.Get("wsp")
+	if cdn := query.Get("cdn"); cdn != "" {
+		host, port, err := parseDNSEndpoint(cdn, "cdn")
+		if err != nil {
+			return Profile{}, err
+		}
+		profile.CDN = host
+		if port != DefaultPort {
+			profile.CDNPort = port
+		}
+	}
+	profile.WSPath = query.Get("wsp")
 	profile.SubID, profile.Name = query.Get("sub"), u.Fragment
 	profile.RealitySNI, profile.FastSNI = query.Get("rsni"), query.Get("fsni")
 	profile.FastPin, profile.FastHop = query.Get("pin"), query.Get("fh")
@@ -178,7 +204,7 @@ func (p Profile) Encode() (string, error) {
 	}
 	query := url.Values{"pbk": {EncodeKey(p.PublicKey)}}
 	for key, value := range map[string]string{
-		"cdn": p.CDN, "wsp": p.WSPath, "sub": p.SubID, "pin": p.FastPin, "fh": p.FastHop,
+		"cdn": p.CDNEndpoint(), "wsp": p.WSPath, "sub": p.SubID, "pin": p.FastPin, "fh": p.FastHop,
 	} {
 		if value != "" {
 			query.Set(key, value)
@@ -227,12 +253,15 @@ func (p Profile) validate() error {
 		}
 	}
 	if p.HTTPSProxy != "" {
-		if _, _, err := parseHTTPSProxy(p.HTTPSProxy); err != nil {
+		if _, _, err := parseDNSEndpoint(p.HTTPSProxy, "hp"); err != nil {
 			return err
 		}
 	}
-	if p.CDN != "" && !ValidHost(p.CDN) {
-		return errors.New("cdn must be a DNS name or IP address without a port")
+	if p.CDN == "" && p.CDNPort != 0 {
+		return errors.New("cdn port requires a DNS name")
+	}
+	if p.CDN != "" && !ValidDNSName(p.CDN) {
+		return errors.New("cdn must be a DNS name")
 	}
 	if p.WSPath != "" && !ValidWSPath(p.WSPath) {
 		return errors.New("wsp must be an absolute WebSocket path without a query or fragment")
@@ -357,17 +386,17 @@ func uuid4(key []byte) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", key[:4], key[4:6], key[6:8], key[8:10], key[10:])
 }
 
-func parseHTTPSProxy(value string) (string, uint16, error) {
+func parseDNSEndpoint(value, key string) (string, uint16, error) {
 	host, rawPort, hasPort := strings.Cut(value, ":")
 	if !ValidDNSName(host) {
-		return "", 0, errors.New("hp must be a DNS name with an optional port")
+		return "", 0, fmt.Errorf("%s must be a DNS name with an optional port", key)
 	}
 	if !hasPort {
 		return host, DefaultPort, nil
 	}
 	port, err := parsePort(rawPort)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid hp: %w", err)
+		return "", 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return host, port, nil
 }
@@ -376,7 +405,7 @@ func canonicalHTTPSProxy(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	host, port, err := parseHTTPSProxy(value)
+	host, port, err := parseDNSEndpoint(value, "hp")
 	if err != nil {
 		return "", err
 	}
@@ -406,7 +435,7 @@ func ProxyURL(p Profile) (string, bool) {
 	if p.HTTPSProxy == "" || !ValidName(p.Name) {
 		return "", false
 	}
-	host, port, err := parseHTTPSProxy(p.HTTPSProxy)
+	host, port, err := parseDNSEndpoint(p.HTTPSProxy, "hp")
 	if err != nil {
 		return "", false
 	}

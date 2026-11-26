@@ -1,0 +1,10 @@
+{
+  "ip": "203.0.113.7",
+  "sni": "proxy.example.com",
+  "cert": { "dns": "cloudflare", "token_file": "/root/cf-token" },
+  "fast": { "port": 443, "hop": "20000-40000" },
+  "stealth": { "port": 8443 },
+  "proxy": { "port": 9443 },
+  "rescue": { "sni": "static.example.com", "port": 2053, "cert": "/root/origin.pem", "key": "/root/origin.key" },
+  "device": "phone"
+}

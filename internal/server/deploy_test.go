@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"pipe/internal/config"
 	"pipe/internal/engine"
 	"pipe/internal/link"
 )
@@ -90,38 +91,25 @@ func TestAutoDetectDeployment(t *testing.T) {
 	}
 }
 
-func TestPrivateRescueListener(t *testing.T) {
-	for _, address := range []string{"0.0.0.0:10001", "[::]:10001", "11.0.0.80:10001", "169.254.1.1:10001",
-		"[fe80::1]:10001", "localhost:10001", "127.0.0.1:0", "[fc00::1%somewhere]:10001"} {
-		if _, err := privateRescueAddress(address); err == nil {
-			t.Errorf("accepted restricted bind %s", address)
-		}
-	}
-	for _, address := range []string{"127.0.0.1:10001", "172.16.1.3:10001", "[::1]:10001", "[fd00::1]:10001"} {
-		if _, err := privateRescueAddress(address); err != nil {
-			t.Errorf("refused private bind %s: %v", address, err)
-		}
-	}
-}
-
 func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 	dir := t.TempDir()
-	const rescueListen = "172.16.0.1:10001"
+	const cdn = "static.example"
+	cert, key := writeProxyTestPair(t, cdn, t.TempDir())
 	options := InitOptions{
 		Mode: Shared, Ports: Ports{Fast: 14443},
 		FastSNI: "fast.example", FastHop: "20000-20010",
-		RescueListen: "[::ffff:172.16.0.1]:10001",
+		Rescue: RescueConfig{Cert: cert, Key: key},
 	}
-	if err := InitWithOptions(dir, "11.0.0.80", "static.example", options); err != nil {
+	if err := InitWithOptions(dir, "11.0.0.80", cdn, options); err != nil {
 		t.Fatal(err)
 	}
 	s, err := ReadSettings(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved Settings
-	if err := readJSON(filepath.Join(dir, settingsFile), &saved); err != nil || saved.RescueListen != rescueListen {
-		t.Fatalf("private Rescue address was not saved in canonical form: %v", err)
+	if s.Rescue == nil || s.Rescue.Port != DefaultRescuePort || s.Ports.VMess == 0 ||
+		filepath.Dir(s.Rescue.Cert) != dir || filepath.Dir(s.Rescue.Key) != dir {
+		t.Fatalf("unexpected saved Rescue configuration: %+v", s.Rescue)
 	}
 	raw, _, proxy, err := AddWithProxy(dir, "shared", false)
 	if err != nil || proxy != "" {
@@ -130,14 +118,14 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 	profile, err := link.Parse(raw)
 	if err != nil || profile.FastEndpointPort() != 14443 || profile.StealthEndpointPort() != 8443 ||
 		profile.FastServerName() != "fast.example" || profile.StealthServerName() != "fast.example" ||
-		profile.FastHop != "20000-20010" || profile.FastPin == "" || profile.CDN != "static.example" {
+		profile.FastHop != "20000-20010" || profile.FastPin == "" || profile.CDN != cdn || profile.CDNPort != DefaultRescuePort {
 		t.Fatalf("shared link has wrong endpoint metadata: %v", err)
 	}
 	before, err := s.fastKeyPair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cover, err := generateCoverSite(s.RealityPrivateKey)
+	cover, err := generateCoverSite(s.RealityPrivateKey, mainCoverLabel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,27 +148,25 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 	if err != nil || pin != profile.FastPin || !bytes.Equal(s.FastPrivateKey, again.FastPrivateKey) {
 		t.Fatalf("persisted Fast key changed after renewal: %v", err)
 	}
-	afterCover, err := generateCoverSite(again.RealityPrivateKey)
+	afterCover, err := generateCoverSite(again.RealityPrivateKey, mainCoverLabel)
 	if err != nil || !bytes.Equal(cover, afterCover) {
 		t.Fatalf("cover should survive Fast certificate renewal: %v", err)
 	}
-	config := serverConfig(s, nil, "127.0.0.1", 12345, 0, nil)
+	config := serverConfig(s, nil, "127.0.0.1", serverListeners{masquerade: 12345}, nil)
 	inbounds := config["inbounds"].([]engine.Object)
-	if len(inbounds) != 2 || inbounds[0]["masquerade"].(engine.Object)["url"] != "http://127.0.0.1:12345" ||
-		inbounds[1]["type"] != engine.SharedRescue || inbounds[1]["listen"] != rescueListen {
-		t.Fatal("shared config without the HTTPS proxy should bind only Fast and private Rescue")
+	if len(inbounds) != 2 || inbounds[0]["tag"] != "fast" || inbounds[0]["masquerade"].(engine.Object)["url"] != "http://127.0.0.1:12345" ||
+		inbounds[1]["type"] != "vmess" || inbounds[1]["listen"] != "127.0.0.1" || inbounds[1]["listen_port"] != s.Ports.VMess {
+		t.Fatalf("expected Fast and loopback VMess: %+v", inbounds)
 	}
 	outbounds := config["outbounds"].([]engine.Object)
 	if outbounds[1]["type"] != engine.InMemoryProbe {
 		t.Fatal("shared health probes need a socket-free outbound")
 	}
 	installDir := filepath.Join(dir, "install")
-	includePath := filepath.Join(installDir, "pipe-rescue.nginx")
-	if err := os.Mkdir(installDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(includePath, []byte("old include"), 0644); err != nil {
-		t.Fatal(err)
+	must(t, os.Mkdir(installDir, 0750))
+	stale := []string{"pipe-rescue.nginx", "pipe-nginx.conf"}
+	for _, name := range stale {
+		must(t, os.WriteFile(filepath.Join(installDir, name), []byte("old include"), 0600))
 	}
 	_, err = GenerateInstall(dir, "/tmp/pipe")
 	if err != nil {
@@ -206,15 +192,17 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 		bytes.Contains(hopService, []byte("AmbientCapabilities=")) {
 		t.Fatal("the root hopping service must not use the state directory or ambient capabilities")
 	}
-	include, err := os.ReadFile(includePath)
-	if err != nil || !strings.Contains(string(include), "location = "+s.WSPath) ||
-		!strings.Contains(string(include), "proxy_pass http://"+rescueListen+";") ||
-		!strings.Contains(string(include), "proxy_set_header Host $http_host;") ||
-		!strings.Contains(string(include), "access_log off;") {
-		t.Fatalf("incomplete nginx location: %v", err)
+	for _, name := range stale {
+		if _, err := os.Stat(filepath.Join(installDir, name)); !os.IsNotExist(err) {
+			t.Errorf("stale %s was kept: %v", name, err)
+		}
+	}
+	firewall, err := os.ReadFile(filepath.Join(installDir, "pipe.nft"))
+	if err != nil || strings.Contains(string(firewall), "tcp dport 2053") {
+		t.Fatalf("unexpected Rescue firewall rule: %v\n%s", err, firewall)
 	}
 	if runtime.GOOS != "windows" {
-		for path, mode := range map[string]os.FileMode{installDir: 0700, includePath: 0600} {
+		for path, mode := range map[string]os.FileMode{installDir: 0700, s.Rescue.Cert: 0600, s.Rescue.Key: 0600} {
 			info, err := os.Stat(path)
 			if err != nil || info.Mode().Perm() != mode {
 				t.Errorf("expected mode %o for %s: %v", mode, filepath.Base(path), err)
@@ -235,6 +223,49 @@ func TestFastHopRequiresExplicitParameters(t *testing.T) {
 		if err := ApplyFastHop(t.Context(), test.ports, test.fast); err == nil {
 			t.Errorf("accepted invalid hopping range %q or port %d", test.ports, test.fast)
 		}
+	}
+}
+
+func TestStandaloneProductionRescueUsesStealthPort(t *testing.T) {
+	const cdn = "cdn.example"
+	for _, tc := range []struct {
+		name     string
+		port     uint16
+		linkPort uint16
+		warning  bool
+	}{
+		{"default port", 443, 0, false},
+		{"Cloudflare port", 2053, 2053, false},
+		{"non-Cloudflare port", 12053, 12053, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var warnings []string
+			must(t, InitWithOptions(dir, "origin.example", cdn, InitOptions{
+				Mode: Standalone, Ports: Ports{Stealth: tc.port},
+				Warn: func(warning string) { warnings = append(warnings, warning) },
+			}))
+			if (len(warnings) > 0) != tc.warning || tc.warning && !strings.Contains(warnings[0], "Cloudflare") {
+				t.Fatalf("unexpected warnings for TCP %d: %v", tc.port, warnings)
+			}
+			raw, _, _, err := AddWithProxy(dir, "phone", false)
+			must(t, err)
+			profile, err := link.Parse(raw)
+			must(t, err)
+			if profile.CDN != cdn || profile.WSPath == "" || profile.CDNPort != tc.linkPort {
+				t.Fatalf("production link has CDN port %d, want %d", profile.CDNPort, tc.linkPort)
+			}
+			client, err := config.BuildClient(config.ClientOptions{
+				Preferences: config.Preferences{Mode: config.Global}, Profile: &profile,
+			})
+			must(t, err)
+			for _, outbound := range client.Config["outbounds"].([]engine.Object) {
+				if outbound["tag"] == "rescue" && outbound["server"] == cdn && outbound["server_port"] == tc.port {
+					return
+				}
+			}
+			t.Fatalf("production client is missing a Rescue outbound on TCP %d", tc.port)
+		})
 	}
 }
 

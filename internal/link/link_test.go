@@ -23,7 +23,7 @@ func TestRoundTrip(t *testing.T) {
 		{Host: "2001:db8::1", FastSNI: "origin.example.test", Port: 9443, Name: "ipv6 port"},
 		{Host: "direct.example.test", FastPort: 24443, StealthPort: 8443, FastSNI: "fast.example.test",
 			RealitySNI: "cover.example.test", FastPin: EncodeKey([32]byte{4}), FastHop: "20000-40000",
-			HTTPSProxy: "cover.example.test:9443", CDN: "static.example.test", WSPath: "/ws/path", Name: "shared"},
+			HTTPSProxy: "cover.example.test:9443", CDN: "static.example.test", CDNPort: 2053, WSPath: "/ws/path", Name: "shared"},
 	} {
 		p.Seed[0], p.PublicKey[31] = 123, 45
 		t.Run(p.Name, func(t *testing.T) {
@@ -82,7 +82,15 @@ func TestBadLink(t *testing.T) {
 		{"hp path", stem + "?pbk=" + key + "&hp=proxy.example.test/x#phone", "hp must"},
 		{"hp scheme", stem + "?pbk=" + key + "&hp=https://proxy.example.test:9443#phone", "invalid hp"},
 		{"hp empty", stem + "?pbk=" + key + "&hp=#phone", "one non-empty"},
-		{"cdn", stem + "?pbk=" + key + "&cdn=cdn.example.test:443#phone", "cdn must"},
+		{"cdn ip", stem + "?pbk=" + key + "&cdn=127.0.0.1#phone", "cdn must"},
+		{"cdn ipv6", stem + "?pbk=" + key + "&cdn=[::1]:2053#phone", "cdn must"},
+		{"cdn port without name", stem + "?pbk=" + key + "&cdn=:2053#phone", "cdn must"},
+		{"cdn path", stem + "?pbk=" + key + "&cdn=cdn.example.test/x#phone", "cdn must"},
+		{"cdn empty port", stem + "?pbk=" + key + "&cdn=cdn.example.test:#phone", "invalid cdn"},
+		{"cdn zero port", stem + "?pbk=" + key + "&cdn=cdn.example.test:0#phone", "invalid cdn"},
+		{"cdn overflow port", stem + "?pbk=" + key + "&cdn=cdn.example.test:65536#phone", "invalid cdn"},
+		{"cdn leading zero port", stem + "?pbk=" + key + "&cdn=cdn.example.test:02053#phone", "leading zeros"},
+		{"cdn extra colon", stem + "?pbk=" + key + "&cdn=cdn.example.test:2053:443#phone", "invalid cdn"},
 		{"ws", stem + "?pbk=" + key + "&wsp=relative#phone", "absolute WebSocket path"},
 		{"sub", stem + "?pbk=" + key + "&sub=a%20b#phone", "URL-safe"},
 		{"fragment", stem + "?pbk=" + key, "device name"},
@@ -148,6 +156,39 @@ func TestDefaultAuthorityPortIsCanonical(t *testing.T) {
 		got, err := profile.Encode()
 		if err != nil || got != stem+query+"#phone" {
 			t.Fatalf("encoder did not omit the redundant ports: %v", err)
+		}
+	}
+}
+
+func TestDefaultCDNPortIsCanonical(t *testing.T) {
+	key := EncodeKey([32]byte{1, 2, 3})
+	prefix := "pipe://" + key + "@origin.example:8443?cdn=cdn.example"
+	suffix := "&pbk=" + key + "#phone"
+	profile, err := Parse(prefix + ":443" + suffix)
+	if err != nil || profile.CDN != "cdn.example" || profile.CDNPort != 0 || profile.CDNEndpointPort() != 443 {
+		t.Fatalf("default CDN port did not normalize: %v", err)
+	}
+	for _, port := range []uint16{0, 443} {
+		profile.CDNPort = port
+		got, err := profile.Encode()
+		if err != nil || got != prefix+suffix {
+			t.Fatalf("encoder did not omit default CDN port %d: %v", port, err)
+		}
+	}
+}
+
+func TestEncodeRejectsInvalidCDN(t *testing.T) {
+	for _, test := range []struct {
+		host string
+		port uint16
+	}{
+		{host: "", port: 2053},
+		{host: "127.0.0.1"},
+		{host: "cdn.example:2053"},
+	} {
+		p := Profile{Host: "origin.example", Name: "phone", CDN: test.host, CDNPort: test.port}
+		if _, err := p.Encode(); err == nil {
+			t.Errorf("encoded invalid CDN host %q or port %d", test.host, test.port)
 		}
 	}
 }

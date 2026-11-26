@@ -9,7 +9,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,23 +96,55 @@ func parseAliDNSSecret(secret string) (alidns.CredentialInfo, error) {
 	return info, nil
 }
 
-func issueProxyCertificate(ctx context.Context, dir, domain string, provider certmagic.DNSProvider) error {
-	config, stop, err := proxyACMEConfig(dir, provider, nil)
+func issueProxyCertificate(ctx context.Context, dir, domain string, provider certmagic.DNSProvider, fresh bool) error {
+	state := dir
+	if fresh {
+		// An empty store forces a new certificate and a new ACME account,
+		// so even cached ACME authorizations cannot skip the DNS challenge.
+		var err error
+		state, err = os.MkdirTemp(dir, ".proxy-acme-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(state)
+	}
+	config, stop, err := proxyACMEConfig(state, provider, nil)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	// Not ManageSync: its interactive mode asks for an email on stdin and
-	// ignores ctx, so pipe server proxy enable (and setup) hung forever.
-	// ObtainCertAsync still blocks until done; ctx bounds its retries.
-	return config.ObtainCertAsync(ctx, domain)
+	// ObtainCertAsync blocks here with bounded retries and no interactive prompts.
+	if err := config.ObtainCertAsync(ctx, domain); err != nil || !fresh {
+		return err
+	}
+	issued, live := filepath.Join(state, proxyCertificateStorage), filepath.Join(dir, proxyCertificateStorage)
+	if err := os.Rename(issued, live); err == nil {
+		return nil
+	}
+	// Keep existing certificates and account data. Publish the new site
+	// as a complete directory if this name has no certificate store yet.
+	site := certmagic.StorageKeys.CertsSitePrefix(config.Issuers[0].IssuerKey(), domain)
+	dest := filepath.Join(live, filepath.FromSlash(site))
+	if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(issued, filepath.FromSlash(site)), dest); err != nil {
+		if info, statErr := os.Stat(dest); statErr != nil || !info.IsDir() {
+			return err
+		}
+	}
+	return nil
 }
 
 func proxyACMEConfig(dir string, provider certmagic.DNSProvider, warn func(string)) (*certmagic.Config, func(), error) {
-	return proxyManagedCertificates(dir, httpsProxyListenerConfig{CertMethod: "dns"}, provider, warn)
+	config, cache, err := proxyManagedCertificates(dir, httpsProxyListenerConfig{CertMethod: "dns"}, provider, warn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return config, cache.Stop, nil
 }
 
-func proxyManagedCertificates(dir string, cfg httpsProxyListenerConfig, provider certmagic.DNSProvider, warn func(string)) (*certmagic.Config, func(), error) {
+func proxyManagedCertificates(dir string, cfg httpsProxyListenerConfig, provider certmagic.DNSProvider, warn func(string)) (*certmagic.Config, *certmagic.Cache, error) {
 	path := filepath.Join(dir, proxyCertificateStorage)
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, nil, err
@@ -123,7 +154,7 @@ func proxyManagedCertificates(dir string, cfg httpsProxyListenerConfig, provider
 	}
 	logger := zap.NewNop()
 	if warn != nil {
-		message := "HTTPS proxy HTTP-01 certificate management reported an error. Check TCP 80 and the ACME challenge route"
+		message := "HTTPS proxy HTTP-01 certificate management reported an error. Check that TCP 80 is open and free"
 		if cfg.method() == "dns" {
 			message = "HTTPS proxy DNS-01 certificate management reported an error. Check the DNS zone and provider credentials"
 		}
@@ -144,8 +175,7 @@ func proxyManagedCertificates(dir string, cfg httpsProxyListenerConfig, provider
 		CA: certmagic.LetsEncryptProductionCA, Agreed: true,
 		DisableTLSALPNChallenge: true, Logger: logger,
 	}
-	switch cfg.method() {
-	case "dns":
+	if cfg.method() == "dns" {
 		template.DisableHTTPChallenge = true
 		// No local propagation check: it trusts this host's resolvers and
 		// network (one dead IPv6 resolver or a negative cache stalls it).
@@ -154,19 +184,12 @@ func proxyManagedCertificates(dir string, cfg httpsProxyListenerConfig, provider
 			DNSProvider: provider, Logger: logger,
 			PropagationDelay: dnsPropagationDelay, PropagationTimeout: -1,
 		}}
-	case "nginx":
-		listen, err := netip.ParseAddrPort(cfg.ACMEListen)
-		if err != nil {
-			cache.Stop()
-			return nil, nil, err
-		}
-		template.ListenHost, template.AltHTTPPort = listen.Addr().String(), int(listen.Port())
 	}
 	issuer := certmagic.NewACMEIssuer(config, template)
 	// Keep issuance and unattended retries on the production directory.
 	issuer.TestCA = ""
 	config.Issuers = []certmagic.Issuer{issuer}
-	return config, cache.Stop, nil
+	return config, cache, nil
 }
 
 // Certmagic can include provider responses and signed request details in its
@@ -204,39 +227,56 @@ func certificateExpiry(dir, domain, storage, path string) (time.Time, error) {
 }
 
 func loadProxyPEM(cfg httpsProxyListenerConfig, now time.Time) (*tls.Certificate, error) {
-	certPEM, err := localfile.Read(cfg.Cert, localfile.MaxConfigBytes, false)
+	return loadPEMFiles(cfg.Domain, cfg.Cert, cfg.Key, "HTTPS proxy", now)
+}
+
+func loadPEMFiles(domain, certPath, keyPath, service string, now time.Time) (*tls.Certificate, error) {
+	certPEM, keyPEM, err := readPEMFiles(certPath, keyPath, service)
 	if err != nil {
-		return nil, fmt.Errorf("read HTTPS proxy certificate: %w", err)
+		return nil, err
 	}
-	keyPEM, err := localfile.Read(cfg.Key, localfile.MaxConfigBytes, true)
+	defer clear(keyPEM)
+	return parsePEMFiles(domain, service, certPEM, keyPEM, now)
+}
+
+func readPEMFiles(certPath, keyPath, service string) (certPEM, keyPEM []byte, err error) {
+	certPEM, err = localfile.Read(certPath, localfile.MaxConfigBytes, false)
 	if err != nil {
-		return nil, fmt.Errorf("read HTTPS proxy key: %w", err)
+		return nil, nil, fmt.Errorf("read %s certificate: %w", service, err)
 	}
+	keyPEM, err = localfile.Read(keyPath, localfile.MaxConfigBytes, true)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s key: %w", service, err)
+	}
+	return certPEM, keyPEM, nil
+}
+
+func parsePEMFiles(domain, service string, certPEM, keyPEM []byte, now time.Time) (*tls.Certificate, error) {
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("load HTTPS proxy certificate and key: %w", err)
+		return nil, fmt.Errorf("load %s certificate and key: %w", service, err)
 	}
 	if pair.Leaf == nil {
 		pair.Leaf, err = x509.ParseCertificate(pair.Certificate[0])
 		if err != nil {
-			return nil, fmt.Errorf("parse HTTPS proxy certificate: %w", err)
+			return nil, fmt.Errorf("parse %s certificate: %w", service, err)
 		}
 	}
-	if err := pair.Leaf.VerifyHostname(cfg.Domain); err != nil {
-		return nil, errors.New("HTTPS proxy certificate does not match the configured domain")
+	if err := pair.Leaf.VerifyHostname(domain); err != nil {
+		return nil, fmt.Errorf("%s certificate does not match the configured domain", service)
 	}
-	if err := proxyPEMValidity(pair.Leaf, now); err != nil {
+	if err := pemValidity(pair.Leaf, service, now); err != nil {
 		return nil, err
 	}
 	return &pair, nil
 }
 
-func proxyPEMValidity(cert *x509.Certificate, now time.Time) error {
+func pemValidity(cert *x509.Certificate, service string, now time.Time) error {
 	if now.Before(cert.NotBefore) {
-		return errors.New("HTTPS proxy certificate is not yet valid")
+		return fmt.Errorf("%s certificate is not yet valid", service)
 	}
 	if !now.Before(cert.NotAfter) {
-		return errors.New("HTTPS proxy certificate has expired")
+		return fmt.Errorf("%s certificate has expired", service)
 	}
 	return nil
 }
@@ -265,7 +305,7 @@ func (p *proxyPEMCertificates) getCertificate(*tls.ClientHelloInfo) (*tls.Certif
 func (p *proxyPEMCertificates) certificateAt(now time.Time) (*tls.Certificate, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.current != nil && proxyPEMValidity(p.current.Leaf, now) != nil {
+	if p.current != nil && pemValidity(p.current.Leaf, "HTTPS proxy", now) != nil {
 		p.current = nil
 		p.nextCheck = time.Time{}
 	}

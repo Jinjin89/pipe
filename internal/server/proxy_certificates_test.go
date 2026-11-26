@@ -322,7 +322,7 @@ func TestStrictProxySNIRejectsHandshakesBeforeSelectingCertificate(t *testing.T)
 }
 
 func TestSharedProxyCover(t *testing.T) {
-	page, err := generateCoverSite(testCoverKey(1))
+	page, err := generateCoverSite(testCoverKey(1), mainCoverLabel)
 	if err != nil {
 		t.Fatal(err)
 	}

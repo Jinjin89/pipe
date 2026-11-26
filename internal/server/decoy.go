@@ -22,8 +22,13 @@ import (
 	"pipe/internal/localfile"
 )
 
-func makeDecoy(settings Settings, options RunOptions, authenticate func(context.Context, string) bool) (http.Handler, error) {
-	var site http.Handler
+type decoySite struct {
+	main http.Handler
+	http.Handler
+}
+
+func makeDecoy(settings Settings, options RunOptions, authenticate func(context.Context, string) bool) (*decoySite, error) {
+	var main, rescue http.Handler
 	www, upstream := options.WWW, options.WebUpstream
 	switch {
 	case www != "" && upstream != "":
@@ -36,36 +41,51 @@ func makeDecoy(settings Settings, options RunOptions, authenticate func(context.
 		if !info.IsDir() {
 			return nil, errors.New("--www must point to a directory")
 		}
-		site = http.FileServer(http.Dir(www))
+		main = http.FileServer(http.Dir(www))
 	case upstream != "":
 		target, err := url.Parse(upstream)
 		if err != nil || target.Host == "" || target.User != nil || target.Fragment != "" ||
 			(target.Scheme != "http" && target.Scheme != "https") {
 			return nil, errors.New("--web-upstream requires an HTTP or HTTPS URL without credentials or a fragment")
 		}
-		site = reverseProxy(target)
+		main = reverseProxy(target)
 	default:
-		page, err := generateCoverSite(settings.RealityPrivateKey)
+		page, err := generateCoverSite(settings.RealityPrivateKey, mainCoverLabel)
 		if err != nil {
 			return nil, err
 		}
-		site = page
+		main = page
+		if settings.CDNDomain != "" {
+			page, err := generateCoverSite(settings.RealityPrivateKey, rescueCoverLabel)
+			if err != nil {
+				return nil, err
+			}
+			rescue = page
+		}
+	}
+	serveSite := func(w http.ResponseWriter, r *http.Request) {
+		if rescue != nil && r.TLS != nil && equalDNS(r.TLS.ServerName, settings.CDNDomain) {
+			rescue.ServeHTTP(w, r)
+		} else {
+			main.ServeHTTP(w, r)
+		}
 	}
 	ws := reverseProxy(&url.URL{Scheme: "http", Host: loopback(settings.Ports.VMess)})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if settings.CDNDomain != "" && r.URL.Path == settings.WSPath {
-			if r.TLS == nil || !strings.EqualFold(requestHost(r.Host), settings.CDNDomain) ||
+			if r.TLS == nil || !equalDNS(r.TLS.ServerName, settings.CDNDomain) || !equalDNS(requestHost(r.Host), settings.CDNDomain) ||
 				!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
-				(options.CFOriginCA != "" && (len(r.TLS.VerifiedChains) == 0 || !strings.EqualFold(r.TLS.ServerName, settings.CDNDomain))) ||
+				(options.CFOriginCA != "" && len(r.TLS.VerifiedChains) == 0) ||
 				authenticate == nil || !authenticate(r.Context(), r.Header.Get(engine.WebSocketEarlyDataHeader)) {
-				site.ServeHTTP(w, r)
+				serveSite(w, r)
 				return
 			}
 			ws.ServeHTTP(w, r)
 			return
 		}
-		site.ServeHTTP(w, r)
-	}), nil
+		serveSite(w, r)
+	})
+	return &decoySite{main: main, Handler: handler}, nil
 }
 
 // webUpstreamWarning explains the cost of a public --web-upstream. Standalone
@@ -103,24 +123,6 @@ func loadCFOriginCA(path string) (*x509.CertPool, error) {
 		return nil, errors.New("--cf-origin-ca contains no PEM certificates")
 	}
 	return pool, nil
-}
-
-func decoyTLSConfig(settings Settings, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error), originCA *x509.CertPool) *tls.Config {
-	config := &tls.Config{
-		MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}, GetCertificate: getCertificate,
-	}
-	if originCA != nil {
-		cdn := config.Clone()
-		cdn.ClientAuth = tls.VerifyClientCertIfGiven
-		cdn.ClientCAs = originCA
-		config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			if strings.EqualFold(hello.ServerName, settings.CDNDomain) {
-				return cdn, nil
-			}
-			return nil, nil
-		}
-	}
-	return config
 }
 
 func reverseProxy(target *url.URL) *httputil.ReverseProxy {

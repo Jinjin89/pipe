@@ -60,6 +60,42 @@ func TestListenerReplacementRetriesOnlyAddressInUse(t *testing.T) {
 	}
 }
 
+func TestDisabledInboundUsesReloadedOptionsWhenEnabled(t *testing.T) {
+	logger := log.NewNOPFactory().NewLogger("reload-test")
+	parent := adapter.NewScope(t.Context(), logger)
+	defer parent.Close()
+	initial, enabled := &testReloadInbound{}, &testReloadInbound{}
+	in := reloadableInbound{
+		Adapter: inbound.NewAdapter("test", "proxy"), logger: logger, current: initial,
+		create: func(options any) (adapter.Inbound, error) {
+			if options != "updated credentials" {
+				t.Fatalf("reload lost the latest options: %v", options)
+			}
+			return enabled, nil
+		},
+	}
+	if err := in.setEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range adapter.ListStartStages {
+		if err := in.Start(stage, parent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := in.replace(&testReloadInbound{bindErr: syscall.EPERM}, "updated credentials"); err != nil {
+		t.Fatalf("credential reload attempted to open the disabled listener: %v", err)
+	}
+	if in.current != nil {
+		t.Fatal("credential reload enabled the listener")
+	}
+	if err := in.setEnabled(true); err != nil || in.current != enabled {
+		t.Fatalf("enable did not start the updated listener: %v", err)
+	}
+	if err := in.setEnabled(false); err != nil || enabled.closed != 1 || initial.closed != 0 {
+		t.Fatalf("disable did not close only the started listener: %v", err)
+	}
+}
+
 type testReloadInbound struct {
 	inbound.Adapter
 	bindErr error

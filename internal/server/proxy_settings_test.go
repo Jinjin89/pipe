@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -27,8 +28,11 @@ const testProxyDomain = "gate.other.example"
 func initProxyTestState(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := InitWithOptions(dir, "11.0.0.80", "static.website.example", InitOptions{
-		Mode: Shared, FastSNI: "fast.example", RescueListen: "127.0.0.1:10001",
+	const cdn = "static.website.example"
+	cert, key := writeProxyTestPair(t, cdn, t.TempDir())
+	if err := InitWithOptions(dir, "11.0.0.80", cdn, InitOptions{
+		Mode: Shared, FastSNI: "fast.example", Ports: Ports{VMess: 10001},
+		Rescue: RescueConfig{Cert: cert, Key: key},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +41,7 @@ func initProxyTestState(t *testing.T) string {
 
 func testProxySetup() proxySetup {
 	return proxySetup{
+		probeHTTP: func() (bool, error) { return false, nil },
 		lookup: func(context.Context, string, string) ([]netip.Addr, error) {
 			return []netip.Addr{netip.MustParseAddr("11.0.0.80")}, nil
 		},
@@ -88,7 +93,10 @@ func TestSharedProxyEnableAddDisable(t *testing.T) {
 	if err != nil || info.Domain != testProxyDomain || info.Port != DefaultProxyPort || info.Source != "certificate files" {
 		t.Fatalf("incorrect proxy status: %v", err)
 	}
+	oldEUID := installEUID
+	installEUID = func() int { return 1000 }
 	paths, hints, err := Install(t.Context(), dir, "/tmp/pipe", Auto, nil)
+	installEUID = oldEUID
 	if err != nil || !strings.Contains(strings.Join(hints, "\n"), "Allow TCP 9443 for the HTTPS proxy") {
 		t.Fatalf("missing shared proxy firewall hint: %v", err)
 	}
@@ -223,20 +231,20 @@ func TestProxyDomainAndPortCollisions(t *testing.T) {
 	for _, domain := range []string{"11.0.0.80", "gate.123", "K.example", "static.website.example", "x.Static.website.example", "website.example"} {
 		bad := cfg
 		bad.Domain = domain
-		if err := s.validateProxyListener(bad); err == nil {
+		if err := s.validateProxyEnable(bad); err == nil {
 			t.Errorf("allowed proxy domain %s", domain)
 		}
 	}
-	for _, port := range []uint16{0, 80, 443, 8443, 10001} {
+	for _, port := range []uint16{0, 80, 443, s.stealthPort(), s.sharedRescuePort(), s.Ports.VMess} {
 		bad := cfg
 		bad.Port = port
-		if err := s.validateProxyListener(bad); err == nil {
+		if err := s.validateProxyEnable(bad); err == nil {
 			t.Errorf("allowed conflicting or reserved TCP port %d", port)
 		}
 	}
 	for _, domain := range []string{testProxyDomain, s.FastSNI} {
 		cfg.Domain = domain
-		if err := s.validateProxyListener(cfg); err != nil {
+		if err := s.validateProxyEnable(cfg); err != nil {
 			t.Errorf("refused permitted domain %s: %v", domain, err)
 		}
 	}
@@ -281,10 +289,12 @@ func TestProxyDNSConfigurationKeepsAndRemovesPrivateCopies(t *testing.T) {
 	}
 	setup := testProxySetup()
 	var issued []string
-	setup.issue = func(ctx context.Context, state, domain string, provider certmagic.DNSProvider) error {
+	var freshAttempts []bool
+	setup.issue = func(ctx context.Context, state, domain string, provider certmagic.DNSProvider, fresh bool) error {
 		if _, ok := ctx.Deadline(); !ok || state != dir || domain != testProxyDomain {
 			t.Fatal("missing timeout or incorrect first-issuance configuration")
 		}
+		freshAttempts = append(freshAttempts, fresh)
 		switch p := provider.(type) {
 		case *cloudflare.Provider:
 			if p.APIToken != "test-cloudflare-token" {
@@ -324,6 +334,9 @@ func TestProxyDNSConfigurationKeepsAndRemovesPrivateCopies(t *testing.T) {
 		return path
 	}
 	first := enableAndReadSecret(cf)
+	if enableAndReadSecret(cf) != first {
+		t.Fatal("unchanged credentials should keep their existing private copy")
+	}
 	second := enableAndReadSecret(ali)
 	if _, err := os.Stat(first); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("replacing the DNS provider kept its previous secret copy: %v", err)
@@ -344,8 +357,9 @@ func TestProxyDNSConfigurationKeepsAndRemovesPrivateCopies(t *testing.T) {
 	if _, err := os.Stat(third); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("disable kept the DNS secret copy: %v", err)
 	}
-	if strings.Join(issued, ",") != "cloudflare,alidns,alidns" {
-		t.Fatalf("unexpected first issuances %v", issued)
+	if strings.Join(issued, ",") != "cloudflare,cloudflare,alidns,alidns" ||
+		!slices.Equal(freshAttempts, []bool{true, false, true, true}) {
+		t.Fatalf("unexpected issuance attempts %v with fresh accounts %v", issued, freshAttempts)
 	}
 	for _, path := range []string{token, twoKeys} {
 		if _, err := os.Stat(path); err != nil {
@@ -367,7 +381,7 @@ func TestProxyIssuanceFailureRetainsSettingsAndRedactsError(t *testing.T) {
 	if err := os.WriteFile(token, []byte(secret), 0600); err != nil {
 		t.Fatal(err)
 	}
-	setup.issue = func(context.Context, string, string, certmagic.DNSProvider) error {
+	setup.issue = func(context.Context, string, string, certmagic.DNSProvider, bool) error {
 		return errors.New(secret)
 	}
 	err := enableProxy(t.Context(), dir, ProxyEnableOptions{
