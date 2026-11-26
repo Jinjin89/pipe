@@ -4,11 +4,14 @@ package desktop
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"pipe/internal/clientctl"
+	"pipe/internal/link"
 )
 
 const (
@@ -17,22 +20,27 @@ const (
 	profileReplyTimeout = 24 * time.Second
 )
 
-func (s *Server) beginProfileTest(r *http.Request) (string, clientctl.ProbeOptions, bool, error) {
+type profileTestTarget struct {
+	name, revision string
+	opts           clientctl.ProbeOptions
+	tun            bool
+}
+
+func (s *Server) beginProfileTest(r *http.Request) (profileTestTarget, error) {
 	parent := r.Context()
 	wait, cancel := context.WithTimeout(parent, profileSlotWait)
 	defer cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var opts clientctl.ProbeOptions
 	var name string
 	for {
 		if err := parent.Err(); err != nil {
-			return "", opts, false, err
+			return profileTestTarget{}, err
 		}
 		var err error
 		name, err = s.storedName(r)
 		if err != nil {
-			return "", opts, false, err
+			return profileTestTarget{}, err
 		}
 		if _, testing := s.profileTests[name]; testing {
 			err = &apiError{status: http.StatusConflict, msg: "That profile is already being tested."}
@@ -49,22 +57,22 @@ func (s *Server) beginProfileTest(r *http.Request) (string, clientctl.ProbeOptio
 		}
 		s.mu.Lock()
 		if canceled := parent.Err(); canceled != nil {
-			return "", opts, false, canceled
+			return profileTestTarget{}, canceled
 		}
 		if wait.Err() != nil {
-			return "", opts, false, err
+			return profileTestTarget{}, err
 		}
 	}
-	profile, err := s.profiles.Load(name)
+	profile, revision, err := s.profiles.load(name)
 	if err != nil {
-		return "", opts, false, errNoProfile
+		return profileTestTarget{}, errNoProfile
 	}
 	data := s.store.Snapshot()
-	opts = clientctl.ProbeOptions{
+	opts := clientctl.ProbeOptions{
 		Profile: profile, Relay: data.relayFor(name, profile.Host).enabledCode(), IPv6: data.Settings.IPv6,
 	}
 	s.profileTests[name] = struct{}{}
-	return name, opts, s.getVia() == viaTUN, nil
+	return profileTestTarget{name: name, revision: revision, opts: opts, tun: s.getVia() == viaTUN}, nil
 }
 
 type profileLatency struct {
@@ -73,14 +81,34 @@ type profileLatency struct {
 	Via string `json:"via,omitempty"`
 }
 
+type profileTestResponse struct {
+	Routes      map[string]profileLatency `json:"routes"`
+	ExitCountry string                    `json:"exitCountry,omitempty"`
+	Rev         string                    `json:"rev"`
+}
+
+type profileExitKey struct {
+	host, cdn             string
+	fastPort, stealthPort uint16
+	fingerprint           [32]byte
+}
+
+func exitCountryKey(profile link.Profile) profileExitKey {
+	return profileExitKey{
+		host: strings.ToLower(profile.Host), cdn: strings.ToLower(profile.CDNEndpoint()),
+		fastPort: profile.FastEndpointPort(), stealthPort: profile.StealthEndpointPort(),
+		fingerprint: sha256.Sum256(profile.PublicKey[:]),
+	}
+}
+
 func (s *Server) testProfile(r *http.Request) (any, error) {
-	name, opts, tun, err := s.beginProfileTest(r)
+	target, err := s.beginProfileTest(r)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		s.mu.Lock()
-		delete(s.profileTests, name)
+		delete(s.profileTests, target.name)
 		close(s.profileTestDone)
 		s.profileTestDone = make(chan struct{})
 		s.mu.Unlock()
@@ -88,30 +116,59 @@ func (s *Server) testProfile(r *http.Request) (any, error) {
 	parent := r.Context()
 	ctx, cancel := context.WithTimeout(parent, profileReplyTimeout)
 	defer cancel()
-	var routes map[string]clientctl.RouteLatency
-	if tun {
-		routes, err = s.cfg.Helper.TestProfile(ctx, opts)
+	opts := target.opts
+	key := exitCountryKey(opts.Profile)
+	s.mu.Lock()
+	country := s.profileCountries[key]
+	s.mu.Unlock()
+	opts.SkipExitCountry = country != ""
+
+	var result clientctl.ProfileTestResult
+	if !target.tun {
+		result = s.cfg.probeProfile(ctx, opts)
+	} else if helper, ok := s.cfg.Helper.(interface {
+		TestProfileResult(context.Context, clientctl.ProbeOptions) (clientctl.ProfileTestResult, error)
+	}); ok {
+		result, err = helper.TestProfileResult(ctx, opts)
 	} else {
-		routes = s.cfg.probeProfile(ctx, opts)
+		result.Routes, err = s.cfg.Helper.TestProfile(ctx, opts)
 	}
 	if canceled := parent.Err(); canceled != nil {
 		return nil, canceled
 	}
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	if err != nil && (!errors.Is(err, context.DeadlineExceeded) || len(result.Routes) == 0) {
 		return nil, err
 	}
 	tiers := []string{"fast", "stealth"}
 	if opts.Profile.CDN != "" {
 		tiers = append(tiers, "rescue")
 	}
-	result := make(map[string]profileLatency, len(tiers))
+	reply := profileTestResponse{Rev: target.revision, Routes: make(map[string]profileLatency, len(tiers))}
+	hasSuccess := false
 	for _, tier := range tiers {
-		probe := routes[tier]
-		latency := profileLatency{Ms: probe.Ms, OK: probe.OK}
-		if probe.OK && probe.Via == "relay" {
-			latency.Via = probe.Via
+		probe, measured := result.Routes[tier]
+		if !measured {
+			continue
 		}
-		result[tier] = latency
+		latency := profileLatency{Ms: probe.Ms, OK: probe.OK}
+		if probe.OK {
+			hasSuccess = true
+			if probe.Via == "relay" {
+				latency.Via = probe.Via
+			}
+		}
+		reply.Routes[tier] = latency
 	}
-	return map[string]any{"routes": result}, nil
+	if hasSuccess {
+		if country == "" {
+			country = clientctl.NormalizeExitCountry(result.ExitCountry)
+			if country != "" {
+				s.mu.Lock()
+				s.profileCountries[key] = country
+				s.mu.Unlock()
+			}
+		}
+		reply.ExitCountry = country
+	}
+	return reply, nil
 }

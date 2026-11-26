@@ -150,15 +150,14 @@
 </section>
 
 <section class="page" id="page-profiles" hidden>
-  <div class="sec-head top"><h1>Profiles</h1><button class="btn" id="test-profiles" hidden>Test all</button></div>
-  <p class="muted lead">A profile is one server. One link can be used on several devices.</p>
-  <section class="card flush profile-results" id="profile-results" aria-label="Profile comparison" hidden>
-    <table aria-label="Route latency by profile">
-      <thead><tr><th scope="col">Profile</th><th scope="col">Fast</th><th scope="col">Stealth</th><th scope="col">Rescue</th></tr></thead>
-      <tbody id="profile-test-rows"></tbody>
-    </table>
-  </section>
-  <div id="profile-list" class="plist"></div>
+  <div class="sec-head"><h1>Profiles</h1><button class="btn" id="test-profiles" disabled>Test</button></div>
+  <div class="card flush plist" hidden>
+    <div class="profile-grid profile-head" aria-hidden="true">
+      <span></span><span class="profile-country"></span>
+      <span class="profile-metric">Fast</span><span class="profile-metric">Stealth</span><span class="profile-metric">Rescue</span><span></span>
+    </div>
+    <div id="profile-list"></div>
+  </div>
   <div class="card add-profile">
     <h2>Add profile</h2>
     <label class="sr" for="add-link">Server link</label>

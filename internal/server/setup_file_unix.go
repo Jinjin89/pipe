@@ -71,8 +71,26 @@ func openTrustedSetupPath(path string, pipeUID uint32, state, create bool) (*os.
 			// The state directory will become Pipe-owned, so its immediate
 			// parent must prohibit renames even if it is sticky.
 			requireProtected := leaf || state && i == len(parts)-1
-			if stat.Uid == pipeUID || (stat.Mode&0022 != 0 && (requireProtected || stat.Mode&unix.S_ISVTX == 0)) {
-				return nil, fmt.Errorf("unsafe setup path %q: %q must be outside paths owned or writable by user pipe", path, pathPart)
+			if stat.Uid == pipeUID {
+				return nil, fmt.Errorf("unsafe setup path %q: %q must not be owned by user pipe", path, pathPart)
+			}
+			sticky := stat.Mode&unix.S_ISVTX != 0
+			if stat.Mode&0022 != 0 && (requireProtected || !sticky) {
+				const writablePath = "unsafe setup path %q: %q is group- or world-writable; "
+				if sticky {
+					return nil, fmt.Errorf(writablePath+"choose a path under a protected directory writable only by root or the operator (for example, /root/pipe/setup.json for input or %s for state)", path, pathPart, setupStateDir)
+				}
+				if pathPart == "/" {
+					return nil, fmt.Errorf(writablePath+"ask the system administrator to review the filesystem root permissions before running setup", path, pathPart)
+				}
+				argument := pathPart
+				if strings.ContainsFunc(pathPart, func(r rune) bool {
+					return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+						r >= '0' && r <= '9' || strings.ContainsRune("/._-", r))
+				}) {
+					argument = "'" + strings.ReplaceAll(pathPart, "'", `'\''`) + "'"
+				}
+				return nil, fmt.Errorf(writablePath+"run: chmod go-w %s", path, pathPart, argument)
 			}
 		}
 		if leaf {

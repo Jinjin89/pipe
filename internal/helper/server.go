@@ -67,7 +67,7 @@ type ServeOptions struct {
 	LastHold  time.Duration                    // lease after the last hold closes (5 s)
 	PeerUID   func(*net.UnixConn) (int, error) // kernel peer uid lookup
 
-	probeProfile func(context.Context, clientctl.ProbeOptions) map[string]clientctl.RouteLatency
+	probeProfile func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult
 }
 
 // chownSocket is a variable so tests can run without root.

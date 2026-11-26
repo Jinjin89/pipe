@@ -197,7 +197,7 @@ On macOS, Pipe opens in its own window, with a Dock icon while it's open, and it
 |---|---|
 | Home | Connect, and watch the live path: your computer, the relay if one is used, and the server, with sending and receiving flowing in both directions. Also shows the route, its speed and the mode |
 | Routing | **Mode:** Smart (China and local sites direct), Global (everything through pipe), Direct (pipe off). **Route:** Auto picks Fast, then Stealth, then Rescue. **Rules:** your own exceptions, checked first |
-| Profiles | Add, rename or switch servers, and set a relay. With two or more, **Test all** measures Fast, Stealth and Rescue for each profile side by side |
+| Profiles | One line per server: its country and its Fast, Stealth and Rescue times. **Test** measures every profile; **Use** switches. Click a name for its relay, device link, Rename and Delete. |
 | Logs | What pipe is doing. **Every connection** (in Settings) shows each site and the route it took. Logs stay in memory only |
 | Settings | Start at login, system proxy, port, IPv6, theme |
 

@@ -49,7 +49,7 @@ func TestProfileProbeIPv6(t *testing.T) {
 					}
 				}
 				return &fakeEngine{}, nil
-			})
+			}, lookupExitCountry).Routes
 			if !routes["fast"].OK || checked != tc.preferred {
 				t.Fatalf("probe results %v, network checked=%t, want checked=%t", routes, checked, tc.preferred)
 			}
@@ -70,7 +70,7 @@ func TestProfileProbeResults(t *testing.T) {
 			t.Fatalf("interface was not passed to BuildProbe: %v", route)
 		}
 		return instance, nil
-	})
+	}, lookupExitCountry).Routes
 	if !instance.started.Load() || !instance.closed.Load() {
 		t.Fatal("profile engine was not started and closed")
 	}
@@ -105,13 +105,16 @@ func TestProfileProbeDeadlinesAndCancellation(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				start := time.Now()
-				done := make(chan map[string]RouteLatency, 1)
+				done := make(chan ProfileTestResult, 1)
 				go func() {
 					done <- testProfile(ctx, options, func() bool { return false }, func(ctx context.Context, _ engine.Options) (probeEngine, error) {
 						if deadline, ok := ctx.Deadline(); !ok || deadline.Sub(start) != 20*time.Second {
 							t.Errorf("profile deadline %v, want a 20-second cap", deadline.Sub(start))
 						}
 						return instance, nil
+					}, func(context.Context, string) string {
+						t.Error("country lookup started without a successful route")
+						return ""
 					})
 				}()
 				synctest.Wait()
@@ -121,7 +124,7 @@ func TestProfileProbeDeadlinesAndCancellation(t *testing.T) {
 				if tc.duration == 0 {
 					cancel()
 				}
-				routes := <-done
+				routes := (<-done).Routes
 				if elapsed := time.Since(start); elapsed != tc.duration {
 					t.Fatalf("probe took %v, want %v", elapsed, tc.duration)
 				}
@@ -137,7 +140,7 @@ func TestProfileProbeClosesOnStartFailure(t *testing.T) {
 	instance := &fakeEngine{startErr: errors.New("start failed")}
 	routes := testProfile(t.Context(), ProbeOptions{Profile: opts().Profile}, func() bool { return false }, func(context.Context, engine.Options) (probeEngine, error) {
 		return instance, nil
-	})
+	}, lookupExitCountry).Routes
 	if !instance.closed.Load() {
 		t.Fatal("engine was not closed after failed start")
 	}
@@ -145,5 +148,73 @@ func TestProfileProbeClosesOnStartFailure(t *testing.T) {
 		if route, ok := routes[tier]; !ok || route.OK || route.Via != "" {
 			t.Fatalf("%s should be marked failed, got %+v", tier, routes)
 		}
+	}
+}
+
+func TestProfileExitCountryKeepsTimings(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantTier, country string
+		failed                  map[string]bool
+		remaining               time.Duration
+		skip                    bool
+	}{
+		{name: "fast preferred", wantTier: "fast", country: "DE"},
+		{name: "stealth preferred over rescue", wantTier: "stealth", country: "CA", failed: map[string]bool{"fast": true}},
+		{name: "rescue only", wantTier: "rescue", country: "JP", failed: map[string]bool{"fast": true, "stealth": true}},
+		{name: "lookup times out", wantTier: "fast"},
+		{name: "remaining budget", wantTier: "fast", remaining: time.Second},
+		{name: "cached", skip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				budget := 2 * time.Second
+				if tc.remaining != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.remaining)
+					defer cancel()
+					budget = tc.remaining
+				}
+				instance := &fakeEngine{
+					failTier: tc.failed,
+					latency:  map[string]time.Duration{"fast": 45 * time.Millisecond, "stealth": 85 * time.Millisecond, "rescue": 150 * time.Millisecond},
+					viaRelay: map[string]bool{"fast": true},
+				}
+				var calls []string
+				start := time.Now()
+				result := testProfile(ctx, ProbeOptions{Profile: opts().Profile, SkipExitCountry: tc.skip}, func() bool { return false },
+					func(context.Context, engine.Options) (probeEngine, error) { return instance, nil },
+					func(ctx context.Context, tier string) string {
+						calls = append(calls, tier)
+						if instance.closed.Load() || !instance.started.Load() {
+							t.Error("lookup ran outside the probe engine's lifetime")
+						}
+						if deadline, ok := ctx.Deadline(); !ok || deadline.Sub(start) != budget {
+							t.Errorf("lookup deadline = %v, want %v after start", deadline, budget)
+						}
+						if tc.country == "" {
+							<-ctx.Done()
+						}
+						return tc.country
+					})
+				if tc.skip && len(calls) != 0 || !tc.skip && !slices.Equal(calls, []string{tc.wantTier}) {
+					t.Fatalf("lookup tiers = %v", calls)
+				}
+				if result.ExitCountry != tc.country || !instance.closed.Load() {
+					t.Fatalf("country = %q, engine closed = %t", result.ExitCountry, instance.closed.Load())
+				}
+				for tier, ms := range map[string]int64{"fast": 45, "stealth": 85, "rescue": 150} {
+					if tc.failed[tier] {
+						if result.Routes[tier].OK {
+							t.Errorf("failed %s reported success", tier)
+						}
+						continue
+					}
+					if route := result.Routes[tier]; !route.OK || route.Ms != ms || !route.At.Equal(start) {
+						t.Errorf("%s timing changed: %+v", tier, route)
+					}
+				}
+			})
+		})
 	}
 }

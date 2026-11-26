@@ -20,23 +20,31 @@ func TestProfileProbeWire(t *testing.T) {
 	r := startServer(t, func(o *ServeOptions) {
 		o.DNS = dns
 		o.Session.(*fakeSession).uplink = "en0"
-		o.probeProfile = func(ctx context.Context, got clientctl.ProbeOptions) map[string]clientctl.RouteLatency {
+		o.probeProfile = func(ctx context.Context, got clientctl.ProbeOptions) clientctl.ProfileTestResult {
 			if got.Profile != profile || got.Relay != opts.Relay || !got.IPv6 || got.Interface != "en0" {
 				t.Error("probe did not receive the profile options and physical uplink")
 			}
 			if _, ok := ctx.Deadline(); !ok {
 				t.Error("profile probe has no deadline")
 			}
-			return map[string]clientctl.RouteLatency{"fast": {Ms: 22, OK: true, Via: "relay"}}
+			result := clientctl.ProfileTestResult{Routes: map[string]clientctl.RouteLatency{"fast": {Ms: 22, OK: true, Via: "relay"}}}
+			if !got.SkipExitCountry {
+				result.ExitCountry = "JP"
+			}
+			return result
 		}
 	})
 	remote := NewRemote(RemoteOptions{Socket: r.sock, Version: "1.2.3"})
 	if info := remote.Info(); info.State != StateOK || ProtocolVersion != 4 {
 		t.Fatalf("probe protocol = %d, info = %+v", ProtocolVersion, info)
 	}
-	res, err := remote.TestProfile(t.Context(), opts)
-	if err != nil || res["fast"].Ms != 22 || !res["fast"].OK || res["fast"].Via != "relay" {
-		t.Fatalf("profile probe = %v, %v", res, err)
+	for _, wantCountry := range []string{"JP", ""} {
+		opts.SkipExitCountry = wantCountry == ""
+		res, err := remote.TestProfileResult(t.Context(), opts)
+		fast := res.Routes["fast"]
+		if err != nil || fast.Ms != 22 || !fast.OK || fast.Via != "relay" || res.ExitCountry != wantCountry {
+			t.Fatalf("profile probe = %v, %v, want country %q", res, err, wantCountry)
+		}
 	}
 	opts.Relay = profile.Host + ":8444"
 	if _, err := remote.TestProfile(t.Context(), opts); err == nil {
@@ -53,9 +61,9 @@ func TestProfileProbeWire(t *testing.T) {
 func TestProfileProbeRequiresUplink(t *testing.T) {
 	r := startServer(t, func(o *ServeOptions) {
 		o.DNS = &fakeSystemDNS{}
-		o.probeProfile = func(context.Context, clientctl.ProbeOptions) map[string]clientctl.RouteLatency {
+		o.probeProfile = func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult {
 			t.Error("probe started without a physical uplink")
-			return nil
+			return clientctl.ProfileTestResult{}
 		}
 	})
 	remote := NewRemote(RemoteOptions{Socket: r.sock, Version: "1.2.3"})
@@ -78,9 +86,9 @@ func TestProfileProbeTimeoutKeepsRoutes(t *testing.T) {
 			probeSlots: make(chan struct{}, 2),
 			opts: ServeOptions{
 				Session: &fakeSession{uplink: "en0"},
-				probeProfile: func(ctx context.Context, _ clientctl.ProbeOptions) map[string]clientctl.RouteLatency {
+				probeProfile: func(ctx context.Context, _ clientctl.ProbeOptions) clientctl.ProfileTestResult {
 					<-ctx.Done()
-					return map[string]clientctl.RouteLatency{"fast": {Ms: 22, OK: true, Via: "relay"}}
+					return clientctl.ProfileTestResult{Routes: map[string]clientctl.RouteLatency{"fast": {Ms: 22, OK: true, Via: "relay"}}}
 				},
 			},
 		}
@@ -88,7 +96,7 @@ func TestProfileProbeTimeoutKeepsRoutes(t *testing.T) {
 		if errText != "" {
 			t.Fatalf("expired probe returned %q", errText)
 		}
-		if fast := res.(map[string]any)["routes"].(map[string]clientctl.RouteLatency)["fast"]; !fast.OK || fast.Ms != 22 || fast.Via != "relay" {
+		if fast := res.(clientctl.ProfileTestResult).Routes["fast"]; !fast.OK || fast.Ms != 22 || fast.Via != "relay" {
 			t.Fatalf("expired probe returned %+v", res)
 		}
 	})
@@ -130,11 +138,11 @@ func TestProfileProbeSocketCancellationAndLimit(t *testing.T) {
 	r := startServer(t, func(o *ServeOptions) {
 		o.DNS = &fakeSystemDNS{}
 		o.Session.(*fakeSession).uplink = "net0"
-		o.probeProfile = func(ctx context.Context, _ clientctl.ProbeOptions) map[string]clientctl.RouteLatency {
+		o.probeProfile = func(ctx context.Context, _ clientctl.ProbeOptions) clientctl.ProfileTestResult {
 			started <- struct{}{}
 			<-ctx.Done()
 			ended <- struct{}{}
-			return nil
+			return clientctl.ProfileTestResult{}
 		}
 	})
 	remote := NewRemote(RemoteOptions{Socket: r.sock, Version: "1.2.3"})

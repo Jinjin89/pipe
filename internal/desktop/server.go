@@ -43,7 +43,7 @@ type Config struct {
 	OnShow      func() // called for a valid /internal/show
 	OnQuit      func() // called after /api/quit has answered
 
-	probeProfile func(context.Context, clientctl.ProbeOptions) map[string]clientctl.RouteLatency
+	probeProfile func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult
 }
 
 // Server is the local HTTP API and static UI.
@@ -60,8 +60,9 @@ type Server struct {
 	via      atomic.Value // "", "proxy" or "tun": which controller owns the session; written under mu
 	changes  chan struct{}
 
-	profileTests    map[string]struct{} // saved names with a probe in flight, under mu
-	profileTestDone chan struct{}       // closed and replaced when a probe releases its slot, under mu
+	profileTests     map[string]struct{}       // saved names with a probe in flight, under mu
+	profileTestDone  chan struct{}             // closed and replaced when a probe releases its slot, under mu
+	profileCountries map[profileExitKey]string // session cache under mu
 }
 
 func NewServer(cfg Config) *Server {
@@ -79,8 +80,9 @@ func NewServer(cfg Config) *Server {
 		sess:     newSessions(),
 		changes:  make(chan struct{}, 1),
 
-		profileTests:    make(map[string]struct{}),
-		profileTestDone: make(chan struct{}),
+		profileTests:     make(map[string]struct{}),
+		profileTestDone:  make(chan struct{}),
+		profileCountries: make(map[profileExitKey]string),
 	}
 	s.host.Store("")
 	if cfg.Helper != nil {

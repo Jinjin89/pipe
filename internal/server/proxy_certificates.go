@@ -28,6 +28,8 @@ import (
 
 const proxyCertificateStorage = "https-proxy-certificates"
 
+var errProxyCertificateUnavailable = errors.New("HTTPS proxy certificate is unavailable")
+
 // dnsPropagationDelay is how long DNS-01 waits after adding the TXT record.
 // Cloudflare and AliDNS publish within seconds; this leaves a wide margin.
 const dnsPropagationDelay = 30 * time.Second
@@ -320,7 +322,7 @@ func (p *proxyPEMCertificates) certificateAt(now time.Time) (*tls.Certificate, e
 		p.nextCheck = now.Add(interval)
 	}
 	if p.current == nil {
-		return nil, errors.New("HTTPS proxy certificate is unavailable")
+		return nil, errProxyCertificateUnavailable
 	}
 	return p.current, nil
 }

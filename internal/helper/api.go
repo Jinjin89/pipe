@@ -97,7 +97,8 @@ type SessionOptions struct {
 
 // TestProfileParams is the request for a fresh probe of a saved profile.
 type TestProfileParams struct {
-	Link  string `json:"link"`
-	Relay string `json:"relay,omitempty"`
-	IPv6  bool   `json:"ipv6"`
+	Link            string `json:"link"`
+	Relay           string `json:"relay,omitempty"`
+	IPv6            bool   `json:"ipv6"`
+	SkipExitCountry bool   `json:"skipExitCountry,omitempty"`
 }

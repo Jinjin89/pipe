@@ -5,6 +5,7 @@ package desktop
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -253,6 +254,7 @@ type ProfileInfo struct {
 	Routes      []string     `json:"routes"`
 	Fingerprint string       `json:"fingerprint"`
 	Relay       ProfileRelay `json:"relay"`
+	Rev         string       `json:"rev,omitempty"`
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -286,7 +288,7 @@ func (p *Profiles) Resolve(name string) (string, bool) {
 	return folded, folded != ""
 }
 
-func infoFor(name string, p link.Profile) ProfileInfo {
+func infoFor(name string, p link.Profile, revision string) ProfileInfo {
 	routes := []string{"fast", "stealth"}
 	if p.CDN != "" {
 		routes = append(routes, "rescue")
@@ -296,7 +298,7 @@ func infoFor(name string, p link.Profile) ProfileInfo {
 	for _, b := range sum[:6] {
 		fp = append(fp, fmt.Sprintf("%02X", b))
 	}
-	return ProfileInfo{Name: name, Server: p.Host, Routes: routes, Fingerprint: strings.Join(fp, ":")}
+	return ProfileInfo{Name: name, Server: p.Host, Routes: routes, Fingerprint: strings.Join(fp, ":"), Rev: revision}
 }
 
 // Profiles manages NAME.link files, shared with the CLI.
@@ -311,14 +313,29 @@ func (p *Profiles) path(name string) string { return filepath.Join(p.dir, name+"
 
 // Load reads one profile.
 func (p *Profiles) Load(name string) (link.Profile, error) {
+	profile, _, err := p.load(name)
+	return profile, err
+}
+
+// load reads the profile and its revision from the same saved link.
+func (p *Profiles) load(name string) (link.Profile, string, error) {
 	if !config.ValidAlias(name) {
-		return link.Profile{}, os.ErrNotExist
+		return link.Profile{}, "", os.ErrNotExist
 	}
 	raw, err := sysproxy.ReadPrivate(p.path(name))
 	if err != nil {
-		return link.Profile{}, err
+		return link.Profile{}, "", err
 	}
-	return link.Parse(strings.TrimSpace(string(raw)))
+	profile, err := link.Parse(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return profile, "", err
+	}
+	return profile, savedLinkRevision(raw), nil
+}
+
+func savedLinkRevision(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:16])
 }
 
 // List returns every readable profile, sorted by name. Unreadable files are skipped.
@@ -333,8 +350,8 @@ func (p *Profiles) List() []ProfileInfo {
 		if !config.ValidAlias(name) {
 			continue
 		}
-		if profile, err := p.Load(name); err == nil {
-			list = append(list, infoFor(name, profile))
+		if profile, revision, err := p.load(name); err == nil {
+			list = append(list, infoFor(name, profile, revision))
 		}
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
@@ -357,17 +374,18 @@ func (p *Profiles) Save(name string, profile link.Profile) (ProfileInfo, error) 
 	if stored, ok := p.Resolve(name); ok {
 		name = stored // replace the existing file, whatever its case
 	}
-	if err := WriteFileAtomic(p.path(name), []byte(encoded+"\n"), 0600); err != nil {
+	raw := []byte(encoded + "\n")
+	if err := WriteFileAtomic(p.path(name), raw, 0600); err != nil {
 		return ProfileInfo{}, err
 	}
-	return infoFor(name, profile), nil
+	return infoFor(name, profile, savedLinkRevision(raw)), nil
 }
 
 // Rename moves a profile. It refuses to overwrite another one.
 func (p *Profiles) Rename(from, to string) (ProfileInfo, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	profile, err := p.Load(from)
+	profile, revision, err := p.load(from)
 	if err != nil {
 		return ProfileInfo{}, err
 	}
@@ -379,7 +397,7 @@ func (p *Profiles) Rename(from, to string) (ProfileInfo, error) {
 			return ProfileInfo{}, err
 		}
 	}
-	return infoFor(to, profile), nil
+	return infoFor(to, profile, revision), nil
 }
 
 func (p *Profiles) Delete(name string) error {
@@ -390,11 +408,11 @@ func (p *Profiles) Delete(name string) error {
 
 // Info returns the public info of one profile.
 func (p *Profiles) Info(name string) (ProfileInfo, error) {
-	profile, err := p.Load(name)
+	profile, revision, err := p.load(name)
 	if err != nil {
 		return ProfileInfo{}, err
 	}
-	return infoFor(name, profile), nil
+	return infoFor(name, profile, revision), nil
 }
 
 // Preview parses a pasted link without saving it.
@@ -403,7 +421,7 @@ func Preview(raw string) (link.Profile, ProfileInfo, error) {
 	if err != nil {
 		return link.Profile{}, ProfileInfo{}, errors.New("That doesn't look like a Pipe link. Copy the whole link that starts with pipe://")
 	}
-	return profile, infoFor(DefaultName(profile), profile), nil
+	return profile, infoFor(DefaultName(profile), profile, ""), nil
 }
 
 // DefaultName suggests a profile name: the link's name lowercased, invalid

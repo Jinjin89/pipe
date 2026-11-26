@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 
 	"pipe/internal/link"
 
@@ -628,6 +629,9 @@ func TestSetupRendersPrivilegedFilesIndependentlyOfInstallOutput(t *testing.T) {
 			return err
 		}
 		if c.AsPipe && c.Argv[2] == "install" {
+			if !c.installFromSetup {
+				t.Fatal("the setup installer child must suppress its manual setup hints")
+			}
 			for _, name := range []string{"pipe.service", "pipe-hop.service"} {
 				must(t, os.WriteFile(filepath.Join(state, "install", name), []byte("fixture artifact\n"), 0644))
 			}
@@ -833,7 +837,7 @@ func TestSetupChownsExistingStateWithoutSymlinks(t *testing.T) {
 }
 
 func TestSetupRejectsUnsafeStatePath(t *testing.T) {
-	for _, kind := range []string{"symlink", "writable parent", "service-owned parent"} {
+	for _, kind := range []string{"symlink", "writable parent", "sticky writable parent", "service-owned parent"} {
 		t.Run(kind, func(t *testing.T) {
 			h := newSetupHarness(t, "")
 			h.exists = true
@@ -846,7 +850,9 @@ func TestSetupRejectsUnsafeStatePath(t *testing.T) {
 			case "symlink":
 				must(t, os.Symlink(outside, filepath.Join(parent, "state")))
 			case "writable parent":
-				must(t, os.Chmod(parent, 0775))
+				must(t, os.Chmod(parent, 0777))
+			case "sticky writable parent":
+				must(t, os.Chmod(parent, 0777|os.ModeSticky))
 			case "service-owned parent":
 				if os.Geteuid() != 0 {
 					t.Skip("changing the fixture owner requires root")
@@ -857,8 +863,20 @@ func TestSetupRejectsUnsafeStatePath(t *testing.T) {
 				t.Errorf("changed ownership of %s", path)
 				return nil
 			}
-			if err := h.run(SetupOptions{Dir: "/custom/state", Yes: true}); err == nil || len(h.cmds) != 0 {
+			err := h.run(SetupOptions{Dir: "/custom/state", Yes: true})
+			if err == nil || len(h.cmds) != 0 {
 				t.Fatalf("unsafe path accepted: %v, commands %v", err, h.argvs())
+			}
+			switch kind {
+			case "writable parent":
+				if !strings.Contains(err.Error(), "run: chmod go-w ") {
+					t.Fatalf("writable parent error lacks the chmod hint: %v", err)
+				}
+			case "sticky writable parent":
+				want := fmt.Sprintf("unsafe setup path %q: %q is group- or world-writable; choose a path under a protected directory writable only by root or the operator (for example, /root/pipe/setup.json for input or /var/lib/pipe for state)", filepath.Join(parent, "state"), parent)
+				if err.Error() != want {
+					t.Fatalf("sticky writable parent error = %v, want %q", err, want)
+				}
 			}
 			info, err := os.Stat(outside)
 			must(t, err)
@@ -872,6 +890,33 @@ func TestSetupRejectsUnsafeStatePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSetupDNSIssuanceTimeoutIncludesTokenHint(t *testing.T) {
+	dir := t.TempDir()
+	token := filepath.Join(t.TempDir(), "token")
+	must(t, os.WriteFile(token, []byte("fixture-token"), 0600))
+	cfg, source, err := proxyConfigForEnable(ProxyEnableOptions{
+		Domain: testProxyDomain, CertMethod: "dns", DNS: proxyDNSCloudflare, DNSTokenFile: token,
+	})
+	must(t, err)
+	update := setupUpdate{
+		Initial: &setupInitialSettings{Mode: Shared, Domain: testProxyDomain},
+		Proxy:   &setupProxyUpdate{Enabled: true, Listener: &cfg, DNSFile: source},
+	}
+	hooks := testProxySetup()
+	hooks.issue = func(ctx context.Context, _, _ string, _ certmagic.DNSProvider, _ bool) error {
+		<-ctx.Done()
+		return errors.New("fixture-token")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		err := applySetupUpdate(t.Context(), dir, update, hooks, nil)
+		if err == nil || !strings.Contains(err.Error(), "initial HTTPS proxy DNS-01 issuance timed out for "+testProxyDomain) ||
+			!strings.Contains(err.Error(), "works from this server's IP address and can edit the zone") ||
+			!strings.Contains(err.Error(), "Cloudflare tokens can be IP-restricted") || strings.Contains(err.Error(), "fixture-token") {
+			t.Fatalf("unexpected setup timeout error: %v", err)
+		}
+	})
 }
 
 func TestSetupStagesUnderOpenedDirectory(t *testing.T) {
@@ -1399,5 +1444,35 @@ func TestInstallRootOnlyUsesTrustedSetupForSystemFiles(t *testing.T) {
 	if len(paths) != 0 || len(files) != 0 || info.Mode().Perm() != 0755 ||
 		!strings.Contains(strings.Join(hints, "\n"), "sudo pipe server setup --yes") {
 		t.Fatal("root installer wrote into the service's install directory or omitted the trusted setup command")
+	}
+}
+
+func TestSetupInstallOutputOmitsManualSystemHints(t *testing.T) {
+	dir := t.TempDir()
+	must(t, InitWithOptions(dir, "origin.example", "", InitOptions{Mode: Standalone, FastHop: "25000-25003"}))
+	oldEUID := installEUID
+	installEUID = func() int { return 1000 }
+	t.Cleanup(func() { installEUID = oldEUID })
+	for _, tc := range []struct {
+		name, marker string
+		manual       bool
+	}{
+		{name: "manual install", manual: true},
+		{name: "setup child", marker: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(setupInstallEnv, tc.marker)
+			paths, hints, err := Install(t.Context(), dir, setupBinary, Auto, nil)
+			must(t, err)
+			output := strings.Join(hints, "\n")
+			for _, manual := range []string{"Use sudo pipe server setup --yes with the same --dir", "Fast port hopping is applied by pipe-hop.service"} {
+				if strings.Contains(output, manual) != tc.manual {
+					t.Fatalf("unexpected install hints:\n%s", output)
+				}
+			}
+			if len(paths) == 0 || !strings.Contains(output, "Allow the Fast UDP hopping range 25000-25003") {
+				t.Fatalf("missing install files or firewall guidance: %v, %s", paths, output)
+			}
+		})
 	}
 }

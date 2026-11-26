@@ -209,6 +209,9 @@ func applySetupUpdate(ctx context.Context, dir string, update setupUpdate, proxy
 		}
 		secret, err := prepareProxyCertificate(ctx, dir, cfg, saved.HTTPSProxyListener, source, ProxyEnableOptions{Warn: warn}, proxy)
 		if err != nil {
+			if strings.HasPrefix(err.Error(), "initial HTTPS proxy DNS-01 issuance timed out for ") {
+				return fmt.Errorf("%w. Check that the DNS token works from this server's IP address and can edit the zone (Cloudflare tokens can be IP-restricted)", err)
+			}
 			return err
 		}
 		defer clear(secret)

@@ -41,6 +41,8 @@ const (
 type SetupCommand struct {
 	Argv   []string
 	AsPipe bool
+
+	installFromSetup bool
 }
 
 // SetupInterface is one network interface and its addresses.
@@ -126,6 +128,9 @@ func runSetupCommand(ctx context.Context, c SetupCommand) error {
 			return errors.New("user pipe does not exist")
 		}
 		cmd.Env = append(os.Environ(), "HOME="+setupStateDir)
+		if c.installFromSetup {
+			cmd.Env = append(cmd.Env, setupInstallEnv+"=1")
+		}
 		if err := dropCredentials(cmd, uid, gid); err != nil {
 			return err
 		}
@@ -1088,7 +1093,9 @@ func (r *setupRun) execute(ctx context.Context, plan setupPlan) (Settings, error
 	if change := plan.update.Proxy; change != nil && change.Listener != nil {
 		r.printf("HTTPS proxy enabled for %s. Open TCP %d in the firewall.\n", change.Listener.Domain, change.Listener.Port)
 	}
-	if err := asPipe(setupBinary, "server", "install", "--dir", r.opts.Dir); err != nil {
+	if err := r.Run(ctx, SetupCommand{
+		Argv: []string{setupBinary, "server", "install", "--dir", r.opts.Dir}, AsPipe: true, installFromSetup: true,
+	}); err != nil {
 		return Settings{}, err
 	}
 	if plan.device != "" {

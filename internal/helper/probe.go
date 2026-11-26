@@ -44,13 +44,13 @@ func (s *server) testProfile(parent context.Context, raw json.RawMessage) (any, 
 	}
 	ctx, cancel := context.WithTimeout(parent, profileTestTimeout)
 	defer cancel()
-	routes := s.opts.probeProfile(ctx, clientctl.ProbeOptions{
-		Profile: profile, Relay: relay.String(), IPv6: p.IPv6, Interface: uplink,
+	result := s.opts.probeProfile(ctx, clientctl.ProbeOptions{
+		Profile: profile, Relay: relay.String(), IPv6: p.IPv6, Interface: uplink, SkipExitCountry: p.SkipExitCountry,
 	})
 	if err := parent.Err(); err != nil {
 		return nil, err.Error()
 	}
-	return map[string]any{"routes": routes}, ""
+	return result, ""
 }
 
 func (s *server) acquireProfileSlot(ctx context.Context) string {
@@ -67,21 +67,25 @@ func (s *server) acquireProfileSlot(ctx context.Context) string {
 	}
 }
 
-// TestProfile probes through the helper using the active TUN session's uplink.
+// TestProfile returns timings through the active TUN session's uplink.
 func (r *Remote) TestProfile(ctx context.Context, opts clientctl.ProbeOptions) (map[string]clientctl.RouteLatency, error) {
+	result, err := r.TestProfileResult(ctx, opts)
+	return result.Routes, err
+}
+
+// TestProfileResult also returns the optional exit country from the helper.
+func (r *Remote) TestProfileResult(ctx context.Context, opts clientctl.ProbeOptions) (clientctl.ProfileTestResult, error) {
+	var result clientctl.ProfileTestResult
 	text, err := opts.Profile.Encode()
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	var res struct {
-		Routes map[string]clientctl.RouteLatency `json:"routes"`
-	}
-	params := TestProfileParams{Link: text, Relay: opts.Relay, IPv6: opts.IPv6}
+	params := TestProfileParams{Link: text, Relay: opts.Relay, IPv6: opts.IPv6, SkipExitCountry: opts.SkipExitCountry}
 	callCtx, cancel := context.WithTimeout(ctx, profileReplyTimeout)
 	defer cancel()
-	_, err = r.call(callCtx, profileReplyTimeout+time.Second, "testProfile", params, &res)
+	_, err = r.call(callCtx, profileReplyTimeout+time.Second, "testProfile", params, &result)
 	if ctxErr := callCtx.Err(); ctxErr != nil {
-		return res.Routes, ctxErr
+		return result, ctxErr
 	}
-	return res.Routes, err
+	return result, err
 }

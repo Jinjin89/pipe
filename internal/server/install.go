@@ -16,6 +16,7 @@ import (
 )
 
 const sysctlConfig = "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\n"
+const setupInstallEnv = "PIPE_SETUP_INSTALL"
 
 var installEUID = os.Geteuid
 
@@ -49,12 +50,17 @@ func Install(_ context.Context, dir, executable string, mode DeployMode, _ func(
 	if settings.realityTargetProblem() == nil {
 		hints = append(hints, fmt.Sprintf("Allow clients from any IP on Stealth TCP %d.", settings.stealthPort()))
 	}
-	hints = append(hints, "Use sudo pipe server setup --yes with the same --dir to render and install the systemd units and sysctl file as root.")
+	fromSetup := os.Getenv(setupInstallEnv) == "1"
+	if !fromSetup {
+		hints = append(hints, "Use sudo pipe server setup --yes with the same --dir to render and install the systemd units and sysctl file as root.")
+	}
 	if settings.FastHop == "" {
 		hints = append(hints, "For connections from CN, consider initializing with --fast-hop 20000-40000.")
 	} else {
-		hints = append(hints, "Allow the Fast UDP hopping range "+settings.FastHop+".",
-			"Fast port hopping is applied by pipe-hop.service. To configure it with setup, supply --fast-hop and --fast-port.")
+		hints = append(hints, "Allow the Fast UDP hopping range "+settings.FastHop+".")
+		if !fromSetup {
+			hints = append(hints, "Fast port hopping is applied by pipe-hop.service. To configure it with setup, supply --fast-hop and --fast-port.")
+		}
 	}
 	switch settings.Mode {
 	case Standalone:

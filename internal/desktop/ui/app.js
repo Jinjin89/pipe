@@ -496,14 +496,8 @@ async function loadRouting() {
 
 // ---------- profiles ----------
 const SECRET_TTL_MS = 30000;
-const FAKE_QR_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 11 11" aria-hidden="true">' +
-  '<path fill="currentColor" d="M1 1h3v3H1zm1 1v1h1V2zm5-1h3v3H7zm1 1v1h1V2zM1 7h3v3H1zm1 1v1h1V8zm3-4h1v1H5zm2 1h1v2H7zm2 2h1v3H9zM5 6h2v1H5zm1 2h2v2H6z"/>' +
-  '</svg>';
-const FAKE_LINK = 'pipe://•••••••••••••••••••••••••••••••••••••••••••@server.example?pbk=••••••••••••••••••••••••#device';
-const FAKE_PROXY = 'export https_proxy=https://device:••••••••••••••••@proxy.example:9443 http_proxy=https://device:••••••••••••••••@proxy.example:9443';
 
 let secretState = null;
-let secretGen = 0;
 
 function parseSVG(text) {
   const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
@@ -515,10 +509,10 @@ function parseSVG(text) {
 }
 
 function hideSecrets() {
-  secretGen++;
   if (!secretState) return;
   const st = secretState;
   secretState = null;
+  st.abort.abort();
   clearTimeout(st.timer);
   if (st.data) {
     st.data.link = '';
@@ -526,34 +520,15 @@ function hideSecrets() {
     st.data.cmd = '';
     st.data = null;
   }
-  if (st.box) {
-    const hadFocus = st.box.contains(document.activeElement);
-    st.box.querySelectorAll('code').forEach((c) => { c.textContent = ''; });
-    st.box.replaceChildren(...secretPlaceholder(st.name, st.box));
-    if (hadFocus) st.box.querySelector('button')?.focus({ preventScroll: true });
-  }
+  const hadFocus = st.box.contains(document.activeElement);
+  st.box.querySelectorAll('code').forEach((c) => { c.textContent = ''; });
+  const show = secretPlaceholder(st.name, st.box);
+  st.box.replaceChildren(show);
+  if (hadFocus) show.focus({ preventScroll: true });
 }
 
 function secretPlaceholder(name, box) {
-  const fakeQR = h('div', { class: 'dlink-qr blurred', 'aria-hidden': 'true' });
-  const svg = parseSVG(FAKE_QR_SVG);
-  if (svg) {
-    svg.removeAttribute('role');
-    svg.removeAttribute('aria-label');
-    svg.setAttribute('aria-hidden', 'true');
-    fakeQR.append(svg);
-  }
-  const showBtn = h('button', { class: 'btn small', type: 'button', onclick: () => revealSecret(name, box, showBtn) }, 'Show');
-  return [
-    h('div', { class: 'dlink-head' },
-      h('span', { class: 'dlink-title' }, h('b', {}, 'Device link'), h('span', { class: 'muted small-text' }, 'Hidden until you click Show.')),
-      showBtn),
-    h('div', { class: 'dlink-body' },
-      fakeQR,
-      h('div', { class: 'dlink-lines blurred', 'aria-hidden': 'true' },
-        h('div', { class: 'dlink-fake' }, FAKE_LINK),
-        h('div', { class: 'dlink-fake' }, FAKE_PROXY))),
-  ];
+  return h('button', { class: 'btn small', type: 'button', onclick: (event) => revealSecret(name, box, event.currentTarget) }, 'Show device link');
 }
 
 function secretField(label, getValue, toastMsg) {
@@ -566,24 +541,22 @@ function secretField(label, getValue, toastMsg) {
 
 async function revealSecret(name, box, btn) {
   hideSecrets();
-  const gen = ++secretGen;
+  const state = { box, name, abort: new AbortController() };
+  secretState = state;
   btn.disabled = true;
   btn.textContent = 'Loading…';
   let res;
   try {
-    res = await api('POST', `/profiles/${encodeURIComponent(name)}/secret`);
+    res = await api('POST', `/profiles/${encodeURIComponent(name)}/secret`, undefined, state.abort.signal);
   } catch (e) {
-    if (box.isConnected && (!secretState || secretState.box !== box)) {
-      box.replaceChildren(...secretPlaceholder(name, box));
-    }
+    if (secretState !== state) return;
+    hideSecrets();
     toast(e.message);
     return;
   }
-  if (gen !== secretGen || !box.isConnected || document.visibilityState !== 'visible') {
-    res = null;
-    if (box.isConnected && (!secretState || secretState.box !== box)) {
-      box.replaceChildren(...secretPlaceholder(name, box));
-    }
+  if (secretState !== state) return;
+  if (!box.isConnected || document.visibilityState !== 'visible') {
+    hideSecrets();
     return;
   }
   const data = {
@@ -630,133 +603,135 @@ async function revealSecret(name, box, btn) {
       qrBig,
       h('div', { class: 'dlink-fields' }, ...fields)),
   );
-  secretState = { box, name, data, timer: setTimeout(hideSecrets, SECRET_TTL_MS) };
+  state.data = data;
+  state.timer = setTimeout(hideSecrets, SECRET_TTL_MS);
 }
 
+let profileLoad = 0;
 async function loadProfiles() {
+  const request = ++profileLoad;
   try {
-    S.profiles = await api('GET', '/profiles');
-    const names = new Set(S.profiles.profiles.map((p) => p.name));
-    for (const name of comparison.rows.keys()) if (!names.has(name)) removeProfileTest(name);
+    const profiles = await api('GET', '/profiles');
+    if (request !== profileLoad) return;
+    for (const previous of S.profiles?.profiles || []) {
+      const current = profiles.profiles.find((p) => p.name === previous.name);
+      const relayChanged = current?.relay?.host !== previous.relay?.host || current?.relay?.on !== previous.relay?.on;
+      if (!current || current.rev !== previous.rev || relayChanged) {
+        clearProfileTest(previous.name, relayChanged ? undefined : current?.rev);
+      }
+    }
+    S.profiles = profiles;
     renderProfiles();
-    renderProfileTests();
     updatePowerEnabled();
     renderRoutingTiles();
     renderPath();
-  } catch (e) { toast(e.message); }
+  } catch (e) { if (request === profileLoad) toast(e.message); }
 }
-const ROUTE_NAMES = { fast: 'Fast', stealth: 'Stealth', rescue: 'Rescue' };
-const TEST_TIERS = Object.keys(ROUTE_NAMES);
-const comparison = { rows: new Map(), batch: null };
+const PROFILE_TIERS = ['fast', 'stealth', 'rescue'];
+const profileResults = new Map();
+let profileBatch = null;
 
-function updateProfileTest(row, state, routes, error) {
-  row.state = state;
-  row.el.dataset.state = state;
-  row.el.setAttribute('aria-busy', String(state === 'testing'));
-  row.detail.textContent = error || ({ queued: 'Waiting', testing: 'Testing…' }[state] || '');
-  row.detail.classList.toggle('profile-test-error', !!error);
-  row.metrics = row.cells.map((cell, i) => {
-    const tier = TEST_TIERS[i];
-    const result = routes?.[tier];
-    if (!result?.ok) {
-      const supported = routes ? !!result : row.profile.routes?.includes(tier);
-      const pending = state === 'testing' || state === 'queued';
-      const marker = supported && pending ? 'profile-test-empty profile-test-pending' : 'profile-test-empty';
-      cell.replaceChildren(h('span', { class: marker, title: supported && !pending ? 'No response' : '' },
-        supported ? (pending ? '…' : '—') : 'n/a'));
-      return null;
-    }
-    const ms = result.ms;
-    const shade = ms <= 150 ? 'good' : ms > 350 ? 'slow' : '';
-    const fill = h('span', { class: `profile-test-fill ${shade}` });
-    cell.replaceChildren(result.via === 'relay' ? h('span', { class: 'profile-test-via' }, 'via relay') : '',
-      h('span', { class: 'profile-test-number' }, `${ms} ms`),
-      h('span', { class: 'profile-test-meter', 'aria-hidden': 'true' }, fill));
-    return { ms, cell, fill };
+function countryName(code) {
+  if (!code) return '';
+  try { return new Intl.DisplayNames(undefined, { type: 'region' }).of(code) || code; }
+  catch { return code; }
+}
+
+function renderProfileTest(name) {
+  const row = document.getElementById(`profile-row-${name}`);
+  const profile = S.profiles?.profiles.find((p) => p.name === name);
+  if (!row || !profile) return;
+  const completed = profileResults.get(name);
+  const result = completed?.rev === profile.rev ? completed : undefined;
+  const job = profileBatch?.get(name);
+  const phase = job?.rev === profile.rev ? job?.state : undefined;
+  const pending = ({ queued: 'Queued', testing: 'Testing…' })[phase];
+  const state = $('.profile-state', row);
+  state.textContent = pending || result?.error || '';
+  state.title = pending ? '' : result?.error || '';
+  const country = $('.profile-country', row);
+  country.textContent = country.title = result?.country || '';
+  $$('.profile-metric', row).forEach((cell, i) => {
+    const tier = PROFILE_TIERS[i], probe = result?.routes?.[tier];
+    let value = '—';
+    if (probe?.ok) value = `${probe.ms} ms`;
+    else if (probe?.ok === false) value = 'No reply';
+    else if (!profile.routes?.includes(tier)) value = 'n/a';
+    else if (!result && phase === 'testing') value = '…';
+    cell.classList.toggle('muted', !probe?.ok);
+    cell.replaceChildren(h('span', { class: 'sr' }, tierName(tier) + ' '),
+      probe?.ok && probe.via === 'relay' ? h('small', { class: 'muted profile-via' }, 'via relay ') : '', value);
   });
 }
 
-function renderProfileTests() {
-  const button = $('#test-profiles');
-  button.hidden = (S.profiles?.profiles.length || 0) < 2;
-  button.disabled = !!comparison.batch;
-  button.textContent = comparison.batch ? 'Testing…' : 'Test all';
-  $('#profile-results').hidden = comparison.rows.size === 0;
-  TEST_TIERS.forEach((_, i) => {
-    let min = Infinity, max = 250;
-    for (const row of comparison.rows.values()) {
-      const result = row.metrics[i];
-      if (!result) continue;
-      min = Math.min(min, result.ms);
-      max = Math.max(max, result.ms);
-    }
-    for (const row of comparison.rows.values()) {
-      const result = row.metrics[i];
-      if (!result) continue;
-      result.cell.classList.toggle('fastest', result.ms === min);
-      const width = `${Math.max(1, 100 * result.ms / max).toFixed(1)}%`;
-      if (result.fill.style.width !== width) result.fill.style.width = width;
-    }
-  });
+function updateProfileTestButton() {
+  $('#test-profiles').disabled = !!profileBatch || !S.profiles?.profiles.length;
 }
 
-function removeProfileTest(name) {
-  const row = comparison.rows.get(name);
-  if (!row) return;
-  row.abort?.abort();
-  row.el.remove();
-  comparison.rows.delete(name);
+function clearProfileTest(name, keepRevision) {
+  const job = profileBatch?.get(name);
+  if (job && (!keepRevision || job.rev !== keepRevision)) {
+    job.abort?.abort();
+    profileBatch.delete(name);
+  }
+  if (profileResults.delete(name) || job) renderProfileTest(name);
 }
 
 function cancelProfileTests() {
-  if (!comparison.batch) return;
-  comparison.batch = null;
-  for (const [name, row] of comparison.rows) {
-    if (row.state !== 'finished') removeProfileTest(name);
+  const batch = profileBatch;
+  if (!batch) return;
+  profileBatch = null;
+  for (const [name, job] of batch) {
+    job.abort?.abort();
+    renderProfileTest(name);
   }
-  renderProfileTests();
+  updateProfileTestButton();
 }
 
 async function testAllProfiles() {
   const profiles = S.profiles?.profiles;
-  if (comparison.batch || !profiles || profiles.length < 2) return;
-  const batch = {};
-  comparison.batch = batch;
-  comparison.rows.clear();
-  const rows = profiles.map((profile) => {
-    const cells = TEST_TIERS.map(() => h('td', { class: 'profile-test-cell' }));
-    const detail = h('small', { class: 'profile-test-empty' });
-    const heading = h('th', { scope: 'row' }, h('span', { class: 'profile-test-name', title: profile.name }, profile.name), detail);
-    const row = { profile, cells, detail, el: h('tr', { class: 'profile-test-row' }, heading, cells) };
-    updateProfileTest(row, 'queued');
-    comparison.rows.set(profile.name, row);
-    return row;
-  });
-  $('#profile-test-rows').replaceChildren(...rows.map((row) => row.el));
-  renderProfileTests();
-  let next = 0;
+  if (profileBatch || !profiles?.length) return;
+  const batch = new Map(profiles.map(({ name, rev }) => [name, { rev, state: 'queued' }]));
+  profileBatch = batch;
+  for (const name of batch.keys()) renderProfileTest(name);
+  updateProfileTestButton();
+  const queue = batch.entries();
+  let refresh;
   const worker = async () => {
-    while (comparison.batch === batch && next < rows.length) {
-      const row = rows[next++];
-      const name = row.profile.name;
-      if (comparison.rows.get(name) !== row) continue;
-      const abort = new AbortController();
-      row.abort = abort;
-      updateProfileTest(row, 'testing');
-      let routes, error;
+    while (profileBatch === batch) {
+      const next = queue.next();
+      if (next.done) return;
+      const [name, job] = next.value;
+      job.abort = new AbortController();
+      job.state = 'testing';
+      renderProfileTest(name);
+      let result;
       try {
-        ({ routes } = await api('POST', `/profiles/${encodeURIComponent(name)}/test`, undefined, abort.signal));
-      } catch (e) { error = e.message; }
-      row.abort = null;
-      if (abort.signal.aborted) continue;
-      updateProfileTest(row, 'finished', routes, error);
-      renderProfileTests();
+        const { rev, routes, exitCountry } = await api('POST', `/profiles/${encodeURIComponent(name)}/test`, undefined, job.abort.signal);
+        result = { rev, routes, country: countryName(exitCountry) };
+      } catch (e) { result = { rev: job.rev, error: e.message }; }
+      if (profileBatch !== batch || !batch.has(name)) continue;
+      let profile = S.profiles?.profiles.find((p) => p.name === name);
+      if (profile && result.rev !== profile.rev) {
+        // Keep this reply pending while the list catches up to its revision.
+        job.rev = result.rev;
+        profileResults.delete(name);
+        renderProfileTest(name);
+        refresh ||= loadProfiles().finally(() => { refresh = null; });
+        await refresh;
+        profile = S.profiles?.profiles.find((p) => p.name === name);
+      }
+      if (profileBatch !== batch || !batch.delete(name)) continue;
+      if (profile && result.rev === profile.rev) profileResults.set(name, result);
+      renderProfileTest(name);
     }
   };
-  await Promise.all([worker(), worker()]);
-  if (comparison.batch === batch) {
-    comparison.batch = null;
-    renderProfileTests();
+  try { await Promise.all([worker(), worker()]); }
+  finally {
+    if (profileBatch === batch) {
+      profileBatch = null;
+      updateProfileTestButton();
+    }
   }
 }
 
@@ -774,8 +749,7 @@ function relayForm(p) {
     try {
       const result = await api('PUT', `/profiles/${encodeURIComponent(p.name)}/relay`, { host: code.value, on: enabled.checked });
       if (p.relay?.host !== result.relay.host || p.relay?.on !== result.relay.on) {
-        removeProfileTest(p.name);
-        renderProfileTests();
+        clearProfileTest(p.name);
       }
       p.relay = result.relay;
       code.value = p.relay.host;
@@ -792,29 +766,52 @@ function relayForm(p) {
     h('label', { class: 'relay-toggle' }, 'Use relay', enabled), save, error);
 }
 
+function toggleProfileDetails(button) {
+  const opened = $('#profile-list .profile-name[aria-expanded="true"]');
+  if (opened) {
+    hideSecrets();
+    opened.setAttribute('aria-expanded', 'false');
+    document.getElementById(opened.getAttribute('aria-controls')).hidden = true;
+  }
+  if (button !== opened) {
+    button.setAttribute('aria-expanded', 'true');
+    document.getElementById(button.getAttribute('aria-controls')).hidden = false;
+  }
+  button.focus({ preventScroll: true });
+}
+
 function renderProfiles() {
   hideSecrets();
   const list = $('#profile-list');
-  const ps = S.profiles ? S.profiles.profiles : [];
-  if (!ps.length) { list.replaceChildren(h('p', { class: 'muted' }, 'No profiles yet. Paste a link below to add your first server.')); return; }
-  list.replaceChildren(...ps.map((p) => {
+  const profiles = S.profiles?.profiles || [];
+  list.parentElement.hidden = !profiles.length;
+  list.replaceChildren(...profiles.map((p) => {
     const active = p.name === S.profiles.active;
+    const nameID = `profile-name-${p.name}`, detailsID = `profile-details-${p.name}`;
+    const name = h('button', {
+      class: 'profile-name', type: 'button', id: nameID, title: p.name,
+      'aria-expanded': 'false', 'aria-controls': detailsID, 'aria-current': active ? 'true' : null,
+      onclick: (event) => toggleProfileDetails(event.currentTarget),
+    }, h('span', { class: 'profile-check', 'aria-hidden': 'true' }, active ? '✓' : ''),
+    h('span', { class: 'profile-label' }, p.name));
+    const row = h('div', { id: `profile-row-${p.name}`, class: 'profile-grid profile-row' },
+      h('div', { class: 'profile-identity' }, name, h('small', { class: 'profile-state muted', role: 'status' })),
+      h('small', { class: 'profile-country muted' }), PROFILE_TIERS.map(() => h('span', { class: 'profile-metric' })),
+      active ? null : h('button', { class: 'btn small ghost', type: 'button', 'aria-label': `Use ${p.name}`, onclick: () => activate(p.name) }, 'Use'));
     const dlink = h('div', { class: 'dlink' });
-    dlink.replaceChildren(...secretPlaceholder(p.name, dlink));
-    return h('div', { class: 'card pcard' + (active ? ' active' : '') },
-      h('div', { class: 'phead' },
-        h('div', { class: 'pavatar' }, p.name[0]),
-        h('div', { class: 'pinfo' },
-          h('div', {}, h('b', {}, p.name), ' ', active ? h('span', { class: 'pill ok' }, '✓ Active') : null),
-          h('div', { class: 'muted' }, p.server),
-          h('div', { class: 'pmeta' }, (p.routes || []).map((r) => h('span', { class: 'pill ' + r }, ROUTE_NAMES[r] || r)),
-            p.fingerprint ? h('span', { class: 'fp', title: p.fingerprint }, 'key ' + p.fingerprint.slice(0, 12)) : null)),
-        h('div', { class: 'pact' },
-          active ? null : h('button', { class: 'btn small', onclick: () => activate(p.name) }, 'Use'),
-          h('button', { class: 'btn small', onclick: () => renameSheet(p.name) }, 'Rename'),
-          h('button', { class: 'btn small danger', onclick: () => confirmSheet(`Delete “${p.name}”?`, 'The link is removed from this device. You can add it again later with the same link.', 'Delete', () => delProfile(p.name)) }, 'Delete'))),
-      relayForm(p), dlink);
+    dlink.append(secretPlaceholder(p.name, dlink));
+    return h('div', {}, row,
+      h('div', { class: 'profile-details', id: detailsID, hidden: true, role: 'region', 'aria-labelledby': nameID },
+        h('dl', { class: 'kv' },
+          h('dt', {}, 'Server'), h('dd', {}, p.server),
+          h('dt', {}, 'Key fingerprint'), h('dd', { class: 'fp' }, p.fingerprint || '—')),
+        relayForm(p),
+        h('div', { class: 'profile-actions' }, dlink,
+          h('button', { class: 'btn small', type: 'button', onclick: () => renameSheet(p.name) }, 'Rename'),
+          h('button', { class: 'btn small danger', type: 'button', onclick: () => confirmSheet(`Delete “${p.name}”?`, 'The link is removed from this device. You can add it again later with the same link.', 'Delete', () => delProfile(p.name)) }, 'Delete'))));
   }));
+  for (const { name } of profiles) renderProfileTest(name);
+  updateProfileTestButton();
 }
 async function activate(name) {
   try { const st = await api('POST', `/profiles/${encodeURIComponent(name)}/activate`); await loadProfiles(); applyStatus(st); toast(`Using ${name}`); } catch (e) { toast(e.message); return false; }
@@ -822,8 +819,7 @@ async function activate(name) {
 async function delProfile(name) {
   try {
     await api('DELETE', `/profiles/${encodeURIComponent(name)}`);
-    removeProfileTest(name);
-    renderProfileTests();
+    clearProfileTest(name);
     await loadProfiles();
     applyStatus(await api('GET', '/status'));
     toast('Profile deleted');
@@ -835,7 +831,7 @@ function renameSheet(name) {
   sheet('Rename profile', h('div', {}, inp, note), [{ label: 'Cancel' }, { label: 'Rename', kind: 'primary', run: async () => {
     try {
       const renamed = await api('PATCH', `/profiles/${encodeURIComponent(name)}`, { name: inp.value.trim().toLowerCase() });
-      if (renamed.name !== name) { removeProfileTest(name); renderProfileTests(); }
+      if (renamed.name !== name) clearProfileTest(name);
       await loadProfiles();
       toast('Renamed');
     }
@@ -851,15 +847,14 @@ async function startImport(link, field) {
       h('dt', {}, 'Name'), h('dd', {}, inp),
       h('dt', {}, 'Server'), h('dd', {}, p.server),
       p.cdn ? [h('dt', {}, 'CDN'), h('dd', {}, p.cdn)] : null,
-      h('dt', {}, 'Routes'), h('dd', { class: 'pmeta' }, (p.routes || []).map((r) => h('span', { class: 'pill ' + r }, ROUTE_NAMES[r] || r))),
+      h('dt', {}, 'Routes'), h('dd', {}, (p.routes || []).map(tierName).join(', ')),
       h('dt', {}, 'Key'), h('dd', { class: 'fp' }, p.fingerprint || '—'));
     const body = h('div', {}, h('p', { class: 'muted small-text' }, 'Check that this matches your server before saving.'), kv,
       p.exists ? h('p', { class: 'banner warn' }, 'A profile with this name already exists. Saving will replace it.') : null, err);
     sheet('Add this server?', body, [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', run: async () => {
       try {
         const saved = await api('POST', '/profiles', { link: link.trim(), name: inp.value.trim().toLowerCase() });
-        removeProfileTest(saved.name);
-        renderProfileTests();
+        clearProfileTest(saved.name);
         field.value = ''; field.dispatchEvent(new Event('input'));
         await loadProfiles(); applyStatus(await api('GET', '/status')); toast('Profile saved');
       } catch (e) { err.textContent = e.message; return false; }

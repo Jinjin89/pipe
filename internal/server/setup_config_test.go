@@ -3,6 +3,7 @@
 package server
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -260,7 +261,7 @@ func TestSetupPrivilegedInputsRequireTrustedPath(t *testing.T) {
 		t.Skip("Linux root file validation")
 	}
 	parent := t.TempDir()
-	dir := filepath.Join(parent, "operator")
+	dir := filepath.Join(parent, "operator's $dir")
 	must(t, os.Mkdir(dir, 0755))
 	dst := filepath.Join(dir, "setup.json")
 	must(t, os.WriteFile(dst, []byte(`{"sni":"origin.example"}`), 0600))
@@ -273,15 +274,18 @@ func TestSetupPrivilegedInputsRequireTrustedPath(t *testing.T) {
 		t.Fatal("setup followed a symlink parent")
 	}
 	must(t, os.Chmod(dir, 0775))
-	if _, err := LoadSetupConfig(dst); err == nil || !strings.Contains(err.Error(), "owned or writable by user pipe") {
-		t.Fatalf("writable config parent: %v", err)
+	commandPath := "'" + strings.ReplaceAll(parent, "'", `'\''`) + `/operator'\''s $dir'`
+	want := fmt.Sprintf("unsafe setup path %q: %q is group- or world-writable; run: chmod go-w %s", dst, dir, commandPath)
+	if _, err := LoadSetupConfig(dst); err == nil || err.Error() != want {
+		t.Fatalf("writable config parent error = %v, want %q", err, want)
 	}
 	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil {
 		t.Fatal("setup staged a credential with a writable parent")
 	}
 	must(t, os.Chmod(dir, 0755))
 	must(t, os.Chown(dir, 990, 990))
-	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil {
-		t.Fatal("setup staged a credential in a service-owned directory")
+	want = fmt.Sprintf("unsafe setup path %q: %q must not be owned by user pipe", dst, dir)
+	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil || err.Error() != want {
+		t.Fatalf("service-owned config parent error = %v, want %q", err, want)
 	}
 }

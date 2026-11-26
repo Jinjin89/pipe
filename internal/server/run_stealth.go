@@ -17,6 +17,8 @@ import (
 	"pipe/internal/localfile"
 )
 
+const stealthCertificateGrace = 10 * time.Second
+
 type verifiedStealthCover struct {
 	pair          *tls.Certificate
 	from, expires time.Time
@@ -27,15 +29,19 @@ func (c *verifiedStealthCover) validAt(now time.Time) bool {
 }
 
 type sharedStealth struct {
-	verify    x509.VerifyOptions
-	trustErr  error
-	load      func(time.Time) (*tls.Certificate, error)
-	published atomic.Pointer[verifiedStealthCover]
-	warnedOff bool
+	verify               x509.VerifyOptions
+	trustErr             error
+	load                 func(time.Time) (*tls.Certificate, error)
+	published            atomic.Pointer[verifiedStealthCover]
+	warnUnavailableAfter time.Time
+	warnedOff            bool
 }
 
 func newSharedStealth(name, testCA string) *sharedStealth {
-	stealth := &sharedStealth{verify: x509.VerifyOptions{DNSName: name}}
+	stealth := &sharedStealth{
+		verify:               x509.VerifyOptions{DNSName: name},
+		warnUnavailableAfter: time.Now().Add(stealthCertificateGrace),
+	}
 	if testCA == "" {
 		return stealth // A nil root pool uses the system roots.
 	}
@@ -73,7 +79,7 @@ func (s *sharedStealth) check(now time.Time, current *verifiedStealthCover) (*ve
 		return nil, err
 	}
 	if pair == nil || len(pair.Certificate) == 0 {
-		return nil, errors.New("HTTPS proxy certificate is unavailable")
+		return nil, errProxyCertificateUnavailable
 	}
 	if current != nil && current.validAt(now) && slices.EqualFunc(current.pair.Certificate, pair.Certificate, bytes.Equal) {
 		return &verifiedStealthCover{pair: pair, from: current.from, expires: current.expires}, nil
@@ -112,8 +118,9 @@ func (s *sharedStealth) check(now time.Time, current *verifiedStealthCover) (*ve
 }
 
 func (s *sharedStealth) refresh(instance *engine.Instance, warn func(string)) (bool, error) {
+	now := time.Now()
 	previous := s.published.Load()
-	cover, err := s.check(time.Now(), previous)
+	cover, err := s.check(now, previous)
 	if err == nil {
 		s.published.Store(cover)
 		if previous == nil {
@@ -130,8 +137,9 @@ func (s *sharedStealth) refresh(instance *engine.Instance, warn func(string)) (b
 		s.published.Store(nil)
 	}
 	if err == nil {
+		s.warnUnavailableAfter = time.Time{}
 		s.warnedOff = false
-	} else if !s.warnedOff {
+	} else if !s.warnedOff && (!errors.Is(err, errProxyCertificateUnavailable) || !now.Before(s.warnUnavailableAfter)) {
 		warn("Stealth is OFF: " + err.Error())
 		s.warnedOff = true
 	}

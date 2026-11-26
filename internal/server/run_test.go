@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"pipe/internal/engine"
@@ -496,8 +497,10 @@ func TestSharedStealthTracksProxyCertificate(t *testing.T) {
 	}
 	cancel()
 	must(t, <-finished)
+	if strings.Contains(output.String(), "Stealth is OFF: HTTPS proxy certificate is unavailable") {
+		t.Fatalf("early OFF warning before the certificate loaded:\n%s", output.String())
+	}
 	for _, text := range []string{
-		"Stealth is OFF: HTTPS proxy certificate is unavailable",
 		"Stealth listening on " + address,
 		"Stealth is OFF: HTTPS proxy certificate for " + testProxyDomain + " failed server certificate verification",
 	} {
@@ -505,6 +508,33 @@ func TestSharedStealthTracksProxyCertificate(t *testing.T) {
 			t.Fatalf("expected one %q entry in server log:\n%s", text, output.String())
 		}
 	}
+}
+
+func TestSharedStealthWaitsBeforeWarningForMissingCertificate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stealth := newSharedStealth(testProxyDomain, "")
+		stealth.load = func(time.Time) (*tls.Certificate, error) { return nil, nil }
+		var warnings []string
+		refresh := func() {
+			t.Helper()
+			active, err := stealth.refresh(nil, func(message string) { warnings = append(warnings, message) })
+			if active || err != nil {
+				t.Fatalf("refresh without a certificate = %t, %v", active, err)
+			}
+		}
+		refresh()
+		time.Sleep(stealthCertificateGrace - time.Millisecond)
+		refresh()
+		if len(warnings) != 0 {
+			t.Fatalf("warned during certificate startup: %v", warnings)
+		}
+		time.Sleep(time.Millisecond)
+		refresh()
+		refresh()
+		if len(warnings) != 1 || warnings[0] != "Stealth is OFF: HTTPS proxy certificate is unavailable" {
+			t.Fatalf("expected one OFF warning after the startup grace period, got %v", warnings)
+		}
+	})
 }
 
 func TestStandaloneIgnoresUnusedOriginPullCA(t *testing.T) {

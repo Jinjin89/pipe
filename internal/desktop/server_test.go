@@ -732,14 +732,22 @@ type fakeHelper struct {
 	stops     int
 	onChange  func()
 
-	probeProfile func(context.Context, clientctl.ProbeOptions) (map[string]clientctl.RouteLatency, error)
+	probeProfile func(context.Context, clientctl.ProbeOptions) (clientctl.ProfileTestResult, error)
 }
 
 func (h *fakeHelper) SyncLogs()         {}
 func (h *fakeHelper) OnChange(f func()) { h.onChange = f }
 
 func (h *fakeHelper) TestProfile(ctx context.Context, opts clientctl.ProbeOptions) (map[string]clientctl.RouteLatency, error) {
-	return h.probeProfile(ctx, opts)
+	result, err := h.TestProfileResult(ctx, opts)
+	return result.Routes, err
+}
+
+func (h *fakeHelper) TestProfileResult(ctx context.Context, opts clientctl.ProbeOptions) (clientctl.ProfileTestResult, error) {
+	if h.probeProfile != nil {
+		return h.probeProfile(ctx, opts)
+	}
+	return clientctl.ProfileTestResult{}, nil
 }
 
 func (h *fakeHelper) Info() helper.Info { h.imu.Lock(); defer h.imu.Unlock(); return h.info }
