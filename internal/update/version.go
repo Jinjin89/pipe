@@ -16,6 +16,25 @@ type releaseVersion struct {
 	channel string
 }
 
+// ChannelOf returns the release channel ("stable", "alpha", ...) of ver.
+func ChannelOf(ver string) (string, bool) {
+	v, ok := parseVersion(ver)
+	if !ok {
+		return "", false
+	}
+	return v.channel, true
+}
+
+// CompareVersions compares two Pipe semantic versions on any channel.
+func CompareVersions(a, b string) (int, bool) {
+	va, oka := parseVersion(a)
+	vb, okb := parseVersion(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	return va.compare(vb), true
+}
+
 func parseVersion(text string) (releaseVersion, bool) {
 	if len(text) > 80 {
 		return releaseVersion{}, false

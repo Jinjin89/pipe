@@ -589,7 +589,7 @@ func TestInvalidBytesAndRedirectCannotReachHandoff(t *testing.T) {
 			m.Download(route)
 			st := waitStatus(t, m, "error")
 			files, err := os.ReadDir(base)
-			if st.Artifact != "" || err != nil || len(files) != 1 || files[0].Name() != m.stateFile {
+			if st.Artifact != "" || err != nil || len(files) != 2 || files[0].Name() != stateLockFilename || files[1].Name() != m.stateFile {
 				t.Fatalf("unverified download escaped staging: %+v %v %v", st, files, err)
 			}
 		})

@@ -224,6 +224,55 @@ func TestRemoteInfoStates(t *testing.T) {
 	}
 }
 
+func TestRemoteHelperVersionAndProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		name, ver, want string
+		protocol        int
+	}{
+		{"newer release", "1.2.4", StateNewer, ProtocolVersion},
+		{"newer release with older protocol", "1.2.4", StateNewer, ProtocolVersion - 1},
+		{"newer protocol with older release", "1.2.2", StateNewer, ProtocolVersion + 1},
+		{"older release", "1.2.2", StateOutdated, ProtocolVersion},
+		{"older protocol", "1.2.3", StateOutdated, ProtocolVersion - 1},
+		{"uncomparable build", "local", StateOutdated, ProtocolVersion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := relayTestRemote(t, func(_ context.Context, req Request) (any, string) {
+				if req.Method != "hello" {
+					t.Errorf("sent %q to an incompatible Helper", req.Method)
+					return nil, "unexpected method"
+				}
+				return map[string]any{"version": tc.ver, "protocol": tc.protocol}, ""
+			})
+			r.goos = "linux"
+			if info := r.Info(); info.State != tc.want || info.Version != tc.ver {
+				t.Fatalf("Helper info = %+v, want state %q and version %q", info, tc.want, tc.ver)
+			}
+			if tc.want != StateNewer {
+				return
+			}
+			if info := r.Info(); info.Note != msgNewer {
+				t.Errorf("newer Helper note = %q, want %q", info.Note, msgNewer)
+			}
+			if err := r.Start(testOptions(t)); !errors.Is(err, ErrNewer) {
+				t.Errorf("starting a session with a newer Helper returned %v", err)
+			}
+			r.lookPath = func(string) (string, error) { return "pkexec", nil }
+			r.run = func(string, ...string) ([]byte, error) {
+				t.Error("downgrade reached the elevation command")
+				return nil, ErrNewer
+			}
+			// A host upgrade can happen while the GUI still has cached
+			// information about the old Helper.
+			r.info = Info{State: StateOutdated}
+			r.infoAt = time.Now()
+			if err := r.Install(); !errors.Is(err, ErrNewer) {
+				t.Errorf("install over a newer Helper returned %v", err)
+			}
+		})
+	}
+}
+
 func TestRemoteInfoCache(t *testing.T) {
 	r := newRemote(filepath.Join(t.TempDir(), "late.sock"), "1.2.3", nil)
 	if r.Info().State != StateMissing {

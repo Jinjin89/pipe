@@ -15,7 +15,7 @@ android {
         applicationId = "io.pipe.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
+        versionCode = 17
         versionName = pipeVersion
     }
     buildFeatures {

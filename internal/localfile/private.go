@@ -5,9 +5,13 @@ package localfile
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 )
+
+// ErrSyncAfterReplace reports an executable replacement whose parent sync failed.
+var ErrSyncAfterReplace = errors.New("replaced executable but could not sync parent directory")
 
 // WritePrivate creates an exclusive owner-only file and removes it on write failure.
 func WritePrivate(path string, data []byte) error {
@@ -33,7 +37,7 @@ func WritePrivateAtomic(path string, data []byte) error {
 	return writePrivateAtomic(path, data, false)
 }
 
-// WritePrivateAtomicSyncDir is WritePrivateAtomic and syncs the parent directory.
+// WritePrivateAtomicSyncDir makes the replacement durable in its parent directory.
 func WritePrivateAtomicSyncDir(path string, data []byte) error {
 	return writePrivateAtomic(path, data, true)
 }
@@ -51,19 +55,8 @@ func writePrivateAtomic(path string, data []byte, syncDir bool) error {
 	if err := WritePrivate(temp, data); err != nil {
 		return err
 	}
-	if err := os.Rename(temp, path); err != nil {
+	if err := replacePrivate(temp, path, syncDir); err != nil {
 		_ = os.Remove(temp)
-		return err
-	}
-	if syncDir {
-		d, err := os.Open(dir)
-		if err != nil {
-			return err
-		}
-		err = d.Sync()
-		if closeErr := d.Close(); err == nil {
-			err = closeErr
-		}
 		return err
 	}
 	return nil

@@ -141,6 +141,35 @@ func trustedDirectory(path string, create bool) (int, error) {
 	}
 }
 
+// CheckTrustedFile verifies that path resolves without symlinks under
+// root-owned, non-group/world-writable directories and is a root-owned regular file.
+func CheckTrustedFile(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("trusted file must have an absolute path")
+	}
+	dir, err := trustedDirectory(filepath.Dir(path), false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dir)
+	fd, err := unix.Openat(dir, filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Uid != 0 || st.Mode&022 != 0 || st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%s must be a root-owned, protected file", path)
+	}
+	if err := CheckFDNoNonOwnerWriteACL(fd, 0); err != nil {
+		return fmt.Errorf("%s must not grant write access through an ACL: %w", path, err)
+	}
+	return nil
+}
+
 // InstallTrustedExecutable publishes bytes from an approved, already open image.
 func InstallTrustedExecutable(source *os.File, dest string) error {
 	if os.Geteuid() != 0 {
@@ -154,12 +183,103 @@ func InstallTrustedExecutable(source *os.File, dest string) error {
 		return err
 	}
 	defer unix.Close(dir)
+	return publishExecutable(source, dir, filepath.Base(dest), true, unix.Fsync)
+}
+
+// InstallOwnerExecutable atomically replaces dest from an already-verified open
+// file inside an owner-controlled directory (for portable non-root updates).
+func InstallOwnerExecutable(source *os.File, dest string) error {
+	uid := uint32(os.Geteuid())
+	var st unix.Stat_t
+	if err := unix.Fstat(int(source.Fd()), &st); err != nil {
+		return err
+	}
+	if st.Uid != uid || st.Mode&022 != 0 || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mode&0111 == 0 {
+		return fmt.Errorf("%s must be an owner-protected executable", source.Name())
+	}
+	if err := CheckFDNoNonOwnerWriteACL(int(source.Fd()), uid); err != nil {
+		return fmt.Errorf("%s must not grant write access through an ACL: %w", source.Name(), err)
+	}
+	var dir int
+	var err error
+	if uid == 0 {
+		dir, err = trustedDirectory(filepath.Dir(dest), false)
+	} else {
+		dir, err = ownerProtectedDirectory(filepath.Dir(dest), uid)
+	}
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dir)
 	name := filepath.Base(dest)
+	var existing unix.Stat_t
+	if err := unix.Fstatat(dir, name, &existing, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		if existing.Uid != uid || existing.Mode&022 != 0 || existing.Mode&unix.S_IFMT != unix.S_IFREG {
+			return fmt.Errorf("%s must be a protected, owner-owned regular file", dest)
+		}
+	} else if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	return publishExecutable(source, dir, name, uid == 0, unix.Fsync)
+}
+
+func ownerProtectedDirectory(path string, uid uint32) (int, error) {
+	const flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	if !filepath.IsAbs(path) {
+		return -1, errors.New("destination directory must have an absolute path")
+	}
+	fd, err := unix.Open("/", flags, 0)
+	if err != nil {
+		return -1, err
+	}
+	current := "/"
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(path), "/"), "/")
+	for i := 0; ; i++ {
+		leaf := i == len(parts) || parts[i] == ""
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			unix.Close(fd)
+			return -1, err
+		}
+		if leaf {
+			if st.Uid != uid || st.Mode&022 != 0 {
+				unix.Close(fd)
+				return -1, fmt.Errorf("directory %s must be owned by the current user and not writable by others", current)
+			}
+			if err := CheckFDNoNonOwnerWriteACL(fd, uid); err != nil {
+				unix.Close(fd)
+				return -1, fmt.Errorf("directory %s must not grant write access through an ACL: %w", current, err)
+			}
+			return fd, nil
+		}
+		stickyRoot := st.Uid == 0 && st.Mode&unix.S_ISVTX != 0
+		if (st.Uid != 0 && st.Uid != uid) || (st.Mode&022 != 0 && !stickyRoot) {
+			unix.Close(fd)
+			return -1, fmt.Errorf("directory %s must be protected from writes by other users", current)
+		}
+		if !stickyRoot {
+			if err := CheckFDNoNonOwnerWriteACL(fd, st.Uid); err != nil {
+				unix.Close(fd)
+				return -1, fmt.Errorf("directory %s must not grant write access through an ACL: %w", current, err)
+			}
+		}
+		part := parts[i]
+		current = filepath.Join(current, part)
+		next, err := unix.Openat(fd, part, flags, 0)
+		unix.Close(fd)
+		if err != nil {
+			return -1, fmt.Errorf("open directory %s: %w", current, err)
+		}
+		fd = next
+	}
+}
+
+func publishExecutable(source *os.File, dir int, name string, chownRoot bool, syncDir func(int) error) error {
 	var a, b unix.Stat_t
 	if err := unix.Fstat(int(source.Fd()), &a); err != nil {
 		return err
 	}
-	if unix.Fstatat(dir, name, &b, unix.AT_SYMLINK_NOFOLLOW) == nil &&
+	if chownRoot && unix.Fstatat(dir, name, &b, unix.AT_SYMLINK_NOFOLLOW) == nil &&
 		a.Dev == b.Dev && a.Ino == b.Ino && b.Gid == 0 && b.Mode&07777 == 0755 {
 		return nil
 	}
@@ -175,13 +295,18 @@ func InstallTrustedExecutable(source *os.File, dest string) error {
 	f := os.NewFile(uintptr(fd), temp)
 	defer f.Close()
 	defer unix.Unlinkat(dir, temp, 0)
+	if err := clearDarwinACL(fd); err != nil {
+		return err
+	}
 	if n, err := io.Copy(f, io.NewSectionReader(source, 0, a.Size)); err != nil {
 		return err
 	} else if n != a.Size {
 		return io.ErrUnexpectedEOF
 	}
-	if err := f.Chown(0, 0); err != nil {
-		return err
+	if chownRoot {
+		if err := f.Chown(0, 0); err != nil {
+			return err
+		}
 	}
 	if err := f.Chmod(0755); err != nil {
 		return err
@@ -189,5 +314,11 @@ func InstallTrustedExecutable(source *os.File, dest string) error {
 	if err := f.Sync(); err != nil {
 		return err
 	}
-	return unix.Renameat(dir, temp, dir, name)
+	if err := unix.Renameat(dir, temp, dir, name); err != nil {
+		return err
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("%w: %w", ErrSyncAfterReplace, err)
+	}
+	return nil
 }

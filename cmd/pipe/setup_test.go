@@ -5,10 +5,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -73,6 +76,38 @@ func TestSetupFlagsOverrideJSON(t *testing.T) {
 	}
 	if !opts.NoProxy || opts.Proxy != nil || *opts.Cert != (server.SetupCertificate{DNS: "alidns", KeyFile: "ali.key"}) {
 		t.Fatalf("unexpected provider or proxy override: %+v (cert %+v)", opts, opts.Cert)
+	}
+}
+
+func TestSetupOperatorIsCLIOnly(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("setup operator resolution targets Linux")
+	}
+	account, err := user.Current()
+	if err != nil || account.Username == "pipe" {
+		t.Skip("requires a named account outside the Pipe service")
+	}
+	config := setupConfigPath(t, `{"sni":"gate.example"}`)
+	opts, _, err := parseSetupOptions([]string{"--config", config, "--operator", account.Username})
+	if err != nil || opts.Operator != account.Username || opts.SNI != "gate.example" {
+		t.Fatalf("parse setup operator: options = %+v, error = %v", opts, err)
+	}
+	missingConfig := filepath.Join(t.TempDir(), "missing.json")
+	_, _, err = parseSetupOptions([]string{"--config", missingConfig, "--operator", "pipe-test-unknown-operator"})
+	var unknown user.UnknownUserError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("expected operator lookup to fail before config read, got %v", err)
+	}
+	if _, err := user.Lookup("pipe"); err == nil {
+		_, _, err = parseSetupOptions([]string{"--config", missingConfig, "--operator", "pipe"})
+		if err == nil || !strings.Contains(err.Error(), "cannot be user pipe") {
+			t.Fatalf("expected service UID to be rejected before config read, got %v", err)
+		}
+	}
+	config = setupConfigPath(t, `{"sni":"gate.example","operator":"root"}`)
+	_, _, err = parseSetupOptions([]string{"--config", config})
+	if err == nil || !strings.Contains(err.Error(), `unknown field "operator"`) {
+		t.Fatalf("expected operator field in JSON to be rejected, got %v", err)
 	}
 }
 

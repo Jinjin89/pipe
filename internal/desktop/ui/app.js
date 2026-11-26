@@ -305,6 +305,7 @@ function renderPath() {
   text('#path-down', fmtRate(down));
 }
 const helperState = () => (S.status && S.status.helper && S.status.helper.state) || '';
+const helperNewerNote = 'Pipe Helper is newer than this app. Update Pipe first.';
 const thisComputer = () => (S.about && S.about.os && S.about.os !== 'darwin' ? 'computer' : 'Mac');
 function renderTun() {
   const tun = !!(S.settings && S.settings.tun), un = helperState() === 'unsupported';
@@ -329,12 +330,14 @@ async function saveTun(on) {
     tick();
     return true;
   } catch (e) {
-    if (e.code === 'needHelper') { askHelper(); return false; }
+    if (e.code === 'needHelper') { await refreshHelper(); askHelper(); return false; }
     toast(e.message); return false;
   }
 }
 function askHelper() {
-  const outdated = helperState() === 'outdated', pc = thisComputer();
+  const state = helperState();
+  if (state === 'newer') { toast(S.status.helper.note || helperNewerNote); return; }
+  const outdated = state === 'outdated', pc = thisComputer();
   const text = `${outdated ? 'Pipe Helper needs an update. ' : ''}TUN sends every app on this ${pc} through pipe, including Terminal and games. Your ${pc} asks for your password once to ${outdated ? 'update' : 'install'} Pipe Helper. After that, TUN starts by itself.`;
   sheet('Turn on TUN?', h('p', { class: 'muted' }, text), [
     { label: 'Cancel' },
@@ -342,7 +345,12 @@ function askHelper() {
       const btn = $('#sheet-actions .primary');
       if (btn) btn.textContent = 'Waiting for your password…';
       try { await api('POST', '/helper/install'); }
-      catch (e) { toast(e.code === 'canceled' ? 'Cancelled.' : e.message); refreshHelper(); return false; }
+      catch (e) {
+        toast(e.code === 'canceled' ? 'Cancelled.' : e.message);
+        await refreshHelper();
+        if (e.code !== 'helperNewer' && helperState() !== 'newer') return false;
+        return;
+      }
       finally { if (btn) btn.textContent = 'Install and turn on'; }
       await refreshHelper();
       return (await saveTun(true)) ? undefined : false;
@@ -356,14 +364,15 @@ async function refreshHelper() {
 function renderHelper() {
   const hp = (S.status && S.status.helper) || {}, st = hp.state || '';
   const un = st === 'unsupported';
-  const label = { missing: 'Not installed', ok: `Running${hp.version ? ' v' + String(hp.version).replace(/^v/, '') : ''}`, outdated: 'Needs update', unsupported: 'Not available on this system', error: 'Problem' }[st] || '-';
+  const label = { missing: 'Not installed', ok: `Running${hp.version ? ' v' + String(hp.version).replace(/^v/, '') : ''}`, outdated: 'Needs update', newer: 'App needs update', unsupported: 'Not available on this system', error: 'Problem' }[st] || '-';
   $('#helper-state').textContent = label;
-  $('#helper-note').textContent = st === 'error' ? (hp.note || 'Pipe Helper has a problem.')
+  $('#helper-note').textContent = st === 'newer' ? (hp.note || helperNewerNote)
+    : st === 'error' ? (hp.note || 'Pipe Helper has a problem.')
     : un ? 'This system cannot run TUN from the app yet.' : 'Lets TUN start without asking for your password each time.';
   const inst = $('#helper-install'), rem = $('#helper-remove');
   inst.hidden = !(st === 'missing' || st === 'outdated' || st === 'error');
   inst.textContent = st === 'outdated' ? 'Update' : 'Install';
-  rem.hidden = !(st === 'ok' || st === 'outdated');
+  rem.hidden = !(st === 'ok' || st === 'outdated' || st === 'newer');
   $('#cli-box').hidden = !un;
 }
 async function installHelper(ev) {
@@ -1133,23 +1142,27 @@ let updateState, updateRequest = false, updateTimer;
 const updateBusy = () => ['checking', 'downloading'].includes(updateState?.state);
 
 function renderUpdates() {
-  const { installed, state, version, error, artifact } = updateState || {};
+  const { installed, state, version, error, artifact, canApply, appliedVersion, installHint } = updateState || {};
   $('#update-installed').textContent = installed ? `v${installed.replace(/^v/, '')}` : '—';
+  const readyHint = canApply ? 'Install it for the next launch, or open the file.' :
+    installHint || 'Open the downloaded file to install it.';
   const messages = {
     checking: 'Checking for updates…',
     available: `Version ${version} is available.`,
     current: 'Pipe is up to date.',
     downloading: `Downloading and verifying version ${version}…`,
-    ready: `Version ${version} is ready. Open the downloaded file to install it.`,
+    ready: `Version ${version} is ready. ${readyHint}`,
     error: error || 'Could not update Pipe.',
   };
   const status = $('#update-status');
-  const message = messages[state] || '';
+  const message = appliedVersion ? `Version ${appliedVersion} installed. Quit and reopen Pipe to use it.` : messages[state] || '';
   if (status.textContent !== message) status.textContent = message;
   status.parentElement.hidden = !message;
   $('#update-check').disabled = updateRequest || updateBusy();
-  $('#update-download').hidden = state !== 'available' && !(state === 'error' && version);
+  $('#update-download').hidden = !!appliedVersion || (state !== 'available' && !(state === 'error' && version));
   $('#update-download').disabled = updateRequest;
+  $('#update-apply').hidden = !!appliedVersion || state !== 'ready' || !artifact || !canApply;
+  $('#update-apply').disabled = updateRequest;
   $('#update-reveal').hidden = state !== 'ready' || !artifact;
   $('#update-reveal').disabled = updateRequest;
 }
@@ -1275,6 +1288,7 @@ function wire() {
   $$('.seg[data-k] button').forEach((b) => b.addEventListener('click', () => saveSetting({ [b.parentElement.dataset.k]: b.dataset.v })));
   $('#update-check').addEventListener('click', () => requestUpdates('check'));
   $('#update-download').addEventListener('click', () => requestUpdates('download'));
+  $('#update-apply').addEventListener('click', () => requestUpdates('apply', { artifact: updateState.artifact }));
   $('#update-reveal').addEventListener('click', () => requestUpdates('reveal', { artifact: updateState.artifact }));
   $('#s-port').addEventListener('change', (e) => {
     const n = +e.target.value;

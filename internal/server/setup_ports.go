@@ -11,9 +11,12 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"pipe/internal/link"
 )
@@ -88,21 +91,27 @@ func (r *setupRun) checkPorts(s Settings, saved *Settings, hopDestinations []net
 	if occupied == nil {
 		occupied = occupiedUDPPorts
 	}
-	return checkHopPorts(s.FastHop, s.fastPort(), hopDestinations, occupied, r.probePort)
+	warnings, err := checkHopPorts(s.FastHop, s.fastPort(), hopDestinations, occupied, r.probePort, r.readPortSysctl)
+	for _, warning := range warnings {
+		r.printf("Warning: %s.\n", warning)
+	}
+	return err
 }
 
-func checkHopPorts(ports string, fast uint16, destinations []netip.Addr, occupied func() ([]uint16, error), probe func(setupBinding) error) error {
+func checkHopPorts(ports string, fast uint16, destinations []netip.Addr, occupied func() ([]uint16, error), probe func(setupBinding) error, readSysctl func(string) ([]byte, error)) ([]string, error) {
 	if ports == "" {
-		return nil
+		return nil, nil
 	}
 	first, last, err := link.ParseHop(ports)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	candidates, err := occupied()
 	if err != nil {
-		return fmt.Errorf("check occupied Fast hop ports: %w", err)
+		return nil, fmt.Errorf("check occupied Fast hop ports: %w", err)
 	}
+	ephemeral := sync.OnceValue(func() ephemeralUDPPorts { return readEphemeralUDPPorts(readSysctl) })
+	var warnings []string
 	// Ask the kernel about each occupied candidate at the exact destination.
 	// A scoped bind also detects wildcard sockets that cover that address.
 	for _, port := range candidates {
@@ -116,11 +125,82 @@ func checkHopPorts(ports string, fast uint16, destinations []netip.Addr, occupie
 			}
 			binding := setupBinding{name: "Fast hop", network: family, port: port, address: address}
 			if err := probe(binding); err != nil {
-				return fmt.Errorf("check Fast hop UDP port %d on %s: %w", port, address, err)
+				if errors.Is(err, syscall.EADDRINUSE) && ephemeral().allows(port) {
+					warnings = append(warnings, fmt.Sprintf("Fast hop UDP port %d on %s is currently in use within the local ephemeral port range; live local sockets stay exempted", port, address))
+					continue
+				}
+				return warnings, fmt.Errorf("check Fast hop UDP port %d on %s: %w", port, address, err)
 			}
 		}
 	}
-	return nil
+	return warnings, nil
+}
+
+const (
+	ipLocalPortRange     = "/proc/sys/net/ipv4/ip_local_port_range"
+	ipLocalReservedPorts = "/proc/sys/net/ipv4/ip_local_reserved_ports"
+)
+
+type udpPortRange struct{ first, last uint16 }
+
+func (r udpPortRange) contains(port uint16) bool {
+	return port >= r.first && port <= r.last
+}
+
+type ephemeralUDPPorts struct {
+	allocation udpPortRange
+	reserved   []udpPortRange
+}
+
+func (p ephemeralUDPPorts) allows(port uint16) bool {
+	return p.allocation.first != 0 && p.allocation.contains(port) && !slices.ContainsFunc(p.reserved, func(r udpPortRange) bool {
+		return r.contains(port)
+	})
+}
+
+// A zero allocation range preserves strict conflict checks when either
+// setting is unavailable or invalid.
+func readEphemeralUDPPorts(readSysctl func(string) ([]byte, error)) ephemeralUDPPorts {
+	if readSysctl == nil {
+		if runtime.GOOS != "linux" {
+			return ephemeralUDPPorts{}
+		}
+		readSysctl = os.ReadFile
+	}
+	data, err := readSysctl(ipLocalPortRange)
+	fields := strings.Fields(string(data))
+	if err != nil || len(fields) != 2 {
+		return ephemeralUDPPorts{}
+	}
+	allocation, ok := parseUDPPortRange(fields[0], fields[1])
+	if !ok || allocation.first == 0 {
+		return ephemeralUDPPorts{}
+	}
+	data, err = readSysctl(ipLocalReservedPorts)
+	if err != nil {
+		return ephemeralUDPPorts{}
+	}
+	ports := ephemeralUDPPorts{allocation: allocation}
+	if entries := strings.TrimSpace(string(data)); entries != "" {
+		for entry := range strings.SplitSeq(entries, ",") {
+			first, last, ok := strings.Cut(entry, "-")
+			if !ok {
+				last = first
+			}
+			reserved, ok := parseUDPPortRange(first, last)
+			if !ok {
+				return ephemeralUDPPorts{}
+			}
+			ports.reserved = append(ports.reserved, reserved)
+		}
+	}
+	return ports
+}
+
+func parseUDPPortRange(first, last string) (udpPortRange, bool) {
+	start, firstErr := strconv.ParseUint(first, 10, 16)
+	end, lastErr := strconv.ParseUint(last, 10, 16)
+	return udpPortRange{uint16(start), uint16(end)}, firstErr == nil && lastErr == nil && start <= end
 }
 
 func occupiedUDPPorts() ([]uint16, error) {
@@ -160,8 +240,9 @@ func readUDPPorts(r io.Reader, ports map[uint16]struct{}) error {
 	return rows.Err()
 }
 
-func fastHopDestinations(ifaces []SetupInterface, explicit netip.Addr) ([]netip.Addr, error) {
+func fastHopDestinations(ifaces []SetupInterface, explicit netip.Addr) ([]netip.Addr, []string, error) {
 	var public, private [2][]netip.Addr
+	seen := make(map[netip.Addr]bool)
 	for _, iface := range ifaces {
 		for _, addr := range iface.Addrs {
 			addr = addr.Unmap()
@@ -169,11 +250,12 @@ func fastHopDestinations(ifaces []SetupInterface, explicit netip.Addr) ([]netip.
 				continue
 			}
 			if addr == explicit {
-				return []netip.Addr{addr}, nil
+				return []netip.Addr{addr}, nil, nil
 			}
-			if iface.Loopback {
+			if iface.Loopback || seen[addr] {
 				continue
 			}
+			seen[addr] = true
 			family := 0
 			if addr.Is6() {
 				family = 1
@@ -186,22 +268,30 @@ func fastHopDestinations(ifaces []SetupInterface, explicit netip.Addr) ([]netip.
 		}
 	}
 	if explicit.IsValid() {
-		return nil, errors.New("Fast hop address must be assigned to this server")
+		return nil, nil, errors.New("Fast hop address must be assigned to this server")
 	}
 	var destinations []netip.Addr
+	var warnings []string
 	for family, addrs := range public {
 		if len(addrs) == 0 {
 			addrs = private[family]
 		}
-		if len(addrs) > 1 {
-			return nil, errors.New("multiple local Fast addresses; specify a Fast hop address")
+		switch len(addrs) {
+		case 0:
+		case 1:
+			destinations = append(destinations, addrs[0])
+		default:
+			name := [2]string{"IPv4", "IPv6"}[family]
+			warnings = append(warnings, fmt.Sprintf("skipping %s Fast hopping (multiple %s addresses); pass --fast-hop-address to pin one", name, name))
 		}
-		destinations = append(destinations, addrs...)
 	}
 	if len(destinations) == 0 {
-		return nil, errors.New("no local Fast hop address")
+		if len(warnings) != 0 {
+			return nil, warnings, errors.New("multiple local Fast addresses; specify a Fast hop address")
+		}
+		return nil, nil, errors.New("no local Fast hop address")
 	}
-	return destinations, nil
+	return destinations, warnings, nil
 }
 
 func (r *setupRun) probePort(b setupBinding) error {

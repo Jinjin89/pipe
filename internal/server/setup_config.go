@@ -61,10 +61,15 @@ type SetupRescue struct {
 	Key  string `json:"key,omitempty"`
 }
 
-// LoadSetupConfig reads the JSON before flag overrides. Paths in the file are
-// relative to the file's directory. A config file implies noninteractive setup.
+// LoadSetupConfig reads the JSON as the invoking setup operator.
 func LoadSetupConfig(path string) (SetupOptions, error) {
-	data, err := readSetupConfigInput(path)
+	return LoadSetupConfigForOperator(path, "")
+}
+
+// LoadSetupConfigForOperator resolves operator before opening the JSON. Paths
+// in the file are relative to its directory. A config implies noninteractive setup.
+func LoadSetupConfigForOperator(path, operator string) (SetupOptions, error) {
+	data, configOperatorUID, err := readSetupConfigInput(path, operator)
 	if err != nil {
 		return SetupOptions{}, err
 	}
@@ -107,21 +112,42 @@ func LoadSetupConfig(path string) (SetupOptions, error) {
 	if r := cfg.Rescue; r != nil {
 		r.Cert, r.Key = resolve(r.Cert), resolve(r.Key)
 	}
-	return SetupOptions{SetupConfig: cfg, FromConfig: true, Yes: true}, nil
+	return SetupOptions{
+		SetupConfig: cfg, FromConfig: true, Yes: true, Operator: operator,
+		configOperatorUID: configOperatorUID,
+	}, nil
 }
 
-func readSetupConfigInput(path string) ([]byte, error) {
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
-		return localfile.Read(path, maxSetupConfigBytes, false)
+func readSetupConfigInput(path, operator string) ([]byte, uint32, error) {
+	privileged := runtime.GOOS == "linux" && os.Geteuid() == 0
+	pipeUID := noSetupPipeUID
+	if privileged || operator != "" {
+		uid, _, found, err := lookupPipeUser()
+		if err != nil {
+			return nil, 0, err
+		}
+		if found {
+			pipeUID = uid
+		}
 	}
-	uid, _, found, err := lookupPipeUser()
+	operatorUID, err := resolveSetupOperator(operator, pipeUID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if !found {
-		uid = ^uint32(0)
+	if !privileged {
+		data, err := localfile.Read(path, maxSetupConfigBytes, false)
+		return data, 0, err
 	}
-	return readSetupOperatorFile(path, uid, maxSetupConfigBytes, false)
+	f, operatorOwned, err := openSetupOperatorFile(path, pipeUID, operatorUID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	data, err := readBoundedSetupFile(f, maxSetupConfigBytes, false)
+	if !operatorOwned {
+		operatorUID = 0
+	}
+	return data, operatorUID, err
 }
 
 func oldSetupFormat(path string) error {

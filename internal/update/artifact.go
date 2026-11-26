@@ -19,17 +19,27 @@ type artifact struct {
 
 var errUnsafeDirectory = errors.New("The update directory must have private, protected ancestors.")
 
-func (c releaseClient) download(ctx context.Context, rel release, dir string) (artifact, error) {
+var errAssetMismatch = errors.New("The archive does not match the signed release.")
+
+func (c releaseClient) assetBody(ctx context.Context, rel *release) (io.ReadCloser, error) {
 	resp, err := c.get(ctx, rel.url)
+	if err != nil {
+		return nil, err
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != rel.asset.length {
+		resp.Body.Close()
+		return nil, errAssetMismatch
+	}
+	return resp.Body, nil
+}
+
+func (c releaseClient) download(ctx context.Context, rel release, dir string) (artifact, error) {
+	body, err := c.assetBody(ctx, &rel)
 	if err != nil {
 		return artifact{}, err
 	}
-	defer resp.Body.Close()
-	badBytes := errors.New("The downloaded file does not match the signed release.")
+	defer body.Close()
 	saveFailed := errors.New("Could not save the verified update.")
-	if resp.ContentLength >= 0 && resp.ContentLength != rel.asset.length {
-		return artifact{}, badBytes
-	}
 	if err := privateDir(dir); err != nil {
 		return artifact{}, saveFailed
 	}
@@ -53,17 +63,15 @@ func (c releaseClient) download(ctx context.Context, rel release, dir string) (a
 		return artifact{}, saveFailed
 	}
 	defer file.Close()
-	digest := sha256.New()
-	n, err := io.Copy(io.MultiWriter(file, digest), io.LimitReader(resp.Body, rel.asset.length+1))
-	if err != nil {
+	if err := rel.asset.copyVerified(ctx, file, body); err != nil {
+		if errors.Is(err, errAssetMismatch) || ctx.Err() != nil {
+			return artifact{}, err
+		}
 		var localError *os.PathError
 		if errors.As(err, &localError) {
 			return artifact{}, saveFailed
 		}
 		return artifact{}, errors.New("The download ended before verification could finish.")
-	}
-	if !rel.asset.matches(n, digest.Sum(nil)) {
-		return artifact{}, badBytes
 	}
 	if err := file.Sync(); err != nil {
 		return artifact{}, saveFailed
@@ -83,6 +91,18 @@ func (c releaseClient) download(ctx context.Context, rel release, dir string) (a
 	}
 	complete = true
 	return artifact{handle: handle, path: final}, nil
+}
+
+func (a asset) copyVerified(ctx context.Context, dst io.Writer, src io.Reader) error {
+	hash := sha256.New()
+	n, err := io.Copy(io.MultiWriter(dst, hash), io.LimitReader(artifactReader{ctx: ctx, Reader: src}, a.length+1))
+	if err != nil {
+		return err
+	}
+	if !a.matches(n, hash.Sum(nil)) {
+		return errAssetMismatch
+	}
+	return ctx.Err()
 }
 
 func (a asset) matches(length int64, digest []byte) bool {
@@ -149,9 +169,7 @@ func (a asset) checkBytes(ctx context.Context, path string) bool {
 	if err != nil || !os.SameFile(info, opened) {
 		return false
 	}
-	hash := sha256.New()
-	n, err := io.Copy(hash, io.LimitReader(artifactReader{ctx: ctx, Reader: f}, a.length+1))
-	return err == nil && a.matches(n, hash.Sum(nil))
+	return a.copyVerified(ctx, io.Discard, f) == nil
 }
 
 func privateDir(path string) error {
@@ -202,5 +220,16 @@ func inspectDirectory(path string, create, private bool) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errUnsafeDirectory
 	}
-	return checkDirectory(path, info, private)
+	err = checkDirectory(path, info, private)
+	if err != nil && private && !create {
+		// A read-only system check must distinguish inaccessible state from
+		// a readable directory with unsafe ownership or permissions.
+		dir, accessErr := os.Open(path)
+		if accessErr == nil {
+			dir.Close()
+		} else if errors.Is(accessErr, os.ErrPermission) {
+			return accessErr
+		}
+	}
+	return err
 }

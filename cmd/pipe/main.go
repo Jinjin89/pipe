@@ -33,7 +33,7 @@ func run(ctx context.Context, args []string) error {
 		args = []string{defaultCommand}
 	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprintln(os.Stderr, "Usage: pipe app [--background | --no-window | --install-desktop-entry]\n       pipe helper <install | remove | status | run>\n       pipe run <link | pipe.yaml> [--relay <code>] [options]\n       pipe server <setup | init | add | revoke | list | run | install | uninstall | proxy | rescue | reality | relay-command> [options]\n       pipe relay <add | remove | status | apply> [options]\n       pipe version")
+		fmt.Fprintln(os.Stderr, "Usage: pipe app [--background | --no-window | --install-desktop-entry]\n       pipe helper <install | remove | status | run>\n       pipe run <link | pipe.yaml> [--relay <code>] [options]\n       pipe server <setup | init | add | revoke | list | run | install | uninstall | proxy | rescue | reality | relay-command> [options]\n       pipe relay <add | remove | status | apply> [options]\n       pipe update [--check] [--from PATH | --proxy URL]\n       pipe version")
 		return nil
 	}
 	switch args[0] {
@@ -47,6 +47,8 @@ func run(ctx context.Context, args []string) error {
 		return runServer(ctx, args[1:])
 	case "relay":
 		return runRelay(ctx, args[1:])
+	case "update":
+		return runUpdate(ctx, args[1:])
 	case "version", "--version":
 		fmt.Println("pipe", version.Version)
 		return nil

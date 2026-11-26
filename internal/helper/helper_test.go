@@ -20,6 +20,7 @@ import (
 	"pipe/internal/config"
 	"pipe/internal/link"
 	"pipe/internal/logring"
+	"pipe/internal/version"
 )
 
 func testProfile() link.Profile {
@@ -921,6 +922,49 @@ func TestInstallAndRemoveFiles(t *testing.T) {
 	remove(e, "linux")
 	if _, err := os.Stat(filepath.Dir(e.paths.Owner)); err == nil {
 		t.Fatal("empty owner dir remains")
+	}
+}
+
+func TestInstallChecksInstalledHelperRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name, installed string
+		newer           bool
+	}{
+		{"newer", "9999.0.0-alpha", true},
+		{"older", "0.0.1-alpha", false},
+		{"same", version.Version, false},
+		{"unmarked", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, cmds, _ := fakeEnv(t)
+			if err := install(e, "linux", 1000); err != nil {
+				t.Fatal(err)
+			}
+			prefix := strings.TrimSuffix(version.ReleaseIdentity, version.Version+"\x00")
+			installed := "fixture installed helper"
+			if tc.installed != "" {
+				installed += prefix + tc.installed + "\x00"
+			}
+			if err := os.WriteFile(e.paths.Binary, []byte(installed), 0755); err != nil {
+				t.Fatal(err)
+			}
+			*cmds = nil
+			wantBinary, wantOwner := "binary", "1001\n"
+			err := install(e, "linux", 1001)
+			if tc.newer {
+				if !errors.Is(err, ErrNewer) || len(*cmds) != 0 {
+					t.Fatalf("downgrade returned %v and ran %v", err, *cmds)
+				}
+				wantBinary, wantOwner = installed, "1000\n"
+			} else if err != nil {
+				t.Fatalf("eligible install failed: %v", err)
+			}
+			for path, want := range map[string]string{e.paths.Binary: wantBinary, e.paths.Owner: wantOwner} {
+				if got, err := os.ReadFile(path); err != nil || string(got) != want {
+					t.Errorf("%s = %q, %v, want %q", path, got, err, want)
+				}
+			}
+		})
 	}
 }
 

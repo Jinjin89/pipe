@@ -13,9 +13,11 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -479,6 +481,42 @@ func TestSetupReusesRootOwnedHopSettings(t *testing.T) {
 	}
 }
 
+func TestSetupPreservesPinnedFastAddress(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("requires a root-owned hop unit")
+	}
+	h := newSetupHarness(t, "")
+	h.exists = true
+	h.ifaces[1].Addrs = append(h.ifaces[1].Addrs, netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"))
+	opts := setupConfigOptions(t, `{"sni":"origin.example","fast":{"port":2443,"hop":"20000-20010","address":"2001:db8::2"}}`)
+	must(t, h.run(opts))
+	path := h.env.path(filepath.Join(setupUnitDir, hopServiceUnit))
+	before, err := os.ReadFile(path)
+	must(t, err)
+	if !strings.Contains(string(before), `--address "2001:db8::2"`) {
+		t.Fatalf("setup failed to write the pin to the hop unit: %s", before)
+	}
+	opts.Fast.Address = ""
+	must(t, h.run(opts))
+	after, err := os.ReadFile(path)
+	must(t, err)
+	if !slices.Equal(before, after) {
+		t.Fatalf("setup changed the pinned hop unit: %s", after)
+	}
+
+	r := setupRun{SetupEnv: h.env, uid: 990}
+	for _, want := range []SetupFast{
+		{Hop: "20000-20011", Port: 2443},
+		{Hop: "20000-20010", Port: 2444},
+		{Hop: "20000-20010", Port: 2443, Address: "2001:db8::1"},
+	} {
+		fast, err := r.authorizedSetupFast(want)
+		if err != nil || fast != want {
+			t.Fatalf("authorized settings for %+v = %+v, %v", want, fast, err)
+		}
+	}
+}
+
 func TestSetupChecksHopSettingsAfterChildCommits(t *testing.T) {
 	h := newSetupHarness(t, "")
 	h.exists = true
@@ -937,8 +975,8 @@ func TestSetupStagesUnderOpenedDirectory(t *testing.T) {
 	must(t, os.Rename(dir, saved))
 	must(t, os.Symlink(outside, dir))
 
-	r := setupRun{SetupEnv: h.env, uid: 990, gid: 990, opts: SetupOptions{Dir: "/state"}, state: state}
-	staged, err := r.stage("/operator-credential", 4096, true)
+	r := setupRun{SetupEnv: h.env, uid: 990, gid: 990, operatorUID: trustedSetupOperator(), opts: SetupOptions{Dir: "/state"}, state: state}
+	staged, err := r.stage("/operator-credential", 4096, true, false)
 	must(t, err)
 	name := filepath.Base(staged)
 	body, err := os.ReadFile(filepath.Join(saved, name))
@@ -948,6 +986,102 @@ func TestSetupStagesUnderOpenedDirectory(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(outside, name)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged a credential in the symlink target: %v", err)
+	}
+}
+
+func TestResolveSetupOperator(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("setup operator resolution targets Linux")
+	}
+	account, err := user.Current()
+	must(t, err)
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	must(t, err)
+	resolved, err := resolveSetupOperator(account.Username, noSetupPipeUID)
+	if err != nil || resolved != uint32(uid) {
+		t.Fatalf("resolved %q to UID %d, error = %v", account.Username, resolved, err)
+	}
+	if _, err := resolveSetupOperator(account.Username, resolved); err == nil || !strings.Contains(err.Error(), "cannot be user pipe") {
+		t.Fatalf("operator with the service UID was accepted: %v", err)
+	}
+	var unknown user.UnknownUserError
+	if _, err := resolveSetupOperator("pipe-test-unknown-operator", noSetupPipeUID); !errors.As(err, &unknown) {
+		t.Fatalf("unknown operator error = %v", err)
+	}
+	if os.Getuid() == 0 {
+		t.Setenv("SUDO_UID", "65530")
+		resolved, err := resolveSetupOperator("", noSetupPipeUID)
+		if err != nil || resolved != 65530 {
+			t.Fatalf("SUDO_UID operator = %d, error = %v", resolved, err)
+		}
+	}
+}
+
+func TestSetupNamedOperatorConfigAndLink(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Getuid() != 0 || os.Geteuid() != 0 {
+		t.Skip("requires Linux root to set the fixture owner")
+	}
+	account, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skipf("requires a non-root fixture account: %v", err)
+	}
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	must(t, err)
+	if uid == 0 {
+		t.Skip("requires a non-root fixture account")
+	}
+	pipeUID, _, found, err := lookupPipeUser()
+	must(t, err)
+	if found && uint32(uid) == pipeUID {
+		t.Skip("fixture account shares the Pipe service UID")
+	}
+	t.Setenv("SUDO_UID", "")
+	h := newSetupHarness(t, "")
+	h.exists = true
+	dir := h.env.path("/operator")
+	must(t, os.Mkdir(dir, 0700))
+	must(t, os.Chown(dir, int(uid), -1))
+	path := filepath.Join(dir, "setup.json")
+	must(t, os.WriteFile(path, []byte(`{"sni":"origin.example","device":"fixture"}`), 0600))
+	must(t, os.Chown(path, int(uid), -1))
+	if _, err := LoadSetupConfig(path); err == nil {
+		t.Fatal("root setup without an operator accepted the operator-owned parent")
+	}
+	opts, err := LoadSetupConfigForOperator(path, account.Username)
+	must(t, err)
+	if opts.Operator != account.Username || opts.configOperatorUID != uint32(uid) {
+		t.Fatalf("config did not retain the operator identity: %+v", opts)
+	}
+	opts.Dir = "/operator/state"
+	opts.LinkFile = "/operator/device.link"
+	err = h.run(opts)
+	want := fmt.Sprintf("%q must be owned by root or the setup operator", dir)
+	if err == nil || !strings.Contains(err.Error(), want) || len(h.cmds) != 0 {
+		t.Fatalf("operator-owned state parent returned %v, commands %v", err, h.argvs())
+	}
+	if _, err := os.Lstat(h.env.path(opts.Dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state path after refusal: %v", err)
+	}
+	opts.Dir = "/root-state"
+	must(t, h.run(opts))
+	info, err := os.Stat(h.env.path(opts.LinkFile))
+	must(t, err)
+	owner, ok := setupFileOwner(info)
+	if !ok || owner != uint32(uid) || info.Mode().Perm() != 0600 {
+		t.Fatalf("link owner or mode is incorrect: UID %d, mode %s", owner, info.Mode())
+	}
+}
+
+func TestSetupUnprotectedExecutableHint(t *testing.T) {
+	h := newSetupHarness(t, "")
+	h.env.Executable = "/opt/pipe build's $file/pipe"
+	cause := errors.New("unsafe executable path")
+	h.env.openImage = func(string) (*os.File, error) { return nil, cause }
+	err := h.run(SetupOptions{Yes: true})
+	want := "start setup from a root-owned, protected Pipe executable: unsafe executable path\n" +
+		`Run: install -m 0755 -o root -g root '/opt/pipe build'\''s $file/pipe' /usr/local/bin/pipe && /usr/local/bin/pipe server setup ...`
+	if !errors.Is(err, cause) || err.Error() != want || len(h.cmds) != 0 {
+		t.Fatalf("unprotected executable error = %v, commands = %v", err, h.argvs())
 	}
 }
 
@@ -1277,6 +1411,7 @@ func TestSetupRefusesForeignPorts(t *testing.T) {
 func TestSetupRejectsOccupiedFastHopPortBeforeChanges(t *testing.T) {
 	h := newSetupHarness(t, "")
 	h.env.occupiedUDPPorts = func() ([]uint16, error) { return []uint16{31001}, nil }
+	h.env.readPortSysctl = testPortSysctls("32768\t60999\n", "\n", "")
 	h.env.probeBinding = func(b setupBinding) error {
 		if b.network == "udp4" && b.port == 31001 {
 			return syscall.EADDRINUSE
@@ -1296,9 +1431,142 @@ func TestFastHopScopeUsesExternalInterfaceAddresses(t *testing.T) {
 	loop := netip.MustParseAddr("11.0.0.80")
 	local := netip.MustParseAddr("10.0.0.2")
 	ifaces := []SetupInterface{{Loopback: true, Addrs: []netip.Addr{loop}}, {Addrs: []netip.Addr{local}}}
-	addresses, err := fastHopDestinations(ifaces, netip.Addr{})
-	if err != nil || !slices.Equal(addresses, []netip.Addr{local}) {
-		t.Fatalf("hop addresses = %v, error = %v", addresses, err)
+	addresses, warnings, err := fastHopDestinations(ifaces, netip.Addr{})
+	if err != nil || len(warnings) != 0 || !slices.Equal(addresses, []netip.Addr{local}) {
+		t.Fatalf("hop addresses = %v, warnings = %v, error = %v", addresses, warnings, err)
+	}
+	addresses, warnings, err = fastHopDestinations(ifaces, loop)
+	if err != nil || len(warnings) != 0 || !slices.Equal(addresses, []netip.Addr{loop}) {
+		t.Fatalf("pinned loopback-interface address = %v, warnings = %v, error = %v", addresses, warnings, err)
+	}
+	unassigned := netip.MustParseAddr("203.0.113.99")
+	if _, _, err := fastHopDestinations(ifaces, unassigned); err == nil || err.Error() != "Fast hop address must be assigned to this server" {
+		t.Fatalf("unassigned pin error = %v", err)
+	}
+}
+
+func TestFastHopDestinationsSelectUnambiguousFamilies(t *testing.T) {
+	v4 := netip.MustParseAddr("203.0.113.7")
+	v6 := netip.MustParseAddr("2001:db8::1")
+	severalV6 := []netip.Addr{v4}
+	for i := 1; i <= 6; i++ {
+		severalV6 = append(severalV6, netip.MustParseAddr(fmt.Sprintf("2001:db8::%d", i)))
+	}
+	const (
+		warnV4 = "skipping IPv4 Fast hopping (multiple IPv4 addresses); pass --fast-hop-address to pin one"
+		warnV6 = "skipping IPv6 Fast hopping (multiple IPv6 addresses); pass --fast-hop-address to pin one"
+	)
+	for _, tc := range []struct {
+		name         string
+		ifaces       []SetupInterface
+		destinations []netip.Addr
+		warnings     []string
+		err          string
+	}{
+		{
+			name: "single IPv4 and six IPv6 addresses", ifaces: []SetupInterface{{Addrs: severalV6}},
+			destinations: []netip.Addr{v4}, warnings: []string{warnV6},
+		},
+		{
+			name:     "both families ambiguous",
+			ifaces:   []SetupInterface{{Addrs: []netip.Addr{v4, netip.MustParseAddr("203.0.113.8"), v6, netip.MustParseAddr("2001:db8::2")}}},
+			warnings: []string{warnV4, warnV6}, err: "multiple local Fast addresses; specify a Fast hop address",
+		},
+		{
+			name: "deduplicate and prefer public addresses",
+			ifaces: []SetupInterface{
+				{Addrs: []netip.Addr{v4, netip.MustParseAddr("10.0.0.1"), v6}},
+				{Addrs: []netip.Addr{netip.MustParseAddr("::ffff:203.0.113.7"), netip.MustParseAddr("10.0.0.2"), v6}},
+			},
+			destinations: []netip.Addr{v4, v6},
+		},
+		{
+			name: "no eligible addresses", ifaces: []SetupInterface{{Addrs: []netip.Addr{netip.MustParseAddr("fe80::1")}}},
+			err: "no local Fast hop address",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addresses, warnings, err := fastHopDestinations(tc.ifaces, netip.Addr{})
+			if tc.err == "" && err != nil || tc.err != "" && (err == nil || err.Error() != tc.err) ||
+				!slices.Equal(addresses, tc.destinations) || !slices.Equal(warnings, tc.warnings) {
+				t.Fatalf("hop addresses = %v, warnings = %v, error = %v", addresses, warnings, err)
+			}
+		})
+	}
+}
+
+func testPortSysctls(allocation, reserved, unreadable string) func(string) ([]byte, error) {
+	return func(path string) ([]byte, error) {
+		if path != unreadable {
+			switch path {
+			case ipLocalPortRange:
+				return []byte(allocation), nil
+			case ipLocalReservedPorts:
+				return []byte(reserved), nil
+			}
+		}
+		return nil, os.ErrPermission
+	}
+}
+
+func TestCheckHopPortsEphemeralConflicts(t *testing.T) {
+	const allocation = "32768\t60999\n"
+	address := netip.MustParseAddr("203.0.113.7")
+	for _, tc := range []struct {
+		name, allocation, reserved, unreadable string
+		port                                   uint16
+		probeErr                               error
+		warn                                   bool
+	}{
+		{name: "unreserved first port", allocation: allocation, port: 32768, probeErr: syscall.EADDRINUSE, warn: true},
+		{name: "unreserved last port", allocation: allocation, reserved: "0-1023,32768,40000-40002\n", port: 60999, probeErr: syscall.EADDRINUSE, warn: true},
+		{name: "reserved port", allocation: allocation, reserved: "33000,40000-40002\n", port: 33000, probeErr: syscall.EADDRINUSE},
+		{name: "reserved range", allocation: allocation, reserved: "33000,40000-40002\n", port: 40002, probeErr: syscall.EADDRINUSE},
+		{name: "outside ephemeral range", allocation: allocation, port: 32767, probeErr: syscall.EADDRINUSE},
+		{name: "allocation unreadable", allocation: allocation, unreadable: ipLocalPortRange, port: 33000, probeErr: syscall.EADDRINUSE},
+		{name: "reservations unreadable", allocation: allocation, unreadable: ipLocalReservedPorts, port: 33000, probeErr: syscall.EADDRINUSE},
+		{name: "malformed allocation", allocation: "32768 65536\n", port: 33000, probeErr: syscall.EADDRINUSE},
+		{name: "malformed reservations", allocation: allocation, reserved: "33001,40002-40000\n", port: 33000, probeErr: syscall.EADDRINUSE},
+		{name: "other bind error", allocation: allocation, port: 33000, probeErr: syscall.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			occupied := func() ([]uint16, error) { return []uint16{tc.port}, nil }
+			probe := func(b setupBinding) error {
+				if b.address != address || b.port != tc.port || b.network != "udp4" {
+					t.Fatalf("expected a scoped UDP probe, got %+v", b)
+				}
+				return fmt.Errorf("bind: %w", tc.probeErr)
+			}
+			warnings, err := checkHopPorts("20000-61000", 443, []netip.Addr{address}, occupied, probe,
+				testPortSysctls(tc.allocation, tc.reserved, tc.unreadable))
+			if tc.warn {
+				want := fmt.Sprintf("Fast hop UDP port %d on %s is currently in use within the local ephemeral port range; live local sockets stay exempted", tc.port, address)
+				if err != nil || !slices.Equal(warnings, []string{want}) {
+					t.Fatalf("warnings = %v, error = %v", warnings, err)
+				}
+			} else if !errors.Is(err, tc.probeErr) || len(warnings) != 0 {
+				t.Fatalf("warnings = %v, error = %v, want %v", warnings, err, tc.probeErr)
+			}
+		})
+	}
+}
+
+func TestSetupWarnsAndContinuesFastHopping(t *testing.T) {
+	h := newSetupHarness(t, "")
+	h.ifaces[1].Addrs = append(h.ifaces[1].Addrs, netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"))
+	h.env.occupiedUDPPorts = func() ([]uint16, error) { return []uint16{33001}, nil }
+	h.env.readPortSysctl = testPortSysctls("32768\t60999\n", "\n", "")
+	h.env.probeBinding = func(b setupBinding) error {
+		if b.network == "udp4" && b.port == 33001 {
+			return syscall.EADDRINUSE
+		}
+		return nil
+	}
+	must(t, h.run(setupConfigOptions(t, `{"sni":"origin.example","fast":{"hop":"33000-33002"}}`)))
+	for _, want := range []string{"Warning: skipping IPv6 Fast hopping", "Warning: Fast hop UDP port 33001 on 203.0.113.7"} {
+		if !strings.Contains(h.out.String(), want) {
+			t.Fatalf("missing %q in setup output: %s", want, h.out.String())
+		}
 	}
 }
 
@@ -1335,7 +1603,8 @@ func TestHopPreflightUsesKernelAddressAndWildcardScope(t *testing.T) {
 			defer listener.Close()
 			port := listener.LocalAddr().(*net.UDPAddr).Port
 			destination := netip.MustParseAddr("127.0.0.1")
-			err = checkHopPorts(fmt.Sprintf("%d-%d", port, port+1), 443, []netip.Addr{destination}, occupiedUDPPorts, probeSetupBinding)
+			_, err = checkHopPorts(fmt.Sprintf("%d-%d", port, port+1), 443, []netip.Addr{destination}, occupiedUDPPorts, probeSetupBinding,
+				testPortSysctls("", "", ipLocalPortRange))
 			if fixture.blocked && !errors.Is(err, syscall.EADDRINUSE) || !fixture.blocked && err != nil {
 				t.Fatalf("preflight for %s: %v", fixture.host, err)
 			}

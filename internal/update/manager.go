@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type Manager struct {
 	mu           sync.Mutex
 	dir          string
 	target       Target
+	key          ed25519.PublicKey
 	stateFile    string
 	loadErr      error
 	status       Status
@@ -58,7 +60,7 @@ type artifactVerifier func(asset, context.Context, string, string) bool
 func newManager(installed string, target Target, dir string, key ed25519.PublicKey, verify artifactVerifier) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		dir: dir, target: target, ctx: ctx, cancel: cancel,
+		dir: dir, target: target, key: key, ctx: ctx, cancel: cancel,
 		status: Status{Installed: installed, State: "idle"}, restored: make(chan struct{}),
 		makeClient: func(ctx context.Context, dial DialFunc) (releaseClient, *http.Transport) {
 			transport := releaseTransport(ctx, dial)
@@ -67,7 +69,7 @@ func newManager(installed string, target Target, dir string, key ed25519.PublicK
 	}
 	m.directCtx, m.cancelDirect = context.WithCancel(m.ctx)
 	if v, ok := parseVersion(installed); ok && target.filename() != "" {
-		m.stateFile = "verified-" + v.channel + "-" + target.OS + "-" + target.ABI + ".json"
+		m.stateFile = stateFilename(v.channel, target)
 		var handle string
 		if abs, err := filepath.Abs(dir); err == nil {
 			m.dir = abs
@@ -351,10 +353,11 @@ func (m *Manager) Resolve(handle string) (string, error) {
 		m.mu.Unlock()
 		return "", errors.New("The verified download is unavailable.")
 	}
-	path, expected := m.file.path, m.release.asset
+	path, selected := m.file.path, *m.release
 	m.mu.Unlock()
 
-	valid := expected.checkFile(m.ctx, m.dir, path)
+	valid := selected.asset.checkFile(m.ctx, m.dir, path)
+	floorErr := m.verifyFloor(&selected)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if handle != m.file.handle || m.ctx.Err() != nil {
@@ -364,12 +367,80 @@ func (m *Manager) Resolve(handle string) (string, error) {
 		err := errors.New("The verified download is missing or has changed.")
 		m.file, m.status.Artifact = artifact{}, ""
 		if m.save(m.release, m.file, m.viaTunnel) == nil {
-			removeStage(m.dir, handle, expected.name)
+			removeStage(m.dir, handle, selected.asset.name)
 		}
 		if !m.busy() {
 			m.fail(err)
 		}
 		return "", err
 	}
+	if floorErr != nil {
+		return "", floorErr
+	}
 	return path, nil
+}
+
+// ExtractVerifiedLinuxBinary re-verifies the downloaded artifact referenced by
+// handle and extracts the verified Linux pipe executable into a private file.
+func (m *Manager) ExtractVerifiedLinuxBinary(handle string) (*os.File, string, func(), error) {
+	if m.target.OS != "linux" {
+		return nil, "", nil, errors.New("In-place installation is only available on Linux.")
+	}
+	unavailable := errors.New("The verified download is unavailable.")
+	m.mu.Lock()
+	if handle == "" || handle != m.file.handle || m.release == nil || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return nil, "", nil, unavailable
+	}
+	file, selected := m.file, *m.release
+	m.mu.Unlock()
+	stage := filepath.Dir(file.path)
+	if !protectedStage(m.dir, stage) {
+		return nil, "", nil, unavailable
+	}
+	source, err := openLocalSourceDir(stage)
+	if err != nil {
+		return nil, "", nil, unavailable
+	}
+	defer source.Close()
+	archive, _, err := source.OpenRegular(selected.asset.name)
+	if err != nil {
+		return nil, "", nil, unavailable
+	}
+	defer archive.Close()
+	path, discard, err := stageCLIAsset(m.ctx, m.dir, selected.asset, archive)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	bin, cleanup, err := ExtractLinuxBinary(path, m.target.ABI, selected.version, filepath.Dir(path))
+	if err != nil {
+		discard()
+		return nil, "", nil, err
+	}
+	floorErr := m.verifyFloor(&selected)
+	m.mu.Lock()
+	valid := handle == m.file.handle && m.release.same(&selected) && m.ctx.Err() == nil
+	m.mu.Unlock()
+	if floorErr != nil || !valid {
+		cleanup()
+		discard()
+		if floorErr != nil {
+			return nil, "", nil, floorErr
+		}
+		return nil, "", nil, unavailable
+	}
+	return bin, selected.version, func() {
+		cleanup()
+		discard()
+	}, nil
+}
+
+func (m *Manager) verifyFloor(selected *release) error {
+	ver, _ := parseVersion(selected.version)
+	state := releaseState{dir: m.dir, channel: ver.channel, target: m.target, key: m.key}
+	floor, err := state.load()
+	if err != nil {
+		return errStateRead
+	}
+	return selected.checkFloor(floor)
 }

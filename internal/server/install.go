@@ -225,11 +225,19 @@ func setHopTable(ctx context.Context, ports string, fast uint16, address ...neti
 		if len(address) != 0 {
 			explicit = address[0]
 		}
-		destinations, err = fastHopDestinations(ifaces, explicit)
+		var warnings []string
+		destinations, warnings, err = fastHopDestinations(ifaces, explicit)
+		for _, warning := range warnings {
+			fmt.Fprintf(os.Stderr, "Warning: %s.\n", warning)
+		}
 		if err != nil {
 			return err
 		}
-		if err := checkHopPorts(ports, fast, destinations, occupiedUDPPorts, probeSetupBinding); err != nil {
+		warnings, err = checkHopPorts(ports, fast, destinations, occupiedUDPPorts, probeSetupBinding, nil)
+		for _, warning := range warnings {
+			fmt.Fprintf(os.Stderr, "Warning: %s.\n", warning)
+		}
+		if err != nil {
 			return err
 		}
 	}

@@ -1479,6 +1479,32 @@ func TestNeedHelperSavesNothing(t *testing.T) {
 	}
 }
 
+func TestNewerHelperRequiresAppUpdate(t *testing.T) {
+	e, h := newTUNEnv(t, helper.StateNewer)
+	h.imu.Lock()
+	h.installE = helper.ErrNewer
+	h.imu.Unlock()
+	for _, request := range []struct{ method, path, body string }{
+		{http.MethodPut, "/api/settings", `{"tun":true}`},
+		{http.MethodPost, "/api/helper/install", ""},
+	} {
+		resp, body := e.api(request.method, request.path, request.body)
+		if resp.StatusCode != http.StatusConflict || body["code"] != "helperNewer" || body["error"] != helper.ErrNewer.Error() {
+			t.Fatalf("%s = %d %v", request.path, resp.StatusCode, body)
+		}
+	}
+	if e.srv.Settings().TUN {
+		t.Fatal("enabled TUN with a newer Helper")
+	}
+
+	h.mu.Lock()
+	h.state = clientctl.StateError
+	h.mu.Unlock()
+	if _, status := e.api(http.MethodGet, "/api/status", ""); status["via"] != viaTUN {
+		t.Fatalf("an indeterminate newer Helper lost TUN ownership: %v", status)
+	}
+}
+
 func TestInstallCanceledAndRemove(t *testing.T) {
 	e, h := newTUNEnv(t, helper.StateMissing)
 	h.installE = helper.ErrCanceled

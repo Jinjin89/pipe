@@ -46,6 +46,8 @@ type Config struct {
 
 	probeProfile  func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult
 	copySensitive func(string) error
+	extractUpdate func(string) (*os.File, string, func(), error)
+	applyPortable func(*os.File, string) error
 }
 
 // Server is the local HTTP API and static UI.
@@ -57,13 +59,14 @@ type Server struct {
 	updates  *desktopUpdates
 	host     atomic.Value // "127.0.0.1:PORT"
 
-	mu           sync.Mutex // serializes connect/disconnect and proxy state
-	closed       bool
-	proxyOn      bool
-	proxyErr     string
-	proxyRestore proxyRestoreAction
-	via          atomic.Value // "", "proxy" or "tun": which controller owns the session; written under mu
-	changes      chan struct{}
+	mu            sync.Mutex // serializes connect/disconnect and proxy state
+	closed        bool
+	proxyOn       bool
+	proxyErr      string
+	proxyRestore  proxyRestoreAction
+	appliedUpdate string       // version installed for the next launch
+	via           atomic.Value // "", "proxy" or "tun": which controller owns the session; written under mu
+	changes       chan struct{}
 
 	profileTests     map[string]bool           // saved names with probes in flight, true for invalidated results, under mu
 	profileTestDone  chan struct{}             // closed and replaced when a probe releases its slot, under mu
@@ -188,7 +191,7 @@ func (s *Server) reattachTUNLocked() (clientctl.Status, bool) {
 	if !st.Guarded && !running(st) {
 		// An installed Helper with indeterminate status can still own capture.
 		switch h.Info().State {
-		case helper.StateOK, helper.StateOutdated, helper.StateError:
+		case helper.StateOK, helper.StateOutdated, helper.StateNewer, helper.StateError:
 		default:
 			return st, false
 		}
@@ -270,6 +273,7 @@ func (s *Server) Handler() http.Handler {
 	api("POST", "/api/updates/check", s.checkUpdate)
 	api("POST", "/api/updates/download", s.downloadUpdate)
 	api("POST", "/api/updates/reveal", s.revealUpdate)
+	api("POST", "/api/updates/apply", s.applyUpdate)
 	api("GET", "/api/logs", s.getLogs)
 	api("DELETE", "/api/logs", func(*http.Request) (any, error) { s.cfg.Logs.Clear(); return nil, nil })
 	api("GET", "/api/helper", func(*http.Request) (any, error) { return s.helperInfo(), nil })
@@ -425,9 +429,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, err error) {
 	var ae *apiError
 	if !errors.As(err, &ae) {
-		if errors.Is(err, helper.ErrOutdated) {
+		switch {
+		case errors.Is(err, helper.ErrOutdated):
 			ae = &apiError{status: http.StatusConflict, msg: err.Error(), code: "needHelper"}
-		} else {
+		case errors.Is(err, helper.ErrNewer):
+			ae = &apiError{status: http.StatusConflict, msg: err.Error(), code: "helperNewer"}
+		default:
 			ae = &apiError{status: http.StatusInternalServerError, msg: friendly(err)}
 		}
 	}
@@ -653,7 +660,7 @@ func (s *Server) connectLocked() (any, error) {
 			} else {
 				s.holdHelperSession(st)
 			}
-			if errors.Is(err, helper.ErrOutdated) {
+			if errors.Is(err, helper.ErrOutdated) || errors.Is(err, helper.ErrNewer) {
 				return nil, err
 			}
 			return nil, &apiError{status: http.StatusBadGateway, msg: friendly(err)}
@@ -683,14 +690,17 @@ func (s *Server) connectLocked() (any, error) {
 	return s.statusLocked(), nil
 }
 
-// needHelper is a 409 needHelper unless Pipe Helper is installed and current.
+// needHelper reports which component needs an update when the Helper is incompatible.
 func (s *Server) needHelper() error {
 	if s.cfg.Helper == nil {
 		return bad("TUN isn't available on this system yet.")
 	}
 	info := s.cfg.Helper.Info()
-	if info.State == helper.StateOK {
+	switch info.State {
+	case helper.StateOK:
 		return nil
+	case helper.StateNewer:
+		return helper.ErrNewer
 	}
 	msg := info.Note
 	if msg == "" {

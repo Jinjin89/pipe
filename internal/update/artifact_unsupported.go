@@ -8,3 +8,4 @@ import "os"
 func directoryAnchor(string) (string, error)         { return "", errUnsafeDirectory }
 func checkDirectory(string, os.FileInfo, bool) error { return errUnsafeDirectory }
 func mkdirPrivate(string) error                      { return errUnsafeDirectory }
+func tryLockUpdateFile(*os.File) (bool, error)       { return false, errUnsafeDirectory }

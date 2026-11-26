@@ -16,6 +16,8 @@ import (
 
 	"pipe/internal/localfile"
 	"pipe/internal/sysdns"
+	"pipe/internal/update"
+	"pipe/internal/version"
 )
 
 // UnitName is the systemd unit (Linux).
@@ -252,6 +254,9 @@ func install(e env, goos string, uid int) error {
 			return err
 		}
 	}
+	if err := rejectNewerHelper(p.Binary); err != nil {
+		return err
+	}
 	if e.trusted {
 		if err := localfile.InstallTrustedExecutable(in, p.Binary); err != nil {
 			return err
@@ -275,6 +280,37 @@ func install(e env, goos string, uid int) error {
 	for _, args := range [][]string{{"daemon-reload"}, {"enable", UnitName}, {"restart", UnitName}} {
 		if err := e.run(e.svcctl, args...); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func rejectNewerHelper(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, opened) {
+		return errors.New("The installed Pipe Helper changed. Try again.")
+	}
+	if _, _, installed, ok := version.ScanIdentity(f); ok {
+		if order, comparable := update.CompareVersions(installed, version.Version); comparable && order > 0 {
+			return ErrNewer
 		}
 	}
 	return nil

@@ -13,4 +13,6 @@ var errTrustedUnsupported = errors.New("system executable installation is unavai
 func TrustedExecutable(string) (string, error)         { return "", errTrustedUnsupported }
 func OpenTrustedRunningImage(string) (*os.File, error) { return nil, errTrustedUnsupported }
 func MakeTrustedDirectory(string) error                { return errTrustedUnsupported }
+func CheckTrustedFile(string) error                    { return errTrustedUnsupported }
 func InstallTrustedExecutable(*os.File, string) error  { return errTrustedUnsupported }
+func InstallOwnerExecutable(*os.File, string) error    { return errTrustedUnsupported }

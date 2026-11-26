@@ -33,6 +33,22 @@ func createPrivate(path string) (*os.File, error) {
 	return os.NewFile(uintptr(handle), path), nil
 }
 
+func replacePrivate(temp, path string, syncDir bool) error {
+	if !syncDir {
+		return os.Rename(temp, path)
+	}
+	// Write-through replacement avoids FlushFileBuffers on a directory handle.
+	from, err := windows.UTF16PtrFromString(temp)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+}
+
 func privateDescriptor(user *windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
 	return windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + user.String() + ")")
 }

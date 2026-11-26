@@ -38,6 +38,7 @@ const (
 	setupStateDir  = "/var/lib/pipe"
 	setupUnitDir   = "/etc/systemd/system"
 	setupSysctlDir = "/etc/sysctl.d"
+	noSetupPipeUID = ^uint32(0)
 )
 
 // SetupCommand is one external command. AsPipe runs it as the pipe user.
@@ -65,6 +66,19 @@ type SetupOptions struct {
 	NoProxy     bool
 	ClearRescue bool
 	LinkFile    string // exclusive output for an unattended device link
+	Operator    string `json:"-"`
+
+	configOperatorUID uint32 // nonzero when the config or an ancestor is operator-owned
+	cliDNSFile        bool
+	cliRescueCert     bool
+	cliRescueKey      bool
+}
+
+// MarkCLIInputs records which staged inputs were explicitly chosen by the CLI caller.
+func (o *SetupOptions) MarkCLIInputs(dnsFile, rescueCert, rescueKey bool) {
+	if o.configOperatorUID != 0 {
+		o.cliDNSFile, o.cliRescueCert, o.cliRescueKey = dnsFile, rescueCert, rescueKey
+	}
 }
 
 // SetupEnv holds every side effect so tests can replace it.
@@ -86,6 +100,7 @@ type SetupEnv struct {
 	chownStagedFile  func(*os.File, uint32, uint32) error // optional test hook
 	probeBinding     func(setupBinding) error
 	occupiedUDPPorts func() ([]uint16, error)
+	readPortSysctl   func(string) ([]byte, error)
 	openImage        func(string) (*os.File, error)
 }
 
@@ -129,6 +144,43 @@ func lookupPipeUser() (uint32, uint32, bool, error) {
 	}
 	gid, err := strconv.ParseUint(u.Gid, 10, 32)
 	return uint32(uid), uint32(gid), err == nil, err
+}
+
+func trustedSetupOperator() uint32 {
+	if os.Getuid() != 0 {
+		return uint32(os.Getuid())
+	}
+	uid, _ := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32)
+	return uint32(uid)
+}
+
+func resolveSetupOperator(name string, pipeUID uint32) (uint32, error) {
+	uid := trustedSetupOperator()
+	if name != "" {
+		account, err := user.Lookup(name)
+		if err != nil {
+			return 0, fmt.Errorf("look up setup operator %q: %w", name, err)
+		}
+		value, err := strconv.ParseUint(account.Uid, 10, 32)
+		if err != nil || value == uint64(noSetupPipeUID) {
+			return 0, fmt.Errorf("invalid UID for setup operator %q", name)
+		}
+		uid = uint32(value)
+	}
+	if uid == pipeUID && pipeUID != noSetupPipeUID {
+		return 0, errors.New("the setup operator cannot be user pipe")
+	}
+	return uid, nil
+}
+
+func quoteSetupShellPath(path string) string {
+	if path == "" || strings.ContainsFunc(path, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || strings.ContainsRune("/._-", r))
+	}) {
+		return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+	}
+	return path
 }
 
 func runSetupCommand(ctx context.Context, c SetupCommand) error {
@@ -237,15 +289,16 @@ func (e SetupEnv) path(p string) string { return filepath.Join(e.Root, p) }
 
 type setupRun struct {
 	SetupEnv
-	image      *os.File
-	opts       SetupOptions
-	in         *bufio.Reader
-	uid        uint32
-	gid        uint32
-	state      *os.Root
-	cleanup    []string
-	portChecks map[setupBinding]error
-	ctx        context.Context
+	image       *os.File
+	opts        SetupOptions
+	in          *bufio.Reader
+	uid         uint32
+	gid         uint32
+	operatorUID uint32
+	state       *os.Root
+	cleanup     []string
+	portChecks  map[setupBinding]error
+	ctx         context.Context
 }
 
 func (r *setupRun) printf(format string, args ...any) {
@@ -307,7 +360,8 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 	if env.openImage != nil {
 		image, err := env.openImage(env.Executable)
 		if err != nil {
-			return fmt.Errorf("start setup from a root-owned, protected Pipe executable: %w", err)
+			return fmt.Errorf("start setup from a root-owned, protected Pipe executable: %w\nRun: install -m 0755 -o root -g root %s %s && %s server setup ...",
+				err, quoteSetupShellPath(env.Executable), setupBinary, setupBinary)
 		}
 		defer image.Close()
 		r.image = image
@@ -317,10 +371,17 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 		return err
 	}
 	if !found {
-		uid = ^uint32(0)
+		uid = noSetupPipeUID
 	}
 	r.uid, r.gid = uid, gid
-	r.state, err = openSetupState(r.path(opts.Dir), uid, false)
+	r.operatorUID, err = resolveSetupOperator(opts.Operator, r.uid)
+	if err != nil {
+		return err
+	}
+	if opts.configOperatorUID != 0 && opts.configOperatorUID != r.operatorUID {
+		return errors.New("the setup operator changed after reading the config")
+	}
+	r.state, err = openSetupState(r.path(opts.Dir), r.uid, false)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -390,7 +451,11 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 		if err != nil {
 			return err
 		}
-		hopDestinations, err = fastHopDestinations(ifaces, address)
+		var warnings []string
+		hopDestinations, warnings, err = fastHopDestinations(ifaces, address)
+		for _, warning := range warnings {
+			r.printf("Warning: %s.\n", warning)
+		}
 		if err != nil {
 			return err
 		}
@@ -513,6 +578,9 @@ func (r *setupRun) prepareState(ctx context.Context, found bool) error {
 		uid, gid, found, err := r.LookupPipeUser()
 		if err != nil || !found {
 			return errors.New("user pipe was not created")
+		}
+		if uid == r.operatorUID {
+			return errors.New("the setup operator cannot be user pipe")
 		}
 		r.uid, r.gid = uid, gid
 		// Check the parents again with the UID just assigned to Pipe.
@@ -853,13 +921,14 @@ func (r *setupRun) planExisting() (setupPlan, error) {
 }
 
 func (r *setupRun) authorizedSetupFast(fast SetupFast) (SetupFast, error) {
-	if fast.Hop != "" && fast.Port != 0 {
+	complete := fast.Hop != "" && fast.Port != 0
+	if complete && fast.Address != "" {
 		return fast, nil
 	}
 	path := r.path(filepath.Join(setupUnitDir, hopServiceUnit))
 	installed, err := readInstalledSetupHop(path, r.uid)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fast, fmt.Errorf("cannot use installed Fast hopping settings: %w. Supply --fast-hop and --fast-port", err)
+		return fast, fmt.Errorf("cannot use installed Fast hopping settings: %w. Supply --fast-hop and --fast-port with --fast-hop-address", err)
 	}
 	if fast.Hop == "" {
 		fast.Hop = installed.Hop
@@ -867,7 +936,7 @@ func (r *setupRun) authorizedSetupFast(fast SetupFast) (SetupFast, error) {
 	if fast.Port == 0 {
 		fast.Port = installed.Port
 	}
-	if fast.Address == "" {
+	if fast.Address == "" && (!complete || installed.Hop == fast.Hop && installed.Port == fast.Port) {
 		fast.Address = installed.Address
 	}
 	if fast.Hop != "" && fast.Port == 0 {
@@ -877,7 +946,7 @@ func (r *setupRun) authorizedSetupFast(fast SetupFast) (SetupFast, error) {
 }
 
 func readInstalledSetupHop(path string, pipeUID uint32) (SetupFast, error) {
-	f, err := openSetupOperatorFile(path, pipeUID)
+	f, _, err := openSetupOperatorFile(path, pipeUID, trustedSetupOperator())
 	if err != nil {
 		return SetupFast{}, err
 	}
@@ -935,9 +1004,16 @@ func (fast SetupFast) checkSaved(saved Settings) error {
 	return nil
 }
 
-// stage copies a root-readable file into the state dir for the pipe user, removed at the end.
-func (r *setupRun) stage(src string, limit int64, ownerOnly bool) (string, error) {
-	data, err := readSetupOperatorFile(r.path(src), r.uid, limit, ownerOnly)
+// stage copies an input into the state dir for the pipe user, removed at the end.
+func (r *setupRun) stage(src string, limit int64, ownerOnly, fromCLI bool) (string, error) {
+	path := r.path(src)
+	var data []byte
+	var err error
+	if r.opts.configOperatorUID != 0 && !fromCLI {
+		data, err = r.readSetupInputAsOperator(path, limit, ownerOnly)
+	} else {
+		data, err = readSetupOperatorFile(path, r.uid, r.operatorUID, limit, ownerOnly)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -979,8 +1055,8 @@ func readSetupFile(path string, limit int64, ownerOnly bool) ([]byte, error) {
 	return readBoundedSetupFile(f, limit, ownerOnly)
 }
 
-func readSetupOperatorFile(path string, pipeUID uint32, limit int64, ownerOnly bool) ([]byte, error) {
-	f, err := openSetupOperatorFile(path, pipeUID)
+func readSetupOperatorFile(path string, pipeUID, operatorUID uint32, limit int64, ownerOnly bool) ([]byte, error) {
+	f, _, err := openSetupOperatorFile(path, pipeUID, operatorUID)
 	if err != nil {
 		return nil, err
 	}
@@ -1119,10 +1195,10 @@ func (r *setupRun) applyUpdate(plan setupPlan) error {
 		(update.Initial != nil && update.Initial.Mode == Shared || plan.saved != nil && plan.saved.Mode == Shared) {
 		staged := *rescue
 		var err error
-		if staged.Cert, err = r.stage(rescue.Cert, localfile.MaxConfigBytes, false); err != nil {
+		if staged.Cert, err = r.stage(rescue.Cert, localfile.MaxConfigBytes, false, r.opts.cliRescueCert); err != nil {
 			return err
 		}
-		if staged.Key, err = r.stage(rescue.Key, localfile.MaxConfigBytes, true); err != nil {
+		if staged.Key, err = r.stage(rescue.Key, localfile.MaxConfigBytes, true, r.opts.cliRescueKey); err != nil {
 			return err
 		}
 		update.Rescue = &staged
@@ -1130,7 +1206,7 @@ func (r *setupRun) applyUpdate(plan setupPlan) error {
 	if proxy := update.Proxy; proxy != nil && proxy.DNSFile != "" {
 		staged := *proxy
 		var err error
-		if staged.DNSFile, err = r.stage(proxy.DNSFile, 4096, true); err != nil {
+		if staged.DNSFile, err = r.stage(proxy.DNSFile, 4096, true, r.opts.cliDNSFile); err != nil {
 			return err
 		}
 		update.Proxy = &staged
@@ -1248,7 +1324,7 @@ func (r *setupRun) enrollToFile(device string) error {
 	if err != nil {
 		return err
 	}
-	file, closeFile, err := createSetupOutput(path, r.uid)
+	file, closeFile, err := createSetupOutput(path, r.uid, r.operatorUID)
 	if err != nil {
 		return err
 	}

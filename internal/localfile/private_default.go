@@ -6,6 +6,7 @@ package localfile
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -20,6 +21,18 @@ func createPrivate(path string) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+func replacePrivate(temp, path string, syncDir bool) error {
+	if err := os.Rename(temp, path); err != nil || !syncDir {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func checkPrivateACL(file *os.File) error {

@@ -3,6 +3,7 @@
 package update
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,10 @@ import (
 	"pipe/internal/localfile"
 )
 
-const maxState = 32 << 10
+const (
+	maxState          = 32 << 10
+	stateLockFilename = ".verified.lock"
+)
 
 var (
 	errStateRead = errors.New("Could not validate the saved update state.")
@@ -28,6 +32,109 @@ type storedUpdate struct {
 	Artifact  string         `json:"artifact,omitempty"`
 }
 
+type releaseState struct {
+	dir     string
+	channel string
+	target  Target
+	key     ed25519.PublicKey
+}
+
+func (s releaseState) path() string {
+	return filepath.Join(s.dir, stateFilename(s.channel, s.target))
+}
+
+func (s releaseState) load() (*release, error) {
+	if s.dir == "" {
+		return nil, nil
+	}
+	if err := inspectPrivateDir(s.dir, false); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	_, floor, err := s.read()
+	return floor, err
+}
+
+func (s releaseState) read() (storedUpdate, *release, error) {
+	saved, err := readStoredUpdate(s.path())
+	if errors.Is(err, os.ErrNotExist) {
+		return saved, nil, nil
+	}
+	if err != nil || saved.Release == nil {
+		return saved, nil, err
+	}
+	floor, err := saved.Release.verify(s.key, s.channel, s.target)
+	return saved, floor, err
+}
+
+func (s releaseState) raise(ctx context.Context, rel *release, viaTunnel bool) error {
+	now := time.Now().UTC()
+	return s.save(ctx, rel, storedUpdate{CheckedAt: &now, ViaTunnel: viaTunnel}, true)
+}
+
+func (s releaseState) save(ctx context.Context, rel *release, next storedUpdate, floorOnly bool) error {
+	if s.dir == "" {
+		return nil
+	}
+	return withUpdateStateLock(ctx, s.dir, func() error {
+		_, floor, err := s.read()
+		if err != nil {
+			return errStateRead
+		}
+		if err := rel.checkFloor(floor); err != nil {
+			return err
+		}
+		if floorOnly && rel.same(floor) {
+			return nil
+		}
+		if rel != nil {
+			next.Release = &rel.signed
+		}
+		raw, err := json.Marshal(next)
+		if err != nil || localfile.WritePrivateAtomicSyncDir(s.path(), raw) != nil {
+			return errStateSave
+		}
+		return nil
+	})
+}
+
+func withUpdateStateLock(ctx context.Context, dir string, write func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := privateDir(dir); err != nil {
+		return errStateSave
+	}
+	path := filepath.Join(dir, stateLockFilename)
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return errStateSave
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return errStateSave
+	}
+	defer file.Close()
+	for {
+		locked, err := tryLockUpdateFile(file)
+		if err != nil {
+			return errStateSave
+		}
+		if locked {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return write()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 func (m *Manager) restore(key ed25519.PublicKey, installed releaseVersion) (string, error) {
 	if err := inspectPrivateDir(m.dir, false); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -35,18 +142,12 @@ func (m *Manager) restore(key ed25519.PublicKey, installed releaseVersion) (stri
 		}
 		return "", errStateRead
 	}
-	saved, err := readStoredUpdate(filepath.Join(m.dir, m.stateFile))
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
+	state := releaseState{dir: m.dir, channel: installed.channel, target: m.target, key: key}
+	saved, rel, err := state.read()
 	if err != nil {
 		return "", errStateRead
 	}
-	if saved.Release != nil {
-		rel, err := saved.Release.verify(key, installed.channel, m.target)
-		if err != nil {
-			return "", errStateRead
-		}
+	if rel != nil {
 		m.release, m.viaTunnel = rel, saved.ViaTunnel
 		v, _ := parseVersion(rel.version)
 		if v.compare(installed) > 0 {
@@ -60,13 +161,18 @@ func (m *Manager) restore(key ed25519.PublicKey, installed releaseVersion) (stri
 }
 
 func readStoredUpdate(path string) (storedUpdate, error) {
-	var saved storedUpdate
 	raw, err := localfile.ReadProtected(path, maxState)
 	if err != nil {
-		return saved, err
+		return storedUpdate{}, err
 	}
-	err = json.Unmarshal(raw, &saved)
-	return saved, err
+	var saved *storedUpdate
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		return storedUpdate{}, err
+	}
+	if saved == nil || (saved.Release == nil && (saved.Artifact != "" || saved.ViaTunnel)) {
+		return storedUpdate{}, errStateRead
+	}
+	return *saved, nil
 }
 
 // Startup jobs finish before a new check or download touches the saved offer
@@ -126,8 +232,9 @@ func (m *Manager) pruneStages(keep string) {
 		if m.ctx.Err() != nil {
 			return
 		}
-		if entry.IsDir() && !referenced[entry.Name()] {
-			removeStage(m.dir, entry.Name(), m.target.filename())
+		name := entry.Name()
+		if entry.IsDir() && !strings.HasPrefix(name, cliStagePrefix) && !referenced[name] {
+			removeStage(m.dir, name, m.target.filename())
 		}
 	}
 }
@@ -138,22 +245,17 @@ func validHandle(handle string) bool {
 	}) < 0
 }
 
+func stateFilename(channel string, target Target) string {
+	return "verified-" + channel + "-" + target.OS + "-" + target.ABI + ".json"
+}
+
 // save writes one record for the manager's channel and target. A ready handle
 // is published only after the matching record and verified file both exist.
 func (m *Manager) save(rel *release, file artifact, viaTunnel bool) error {
 	if m.stateFile == "" {
 		return nil
 	}
-	if err := privateDir(m.dir); err != nil {
-		return errStateSave
-	}
-	state := storedUpdate{CheckedAt: m.status.CheckedAt, ViaTunnel: viaTunnel, Artifact: file.handle}
-	if rel != nil {
-		state.Release = &rel.signed
-	}
-	raw, err := json.Marshal(state)
-	if err != nil || localfile.WritePrivateAtomic(filepath.Join(m.dir, m.stateFile), raw) != nil {
-		return errStateSave
-	}
-	return nil
+	installed, _ := parseVersion(m.status.Installed)
+	state := releaseState{dir: m.dir, channel: installed.channel, target: m.target, key: m.key}
+	return state.save(m.ctx, rel, storedUpdate{CheckedAt: m.status.CheckedAt, ViaTunnel: viaTunnel, Artifact: file.handle}, false)
 }

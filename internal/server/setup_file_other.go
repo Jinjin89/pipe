@@ -13,15 +13,15 @@ func openSetupFile(string) (*os.File, error) {
 	return nil, errors.New("secure server setup file access requires Unix")
 }
 
-func openSetupOperatorFile(string, uint32) (*os.File, error) {
-	return nil, errors.New("secure server setup file access requires Unix")
+func openSetupOperatorFile(string, uint32, uint32) (*os.File, bool, error) {
+	return nil, false, errors.New("secure server setup file access requires Unix")
 }
 
 func openSetupState(string, uint32, bool) (*os.Root, error) {
 	return nil, errors.New("secure server setup state access requires Linux")
 }
 
-func createSetupOutput(string, uint32) (*os.File, func(bool) error, error) {
+func createSetupOutput(string, uint32, uint32) (*os.File, func(bool) error, error) {
 	return nil, nil, errors.New("secure enrollment output requires Unix")
 }
 

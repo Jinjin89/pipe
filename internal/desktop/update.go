@@ -7,29 +7,81 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"pipe/internal/clientctl"
 	"pipe/internal/helper"
+	"pipe/internal/localfile"
 	"pipe/internal/update"
 	"pipe/internal/version"
 )
 
 type desktopUpdates = update.Manager
 
-const desktopReleasePrefix = "\x00pipe-desktop-release-v1 " + runtime.GOOS + " " + runtime.GOARCH + " "
-
-// The release signer reads this marker from each packaged executable.
-var desktopReleaseIdentity = desktopReleasePrefix + version.Version + "\x00"
+type updateStatusResponse struct {
+	update.Status
+	CanApply       bool   `json:"canApply,omitempty"`
+	AppliedVersion string `json:"appliedVersion,omitempty"`
+	InstallHint    string `json:"installHint,omitempty"`
+}
 
 func newDesktopUpdates(s *Server) *desktopUpdates {
 	installed := s.cfg.Version
 	if installed == "" {
-		installed = desktopReleaseIdentity[len(desktopReleasePrefix) : len(desktopReleaseIdentity)-1]
+		installed = version.Version
 	}
-	return update.NewManager(installed, update.Target{OS: runtime.GOOS, ABI: runtime.GOARCH},
-		filepath.Join(s.cfg.Dir, "updates"))
+	// Select the asset using the same build identity the release signer reads.
+	var target update.Target
+	if fields := strings.Fields(version.ReleaseIdentity); len(fields) == 4 {
+		target = update.Target{OS: fields[1], ABI: fields[2]}
+	}
+	return update.NewManager(installed, target, filepath.Join(s.cfg.Dir, "updates"))
+}
+
+func updateInstallPolicy(goos, exe string) (canApply bool, hint string) {
+	switch goos {
+	case "linux":
+		if !path.IsAbs(exe) {
+			return false, ""
+		}
+		if hint := linuxUpdateHint(path.Clean(exe)); hint != "" {
+			return false, hint
+		}
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			hint = linuxUpdateHint(resolved)
+		}
+		return hint == "", hint
+	case "darwin":
+		return false, "Quit Pipe, then replace Pipe.app in Applications."
+	case "windows":
+		return false, "Quit Pipe, then replace Pipe.exe and pipe-cli.exe together."
+	default:
+		return false, ""
+	}
+}
+
+func linuxUpdateHint(exe string) string {
+	if exe == "/usr/local/bin/pipe" {
+		return "Run sudo pipe update to install."
+	}
+	for _, dir := range []string{"/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/"} {
+		if strings.HasPrefix(exe, dir) {
+			return "Update Pipe with your system package manager."
+		}
+	}
+	return ""
+}
+
+func (s *Server) updateResponse(status update.Status) updateStatusResponse {
+	canApply, hint := updateInstallPolicy(runtime.GOOS, s.cfg.Exe)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return updateStatusResponse{
+		Status: status, CanApply: canApply, AppliedVersion: s.appliedUpdate, InstallHint: hint,
+	}
 }
 
 func (s *Server) updateRoute() update.Route {
@@ -62,7 +114,7 @@ func (s *Server) updateRoute() update.Route {
 }
 
 func (s *Server) updateStatus(r *http.Request) (any, error) {
-	return s.updates.StatusAfterRestore(r.Context()), nil
+	return s.updateResponse(s.updates.StatusAfterRestore(r.Context())), nil
 }
 
 func (s *Server) checkUpdate(r *http.Request) (any, error) {
@@ -81,11 +133,75 @@ func (s *Server) checkUpdate(r *http.Request) (any, error) {
 	if status.State == "available" && status.Verifying {
 		return s.updateStatus(r)
 	}
-	return status, nil
+	return s.updateResponse(status), nil
 }
 
 func (s *Server) downloadUpdate(*http.Request) (any, error) {
-	return s.updates.DownloadWithRoute(s.updateRoute), nil
+	return s.updateResponse(s.updates.DownloadWithRoute(s.updateRoute)), nil
+}
+
+func (s *Server) applyUpdate(r *http.Request) (any, error) {
+	if canApply, hint := updateInstallPolicy(runtime.GOOS, s.cfg.Exe); !canApply {
+		if hint == "" {
+			hint = "In-place installation is only available for portable Linux builds."
+		}
+		return nil, bad(hint)
+	}
+	var input struct {
+		Artifact string `json:"artifact"`
+	}
+	if err := readJSON(r, &input, 1024); err != nil {
+		return nil, err
+	}
+
+	exe, err := filepath.EvalSymlinks(s.cfg.Exe)
+	if err != nil || !matchesRunningExecutable(exe) {
+		return nil, bad("The install path does not match the running Pipe executable.")
+	}
+	if hint := linuxUpdateHint(exe); hint != "" {
+		return nil, bad(hint)
+	}
+	extract := s.cfg.extractUpdate
+	if extract == nil {
+		extract = s.updates.ExtractVerifiedLinuxBinary
+	}
+	bin, ver, cleanup, err := extract(input.Artifact)
+	if err != nil {
+		return nil, bad(err.Error())
+	}
+	defer cleanup()
+
+	// A concurrent apply or a path change during extraction invalidates the
+	// earlier inode check. Serialize publication with apply and shutdown.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, bad("Pipe is quitting.")
+	}
+	if s.appliedUpdate != "" {
+		return nil, bad("An update is already installed. Quit and reopen Pipe to use it.")
+	}
+	if !matchesRunningExecutable(exe) {
+		return nil, bad("The install path does not match the running Pipe executable.")
+	}
+	applyPortable := s.cfg.applyPortable
+	if applyPortable == nil {
+		applyPortable = localfile.InstallOwnerExecutable
+	}
+	if err := applyPortable(bin, exe); err != nil {
+		return nil, bad("Could not install the update. " + err.Error())
+	}
+	s.appliedUpdate = ver
+	return updateStatusResponse{Status: s.updates.Status(), CanApply: true, AppliedVersion: ver}, nil
+}
+
+func matchesRunningExecutable(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	running, err := os.Stat("/proc/self/exe")
+	return err == nil && os.SameFile(running, info)
 }
 
 func (s *Server) revealUpdate(r *http.Request) (any, error) {

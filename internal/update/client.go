@@ -3,6 +3,7 @@
 package update
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -12,9 +13,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -37,15 +44,100 @@ type DialFunc func(context.Context, string, string) (net.Conn, error)
 // Route holds the transport and lifetime selected when an update job starts.
 // Its zero value fails closed.
 type Route struct {
-	ctx      context.Context
-	dial     DialFunc
-	tunneled bool
-	err      error
+	ctx       context.Context
+	dial      DialFunc
+	tunneled  bool
+	err       error
+	proxyURL  *url.URL
+	proxyAddr string
 }
 
 func DirectRoute() Route {
 	d := net.Dialer{Timeout: 15 * time.Second}
 	return Route{dial: d.DialContext}
+}
+
+// ProxyRoute pins a CLI-only HTTP(S) or SOCKS5 proxy for release fetches.
+// Origin host allowlists, TLS verification, and Ed25519 signing still apply.
+func ProxyRoute(raw string) (Route, error) {
+	if raw == "" {
+		return DirectRoute(), nil
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Opaque != "" || (u.EscapedPath() != "" && u.EscapedPath() != "/") ||
+		u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") {
+		return Route{}, errors.New("The proxy URL is invalid.")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	var defaultPort string
+	switch scheme {
+	case "http":
+		defaultPort = "80"
+	case "https":
+		defaultPort = "443"
+	case "socks5", "socks5h":
+		defaultPort = "1080"
+	default:
+		return Route{}, errors.New("Proxy URL must use http://, https://, socks5://, or socks5h://.")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return Route{}, errors.New("The proxy URL must include a host.")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is6() != strings.HasPrefix(u.Host, "[") {
+			return Route{}, errors.New("The proxy URL has an invalid host.")
+		}
+		host = ip.String()
+	} else {
+		host, err = idna.Lookup.ToASCII(host)
+		if err != nil || strings.HasPrefix(u.Host, "[") {
+			return Route{}, errors.New("The proxy URL has an invalid host.")
+		}
+	}
+	port := u.Port()
+	if port == "" && !strings.HasSuffix(u.Host, ":") {
+		port = defaultPort
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || number == 0 {
+		return Route{}, errors.New("The proxy URL has an invalid port.")
+	}
+	u.Scheme, u.Path = scheme, ""
+	u.Host = net.JoinHostPort(host, strconv.FormatUint(number, 10))
+	d := net.Dialer{Timeout: 15 * time.Second}
+	return Route{
+		dial:      d.DialContext,
+		proxyURL:  u,
+		proxyAddr: u.Host,
+	}, nil
+}
+
+// EnvProxyRoute resolves HTTPS_PROXY/NO_PROXY for the release API once and
+// pins that proxy for the entire CLI update job.
+func EnvProxyRoute() (Route, error) {
+	address := cmp.Or(os.Getenv("HTTPS_PROXY"), os.Getenv("https_proxy"))
+	if address == "" {
+		return DirectRoute(), nil
+	}
+	// Resolve the bypass before parsing the operator's address. The standard
+	// matcher silently ignores malformed proxy URLs, which would use direct.
+	config := httpproxy.Config{
+		HTTPSProxy: "http://proxy.invalid",
+		NoProxy:    cmp.Or(os.Getenv("NO_PROXY"), os.Getenv("no_proxy")),
+	}
+	u, _ := url.Parse(releases)
+	proxyURL, err := config.ProxyFunc()(u)
+	if err != nil {
+		return Route{}, errors.New("The configured HTTPS_PROXY URL is invalid.")
+	}
+	if proxyURL == nil {
+		return DirectRoute(), nil
+	}
+	if !strings.Contains(address, "://") {
+		address = "http://" + address
+	}
+	return ProxyRoute(address)
 }
 
 func TunnelRoute(ctx context.Context, dial DialFunc) Route {
@@ -84,9 +176,23 @@ type releaseClient struct {
 }
 
 func releaseTransport(job context.Context, dial DialFunc) *http.Transport {
-	return &http.Transport{
+	return releaseTransportForRoute(job, Route{dial: dial})
+}
+
+func releaseTransportForRoute(job context.Context, route Route) *http.Transport {
+	t := &http.Transport{
 		DialContext: func(request context.Context, network, addr string) (net.Conn, error) {
-			if network != "tcp" || !AllowedAddress(addr) {
+			if route.dial == nil {
+				return nil, ErrTunnelUnavailable
+			}
+			if network != "tcp" {
+				return nil, errRedirect
+			}
+			if route.proxyURL != nil {
+				if !strings.EqualFold(addr, route.proxyAddr) {
+					return nil, errRedirect
+				}
+			} else if !AllowedAddress(addr) {
 				return nil, errRedirect
 			}
 			// Transport can keep dialing after a request is cancelled.
@@ -100,7 +206,7 @@ func releaseTransport(job context.Context, dial DialFunc) *http.Transport {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			return dial(ctx, network, addr)
+			return route.dial(ctx, network, addr)
 		},
 		ForceAttemptHTTP2:      true,
 		TLSHandshakeTimeout:    15 * time.Second,
@@ -109,6 +215,10 @@ func releaseTransport(job context.Context, dial DialFunc) *http.Transport {
 		MaxResponseHeaderBytes: 64 << 10,
 		DisableCompression:     true,
 	}
+	if route.proxyURL != nil {
+		t.Proxy = http.ProxyURL(route.proxyURL)
+	}
+	return t
 }
 
 func releaseHTTPClient(transport *http.Transport) *http.Client {
@@ -269,6 +379,24 @@ func (r *release) same(other *release) bool {
 	return r != nil && other != nil && r.version == other.version && r.signed.Digest == other.signed.Digest
 }
 
+func (r *release) checkFloor(floor *release) error {
+	if floor == nil {
+		return nil
+	}
+	if r == nil {
+		return errOlderRelease
+	}
+	offer, _ := parseVersion(r.version)
+	previous, _ := parseVersion(floor.version)
+	switch order := offer.compare(previous); {
+	case order < 0:
+		return errOlderRelease
+	case order == 0 && !r.same(floor):
+		return errChangedManifest
+	}
+	return nil
+}
+
 func (s signedRelease) verify(key ed25519.PublicKey, channel string, target Target) (*release, error) {
 	version := strings.TrimPrefix(s.Tag, "v")
 	parsed, ok := parseVersion(version)
@@ -348,8 +476,8 @@ func (c releaseClient) check(ctx context.Context, installed string, target Targe
 	if err != nil {
 		return nil, err
 	}
-	if verified != nil && selected.version == verified.version && !selected.same(verified) {
-		return nil, errChangedManifest
+	if err := selected.checkFloor(verified); err != nil {
+		return nil, err
 	}
 	if _, err := latest.assetURL(selected.asset.name); err != nil {
 		return nil, err

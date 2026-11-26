@@ -23,13 +23,14 @@ import (
 	"pipe/internal/clientctl"
 	"pipe/internal/localfile"
 	"pipe/internal/logring"
+	"pipe/internal/update"
 )
 
 // RemoteOptions configures the app side.
 type RemoteOptions struct {
 	Socket  string        // default: PathsFor(runtime.GOOS).Socket
 	Logs    *logring.Ring // helper log lines are copied here by SyncLogs
-	Version string        // the app's version; any other helper version is outdated
+	Version string        // the app's version, matched by a compatible helper
 	Exe     string        // path to the running app executable for installation
 }
 
@@ -37,6 +38,7 @@ const (
 	msgNotAnswering = "Pipe Helper isn't answering."
 	msgMissing      = "Pipe Helper isn't installed."
 	msgOutdated     = "Pipe Helper needs an update."
+	msgNewer        = "Pipe Helper is newer than this app. Update Pipe first."
 	msgUnsupported  = "Pipe Helper isn't available on this system."
 
 	infoTTL      = 3 * time.Second
@@ -165,13 +167,15 @@ func (r *Remote) sessionCall(method string, opts clientctl.Options) error {
 	// An older helper can silently ignore new option fields.
 	r.dropInfo()
 	info := r.Info()
-	if info.State == StateMissing {
+	switch info.State {
+	case StateMissing:
 		return errors.New(msgNotAnswering)
-	}
-	if info.State == StateOutdated {
+	case StateOutdated:
 		return ErrOutdated
-	}
-	if info.State != StateOK {
+	case StateNewer:
+		return ErrNewer
+	case StateOK:
+	default:
 		return errors.New(info.Note)
 	}
 	_, err = r.call(context.Background(), startLimit, method, wire, nil)
@@ -270,6 +274,9 @@ func (r *Remote) probe() Info {
 	case err != nil:
 		return Info{State: StateError, Note: err.Error()}
 	case hello.Version != r.opts.Version || hello.Protocol != ProtocolVersion:
+		if order, ok := update.CompareVersions(hello.Version, r.opts.Version); hello.Protocol > ProtocolVersion || (ok && order > 0) {
+			return Info{State: StateNewer, Version: hello.Version, Note: msgNewer}
+		}
 		return Info{State: StateOutdated, Version: hello.Version, Note: msgOutdated}
 	}
 	return Info{State: StateOK, Version: hello.Version}
@@ -585,6 +592,10 @@ func (r *Remote) settle(want string) error {
 
 // Install shows the OS password prompt and installs or upgrades the helper.
 func (r *Remote) Install() error {
+	r.dropInfo()
+	if r.Info().State == StateNewer {
+		return ErrNewer
+	}
 	err := r.elevate(false)
 	r.dropInfo()
 	if err != nil {

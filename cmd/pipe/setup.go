@@ -27,6 +27,12 @@ func runServerSetup(ctx context.Context, args []string) error {
 		}
 		return server.ApplySetupUpdate(ctx, args[1], args[2])
 	}
+	if len(args) > 0 && args[0] == server.ReadSetupOperatorInputCommand {
+		if len(args) != 5 {
+			return errors.New("invalid setup operator input request")
+		}
+		return server.ReadSetupOperatorInput(args[1], args[2], args[3], args[4], os.Stdout)
+	}
 	o, template, err := parseSetupOptions(args)
 	if err != nil {
 		return err
@@ -50,6 +56,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	var rescue server.SetupRescue
 	fs.BoolVar(&flags.Yes, "yes", false, "do not ask questions; use flags and defaults")
 	fs.StringVar(&flags.Dir, "dir", "/var/lib/pipe", "server state directory")
+	fs.StringVar(&flags.Operator, "operator", "", "operator username for reading setup files from a root shell")
 	fs.StringVar(&flags.IP, "ip", "", "IP address for device links (default: the SNI name)")
 	registerEgressIPFlag(fs, &flags.BlockEgressIPs)
 	fs.StringVar(&flags.SNI, "sni", "", "server DNS-only name for Fast, Stealth and the HTTPS proxy")
@@ -86,12 +93,13 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	var o server.SetupOptions
 	if configPath != "" {
 		var err error
-		o, err = server.LoadSetupConfig(configPath)
+		o, err = server.LoadSetupConfigForOperator(configPath, flags.Operator)
 		if err != nil {
 			return o, false, err
 		}
 	}
 	o.Dir, o.Yes, o.NoProxy, o.LinkFile = flags.Dir, o.Yes || flags.Yes, flags.NoProxy, flags.LinkFile
+	o.Operator = flags.Operator
 	if flags.BlockEgressIPs != nil {
 		o.BlockEgressIPs = flags.BlockEgressIPs
 	}
@@ -144,6 +152,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 		}
 	}
 	o.Cert = mergeSetupCertificate(o.Cert, cert, set)
+	o.MarkCLIInputs(cert.TokenFile != "" || cert.KeyFile != "", rescue.Cert != "", rescue.Key != "")
 	return o, template, nil
 }
 

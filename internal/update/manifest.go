@@ -14,15 +14,20 @@ import (
 )
 
 const (
-	releasePublicKey = "7evMPdWmNXKsBfAyKYviEzA3mzwJb3PV2ZJggn/GCDI="
-	manifestName     = "SHA256SUMS"
-	signatureName    = "SHA256SUMS.sig"
-	manifestHeader   = "pipe-sha256sums-v1"
-	maxManifest      = 16 * 1024
-	maxAssetSize     = 256 << 20
+	releasePublicKey  = "7evMPdWmNXKsBfAyKYviEzA3mzwJb3PV2ZJggn/GCDI="
+	manifestName      = "SHA256SUMS"
+	signatureName     = "SHA256SUMS.sig"
+	ManifestFilename  = manifestName
+	SignatureFilename = signatureName
+	manifestHeader    = "pipe-sha256sums-v1"
+	maxManifest       = 16 * 1024
+	maxAssetSize      = 256 << 20
 )
 
 type Target struct{ OS, ABI string }
+
+// Filename returns the canonical release asset filename for t, or "".
+func (t Target) Filename() string { return t.filename() }
 
 func (t Target) filename() string {
 	switch t.OS {

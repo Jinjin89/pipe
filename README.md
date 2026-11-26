@@ -69,47 +69,73 @@ When pipe has 80/443 to itself it is the same, except that Stealth, the cover si
 
 # Part 1: Deploy the server
 
-There are 3 steps: **get pipe → generate the config → run**. Do them on your VPS as **root**.
+On your Linux VPS, use an account with `sudo` access to install Pipe, configure it, and start the service.
 
 ### Step 1: Get pipe
-Download the latest release (`uname -m` says `x86_64` → `amd64`, `aarch64` → `arm64`):
-```sh
-curl -fLO https://github.com/Jinjin89/pipe/releases/latest/download/pipe-linux-amd64.tar.gz
-tar -xzf pipe-linux-amd64.tar.gz
-```
-Result: a file called `pipe`. Setup installs it to `/usr/local/bin/pipe`.
+Download the Linux release and verify it with OpenSSL 3 before installing. Use `amd64` for `x86_64` or change `arch` to `arm64` for `aarch64`.
 
-To build it yourself instead (Go 1.27):
 ```sh
-git clone https://github.com/Jinjin89/pipe.git && cd pipe
+(
+  set -eu
+  work=$(mktemp -d)
+  trap 'rm -rf -- "$work"' EXIT
+  cd "$work"
+  version=0.7.6-alpha
+  arch=amd64
+  archive="pipe-linux-$arch.tar.gz"
+  release="https://github.com/Jinjin89/pipe/releases/download/v$version"
+  for asset in "$archive" SHA256SUMS SHA256SUMS.sig; do
+    curl -fLO "$release/$asset"
+  done
+
+  printf '%s\n' '-----BEGIN PUBLIC KEY-----' \
+    'MCowBQYDK2VwAyEA7evMPdWmNXKsBfAyKYviEzA3mzwJb3PV2ZJggn/GCDI=' \
+    '-----END PUBLIC KEY-----' > pipe-release.pub
+  openssl pkeyutl -verify -pubin -inkey pipe-release.pub -rawin \
+    -in SHA256SUMS -sigfile SHA256SUMS.sig
+  test "$(sed -n '2p' SHA256SUMS)" = "version $version"
+  awk -v name="$archive" '$3 == name {print $5 "  " $3}' SHA256SUMS | sha256sum -c -
+  tar -xzf "$archive"
+  sudo install -m 0755 -o root -g root ./pipe /usr/local/bin/pipe
+)
+```
+
+For the one-time upgrade from 0.7.5 to 0.7.6, follow this step and restart the service as in Step 3. Use `sudo pipe update` for later upgrades.
+
+You can also build and install from source with Go 1.27.
+
+```sh
+git clone https://github.com/Jinjin89/pipe.git && cd pipe &&
 go build -trimpath -tags with_gvisor,with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0 \
-  -ldflags '-s -w -checklinkname=0' -o pipe ./cmd/pipe
+  -ldflags '-s -w -checklinkname=0' -o pipe ./cmd/pipe &&
+sudo install -m 0755 -o root -g root ./pipe /usr/local/bin/pipe
 ```
 
 ### Step 2: Generate the config
-**Fastest, on a new server with nothing else on it:** point a DNS name at the server (an `A` record, DNS only), then run one line and skip to the **Next steps** below:
-```sh
-./pipe server setup --yes --sni vpn.example.com --fast-hop 20000-40000 --device phone
-```
-pipe gets its own certificate for that name. For anything else, use the setup file:
+On a new server with no website, point a DNS-only `A` record at the server, then run this command and continue to **Next steps** below.
 
-1. **Write the template** (it already has this server's IP and the ports it would use):
+```sh
+sudo /usr/local/bin/pipe server setup --yes --sni vpn.example.com --fast-hop 20000-40000 --device my-device
+```
+Pipe gets its own certificate for that name. For other layouts, use a setup file.
+
+1. **Write the template.** It shows the detected server address and ports.
    ```sh
-   ./pipe server setup --template > setup.json
+   sudo /usr/local/bin/pipe server setup --template > setup.json
    ```
    ```json
    {
      "ip": "203.0.113.7",
      "sni": "proxy.example.com",
-     "cert": { "dns": "cloudflare", "token_file": "/root/cf-token" },
+     "cert": { "dns": "cloudflare", "token_file": "cf-token" },
      "fast": { "port": 443, "hop": "20000-40000" },
      "stealth": { "port": 8443 },
      "proxy": { "port": 9443 },
-     "rescue": { "sni": "static.example.com", "port": 2053, "cert": "/root/origin.pem", "key": "/root/origin.key" },
-     "device": "phone"
+     "rescue": { "sni": "static.example.com", "port": 2053, "cert": "origin.pem", "key": "origin.key" },
+     "device": "my-device"
    }
    ```
-2. **Fill in yours.** Every key is one real thing:
+2. **Fill in your settings.** Relative paths start from the directory containing `setup.json`.
 
    | Key | What it is |
    |---|---|
@@ -119,15 +145,17 @@ pipe gets its own certificate for that name. For anything else, use the setup fi
    | `fast` | UDP `port` and the optional `hop` range (open it in the firewall). |
    | `stealth`, `proxy` | their TCP `port`. `proxy` is the HTTPS proxy for `export https_proxy`; Stealth borrows its site, so without `proxy` there is no Stealth when port 443 is taken. |
    | `rescue` | `sni`: your Cloudflare name (orange cloud, different from `sni` above). `port`: Cloudflare passes HTTPS only on 443, 2053, 2083, 2087, 2096 and 8443. `cert`/`key`: a Cloudflare **Origin Certificate** for that name (SSL/TLS > Origin Server > Create Certificate, valid 15 years). Pipe answers on that port only to Cloudflare's addresses. |
-   | `device` | a name for your first device, e.g. `phone`. |
+   | `device` | a name for your first device. |
 
    **Leave out `proxy` or `rescue` and that part is off.** Fast always runs. Stealth needs a real website to hide behind: it always runs when pipe has port 443, and next to a website it runs only with `proxy` (without it, pick Auto in the app; the Stealth route won't connect). The `fast` and `stealth` sections only set ports. There is no mode to pick: when TCP 80 and 443 are free, pipe uses them itself (everything on 443, certificates automatic) and ignores the ports and certificates above; when a website already has them, pipe uses its own ports and never touches the website. Setup says which one it chose.
 
    **Moving a server set up before 0.7.3:** update your apps to 0.7.3 first. Write the full file with your current names (a `proxy` or `rescue` you leave out is turned off), add the `rescue` section, and run setup again. Keys, devices and all other settings stay. Then open the Rescue port and remove pipe's old file from your nginx. Saved device links need the Rescue port: change `cdn=<name>` to `cdn=<name>:2053` in each link (setup prints the exact value), or add the device again under a new name.
-3. **Run setup with it:**
+3. **Run setup.**
    ```sh
-   ./pipe server setup --config setup.json
+   sudo /usr/local/bin/pipe server setup --config setup.json
    ```
+
+   From a root shell, run the command directly. If `setup.json` is in another user's home directory, add `--operator <user>` with that account's login name.
 
 Setup writes these files:
 
@@ -137,7 +165,7 @@ Setup writes these files:
 | `/var/lib/pipe/devices.json` and the key files | your devices' keys |
 | `/var/lib/pipe/install/` | the service files |
 
-It also prints your phone's **device link and QR code**. The server shows it only once. After you import it, Pipe keeps it for you: **Profiles → Device link → Show** (desktop) or **Settings → Device link → Show** (Android) shows the link, its QR code and the HTTPS proxy line again. They stay hidden until you click.
+For these unattended commands, setup writes the new **device link** to an owner-only `.link` file and prints its path. Import the link into the app. To view it again, use **Profiles → Device link → Show** on desktop or **Settings → Device link → Show** on Android.
 
 Before you run pipe, finish the parts outside it (setup prints these as **Next steps**):
 1. **DNS:** point each name you entered at the server IP.
@@ -149,13 +177,13 @@ Before you run pipe, finish the parts outside it (setup prints these as **Next s
 
 ### Step 3: Run it
 ```sh
-systemctl restart pipe           # start pipe (it also starts on every boot)
-systemctl status pipe            # should say: active (running)
+sudo systemctl restart pipe      # Pipe also starts on every boot
+sudo systemctl status pipe       # confirm it is active (running)
 ```
 Other commands:
-- `journalctl -u pipe -n 50` shows the log.
-- `systemctl stop pipe` stops pipe.
-- After changing the config (for example, running setup again), run `systemctl restart pipe`.
+- `sudo journalctl -u pipe -n 50` shows the log.
+- `sudo systemctl stop pipe` stops Pipe.
+- After editing the server config, run `sudo systemctl restart pipe`.
 
 The server is done ✅
 
@@ -187,7 +215,7 @@ Get the apps from **Releases** on GitHub (open the latest release and look under
 2. Paste your `pipe://` link into **Add your server**, check the server shown, and click **Save**.
 3. Click the big round button. Pipe sets the system proxy, so browsers and most apps use it.
 
-On a Mac, **TUN** on Home sends every app through Pipe. While it's on, Pipe sets the Mac's DNS to `223.5.5.5` and puts your own DNS settings back when TUN stops, even after a crash.
+On a Mac, **TUN** on Home sends every app through Pipe. Pipe points the Mac's DNS into the tunnel. It restores the previous settings when TUN stops and repairs stale settings on the next startup after a crash.
 
 On macOS, Pipe opens in its own window, with a Dock icon while it's open, and it stays in the menu bar after you close it. On Windows and Linux it opens in Edge, Chrome, Brave or Chromium as its own app window. Windows always has Edge. Without one of those it opens a browser tab. Closing the window while connected keeps Pipe running. Open Pipe again to get the window back, or click **Quit** in the sidebar.
 
@@ -228,7 +256,7 @@ If the direct path to your server is slow, put a relay in between: client → re
    # prints e.g.: pipe relay add --to 203.0.113.7 --tcp 8443 --udp 443,20000-40000
    ```
 2. **On the relay VPS**, as root:
-   - Download pipe as in Part 1, Step 1, then `install -m 0755 pipe /usr/local/bin/pipe`. Leave it there, because the relay's boot service runs it from that path.
+   - Download and install Pipe as in Part 1, Step 1.
    - Install nftables if it's missing (Debian or Ubuntu: `apt install nftables`).
    - Run each server's line from step 1. Each run prints that server's **relay code** and the ports it uses:
      ```
@@ -243,7 +271,7 @@ If the direct path to your server is slow, put a relay in between: client → re
 - **Fast uses the relay only when the link has a Fast pin** (servers next to a website, where the server's line includes `--udp`). A server that has 80/443 to itself relays Stealth only. Rescue never uses the relay.
 - **The code shows a private IP** (some cloud VPSes): run the line again with `--host <the VPS's public IP or name>` added.
 - **A server's IP or ports changed:** run its new line on the relay. A server keeps its relay ports, and so its code, whenever they're still free.
-- **On the relay:** `pipe relay status` lists each server with its code and traffic. `pipe relay remove --to <server IP>` drops one server, and `pipe relay remove` deletes everything and restores the VPS's network settings. A new `pipe` binary on the relay needs no reinstall.
+- **On the relay:** `pipe relay status` lists each server with its code and traffic. `pipe relay remove --to <server IP>` drops one server, and `pipe relay remove` deletes everything and restores the VPS's network settings. Use `sudo pipe update` to update the command and its boot copy together.
 
 ## Troubleshoot
 ```sh
@@ -294,20 +322,30 @@ DNS keys need only small permissions:
 - **Cloudflare:** a token with Zone:Read + DNS:Edit on that one zone.
 
 ### Without questions
-Setup also runs non-interactively, for scripts:
+Setup also runs non-interactively for scripts.
+
 ```sh
-./pipe server setup --yes --ip 203.0.113.7 --sni proxy.example.org --fast-hop 20000-40000 \
+sudo /usr/local/bin/pipe server setup --yes --ip 203.0.113.7 --sni proxy.example.org --fast-hop 20000-40000 \
   --dns cloudflare --dns-token-file cf-token \
   --rescue-sni static.example.com --rescue-cert origin.pem --rescue-key origin.key \
-  --device phone
+  --device my-device
 ```
 `pipe server setup --help` lists every flag. To do every step by hand, see `docs/DEPLOY_MANUAL.md`.
 
 ### Update or remove
+
+Use the signed updater on Linux starting with Pipe 0.7.6-alpha.
+
+- `sudo pipe update` fetches and verifies the release against its Ed25519-signed manifest. It updates the installed server, relay, and Pipe Helper binaries and restarts active daemons. The relay uses the new binary on its next apply or boot.
+- `sudo pipe update --check` previews installed and offered versions, target paths, and planned restarts.
+- `sudo pipe update --from <dir-or-archive>` updates offline. Keep `SHA256SUMS`, `SHA256SUMS.sig`, and the release archive together. Sources in `/home` or `/tmp` work.
+- `sudo pipe update --proxy <url>` updates online through an HTTP(S) or SOCKS5 proxy. The updater also honors `HTTPS_PROXY` in its environment.
+
+Disconnect and quit the Pipe app before updating a Helper with an active TUN session.
+
 ```sh
-./pipe server setup                 # with a new binary: upgrades and keeps all devices and keys
-pipe server uninstall --dir /var/lib/pipe           # stops pipe, removes its services, keeps the state
-pipe server uninstall --dir /var/lib/pipe --purge   # also deletes /var/lib/pipe and every device key
+sudo pipe server uninstall --dir /var/lib/pipe         # remove services and keep state
+sudo pipe server uninstall --dir /var/lib/pipe --purge # also delete state and device keys
 ```
 
 ## Development

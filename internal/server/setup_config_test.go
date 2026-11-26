@@ -279,13 +279,13 @@ func TestSetupPrivilegedInputsRequireTrustedPath(t *testing.T) {
 	if _, err := LoadSetupConfig(dst); err == nil || err.Error() != want {
 		t.Fatalf("writable config parent error = %v, want %q", err, want)
 	}
-	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil {
+	if _, err := readSetupOperatorFile(dst, 990, trustedSetupOperator(), maxSetupConfigBytes, true); err == nil {
 		t.Fatal("setup staged a credential with a writable parent")
 	}
 	must(t, os.Chmod(dir, 0755))
 	must(t, os.Chown(dir, 990, 990))
 	want = fmt.Sprintf("unsafe setup path %q: %q must not be owned by user pipe", dst, dir)
-	if _, err := readSetupOperatorFile(dst, 990, maxSetupConfigBytes, true); err == nil || err.Error() != want {
+	if _, err := readSetupOperatorFile(dst, 990, trustedSetupOperator(), maxSetupConfigBytes, true); err == nil || err.Error() != want {
 		t.Fatalf("service-owned config parent error = %v, want %q", err, want)
 	}
 }
@@ -299,11 +299,11 @@ func TestSetupRefusesUnrelatedInputOwner(t *testing.T) {
 	const operator = 65530
 	must(t, os.Chown(path, operator, operator))
 	t.Setenv("SUDO_UID", "0")
-	if _, err := readSetupOperatorFile(path, 990, maxSetupConfigBytes, true); err == nil {
+	if _, err := LoadSetupConfig(path); err == nil {
 		t.Fatal("accepted input owned by an unrelated account")
 	}
 	t.Setenv("SUDO_UID", "65530")
-	if _, err := readSetupOperatorFile(path, 990, maxSetupConfigBytes, true); err != nil {
+	if _, err := LoadSetupConfig(path); err != nil {
 		t.Fatalf("trusted operator input: %v", err)
 	}
 }

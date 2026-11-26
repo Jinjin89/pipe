@@ -22,7 +22,8 @@ const (
 const (
 	StateMissing     = "missing"     // not installed, or not running
 	StateOK          = "ok"          // answering with the app's version
-	StateOutdated    = "outdated"    // answering with another version
+	StateOutdated    = "outdated"    // helper needs an update
+	StateNewer       = "newer"       // the app needs an update
 	StateUnsupported = "unsupported" // no helper on this OS
 	StateError       = "error"       // installed but refuses us (another owner) or is broken
 )
@@ -39,6 +40,9 @@ var ErrCanceled = errors.New("Cancelled.")
 
 // ErrOutdated means the connected helper needs an update.
 var ErrOutdated = errors.New(msgOutdated)
+
+// ErrNewer means the app needs an update before it can use the helper.
+var ErrNewer = errors.New(msgNewer)
 
 // Paths are the fixed, root-owned locations of an installed helper.
 type Paths struct {

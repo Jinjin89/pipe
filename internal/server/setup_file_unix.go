@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -30,24 +29,16 @@ func setupFileOwner(info os.FileInfo) (uint32, bool) {
 // openSetupOperatorFile resolves each component from an open directory. An
 // operator-owned entry in a sticky directory such as /tmp cannot be replaced
 // by Pipe. Outside that case, writable group bits can also represent ACLs.
-func openSetupOperatorFile(path string, pipeUID uint32) (*os.File, error) {
-	return openTrustedSetupPath(path, pipeUID, trustedSetupOperator(), false, false)
+// The boolean reports whether any component is owned by the operator.
+func openSetupOperatorFile(path string, pipeUID, operatorUID uint32) (*os.File, bool, error) {
+	return openTrustedSetupPath(path, pipeUID, operatorUID, false, false)
 }
 
-func trustedSetupOperator() uint32 {
-	if os.Getuid() != 0 {
-		return uint32(os.Getuid())
-	}
-	uid, _ := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32)
-	return uint32(uid)
-}
-
-func createSetupOutput(path string, pipeUID uint32) (*os.File, func(bool) error, error) {
-	operator := trustedSetupOperator()
-	if operator == pipeUID {
+func createSetupOutput(path string, pipeUID, operatorUID uint32) (*os.File, func(bool) error, error) {
+	if operatorUID == pipeUID {
 		return nil, nil, fmt.Errorf("user pipe cannot own the enrollment output")
 	}
-	dir, err := openTrustedSetupPath(filepath.Dir(path), pipeUID, operator, false, false)
+	dir, _, err := openTrustedSetupPath(filepath.Dir(path), pipeUID, operatorUID, false, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,7 +49,7 @@ func createSetupOutput(path string, pipeUID uint32) (*os.File, func(bool) error,
 		return nil, nil, &os.PathError{Op: "create enrollment file", Path: path, Err: err}
 	}
 	file := os.NewFile(uintptr(fd), path)
-	if err := file.Chown(int(operator), -1); err != nil {
+	if err := file.Chown(int(operatorUID), -1); err != nil {
 		file.Close()
 		_ = unix.Unlinkat(int(dir.Fd()), name, 0)
 		dir.Close()
@@ -77,8 +68,9 @@ func createSetupOutput(path string, pipeUID uint32) (*os.File, func(bool) error,
 	}, nil
 }
 
+// State paths use the invoking identity's trust rules.
 func openSetupState(path string, pipeUID uint32, create bool) (*os.Root, error) {
-	dir, err := openTrustedSetupPath(path, pipeUID, trustedSetupOperator(), true, create)
+	dir, _, err := openTrustedSetupPath(path, pipeUID, trustedSetupOperator(), true, create)
 	if err != nil {
 		return nil, err
 	}
@@ -88,15 +80,15 @@ func openSetupState(path string, pipeUID uint32, create bool) (*os.Root, error) 
 	return os.OpenRoot(fmt.Sprintf("/proc/self/fd/%d", dir.Fd()))
 }
 
-func openTrustedSetupPath(path string, pipeUID, operator uint32, state, create bool) (*os.File, error) {
+func openTrustedSetupPath(path string, pipeUID, operatorUID uint32, state, create bool) (*os.File, bool, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil || abs == "/" {
-		return nil, fmt.Errorf("invalid setup path %q", path)
+		return nil, false, fmt.Errorf("invalid setup path %q", path)
 	}
 	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 	fd, err := unix.Open("/", dirFlags, 0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() {
 		if fd >= 0 {
@@ -105,45 +97,40 @@ func openTrustedSetupPath(path string, pipeUID, operator uint32, state, create b
 	}()
 	parts := strings.Split(strings.TrimPrefix(abs, "/"), "/")
 	pathPart := "/"
+	operatorOwned := false
 	for i := 0; ; i++ {
 		leaf := i == len(parts)
 		if !state || !leaf {
 			var stat unix.Stat_t
 			if err := unix.Fstat(fd, &stat); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			// The state directory will become Pipe-owned, so its immediate
 			// parent must prohibit renames even if it is sticky.
 			requireProtected := leaf || state && i == len(parts)-1
 			if stat.Uid == pipeUID {
-				return nil, fmt.Errorf("unsafe setup path %q: %q must not be owned by user pipe", path, pathPart)
+				return nil, false, fmt.Errorf("unsafe setup path %q: %q must not be owned by user pipe", path, pathPart)
 			}
-			if stat.Uid != 0 && stat.Uid != operator {
-				return nil, fmt.Errorf("unsafe setup path %q: %q must be owned by root or the setup operator", path, pathPart)
+			if stat.Uid != 0 && stat.Uid != operatorUID {
+				return nil, false, fmt.Errorf("unsafe setup path %q: %q must be owned by root or the setup operator", path, pathPart)
 			}
+			operatorOwned = operatorOwned || stat.Uid != 0
 			sticky := stat.Mode&unix.S_ISVTX != 0
 			if stat.Mode&0022 != 0 && (requireProtected || !sticky) {
 				const writablePath = "unsafe setup path %q: %q is group- or world-writable; "
 				if sticky {
-					return nil, fmt.Errorf(writablePath+"choose a path under a protected directory writable only by root or the operator (for example, /root/pipe/setup.json for input or %s for state)", path, pathPart, setupStateDir)
+					return nil, false, fmt.Errorf(writablePath+"choose a path under a protected directory writable only by root or the operator (for example, /root/pipe/setup.json for input or %s for state)", path, pathPart, setupStateDir)
 				}
 				if pathPart == "/" {
-					return nil, fmt.Errorf(writablePath+"ask the system administrator to review the filesystem root permissions before running setup", path, pathPart)
+					return nil, false, fmt.Errorf(writablePath+"ask the system administrator to review the filesystem root permissions before running setup", path, pathPart)
 				}
-				argument := pathPart
-				if strings.ContainsFunc(pathPart, func(r rune) bool {
-					return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
-						r >= '0' && r <= '9' || strings.ContainsRune("/._-", r))
-				}) {
-					argument = "'" + strings.ReplaceAll(pathPart, "'", `'\''`) + "'"
-				}
-				return nil, fmt.Errorf(writablePath+"run: chmod go-w %s", path, pathPart, argument)
+				return nil, false, fmt.Errorf(writablePath+"run: chmod go-w %s", path, pathPart, quoteSetupShellPath(pathPart))
 			}
 		}
 		if leaf {
 			file := os.NewFile(uintptr(fd), path)
 			fd = -1
-			return file, nil
+			return file, operatorOwned, nil
 		}
 		flags := dirFlags
 		if !state && i == len(parts)-1 {
@@ -162,7 +149,7 @@ func openTrustedSetupPath(path string, pipeUID, operator uint32, state, create b
 			}
 		}
 		if err != nil {
-			return nil, fmt.Errorf("open setup path %q without following links: %w", pathPart, err)
+			return nil, false, fmt.Errorf("open setup path %q without following links: %w", pathPart, err)
 		}
 		_ = unix.Close(fd)
 		fd = next
