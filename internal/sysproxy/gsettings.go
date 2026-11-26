@@ -4,6 +4,7 @@ package sysproxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -39,11 +40,6 @@ func (g Gsettings) Capture() (json.RawMessage, error) {
 
 func (g Gsettings) Apply(host string, port int) error {
 	p := strconv.Itoa(port)
-	list := "['localhost', '*.local'"
-	for _, c := range bypassAddresses {
-		list += ", '" + c + "'"
-	}
-	list += "]"
 	for _, scheme := range []string{"http", "https", "socks"} {
 		schema := "org.gnome.system.proxy." + scheme
 		if _, err := g.Run("gsettings", "set", schema, "host", host); err != nil {
@@ -53,33 +49,63 @@ func (g Gsettings) Apply(host string, port int) error {
 			return err
 		}
 	}
-	if _, err := g.Run("gsettings", "set", "org.gnome.system.proxy", "ignore-hosts", list); err != nil {
+	if _, err := g.Run("gsettings", "set", "org.gnome.system.proxy", "ignore-hosts", gnomeBypass()); err != nil {
 		return err
 	}
 	_, err := g.Run("gsettings", "set", "org.gnome.system.proxy", "mode", "manual")
 	return err
 }
 
+func gnomeBypass() string {
+	return "['localhost', '*.local', '" + strings.Join(bypassAddresses, "', '") + "']"
+}
+
 func (g Gsettings) IsApplied(host string, port int) bool {
-	get := func(schema, key string) string {
-		out, _ := g.Run("gsettings", "get", schema, key)
-		return trim(out)
+	return g.verifyCleared(host, port) != nil
+}
+
+func (g Gsettings) verifyCleared(host string, port int) error {
+	modeOut, err := g.Run("gsettings", "get", "org.gnome.system.proxy", "mode")
+	if err != nil {
+		return fmt.Errorf("read GNOME proxy mode: %w", err)
 	}
-	return get("org.gnome.system.proxy", "mode") == "'manual'" &&
-		get("org.gnome.system.proxy.http", "host") == "'"+host+"'" &&
-		get("org.gnome.system.proxy.http", "port") == strconv.Itoa(port)
+	if trim(modeOut) != "'manual'" {
+		return nil
+	}
+	wantHost, wantPort := "'"+host+"'", strconv.Itoa(port)
+	for _, scheme := range []string{"http", "https", "socks"} {
+		schema := "org.gnome.system.proxy." + scheme
+		hOut, err := g.Run("gsettings", "get", schema, "host")
+		if err != nil {
+			return fmt.Errorf("read GNOME %s proxy host: %w", scheme, err)
+		}
+		pOut, err := g.Run("gsettings", "get", schema, "port")
+		if err != nil {
+			return fmt.Errorf("read GNOME %s proxy port: %w", scheme, err)
+		}
+		if trim(hOut) == wantHost && trim(pOut) == wantPort {
+			return fmt.Errorf("GNOME %s proxy still points to Pipe", scheme)
+		}
+	}
+	return nil
 }
 
 func (g Gsettings) RestoreIfApplied(saved json.RawMessage, host string, port int) error {
-	return restoreIfApplied(g, saved, host, port)
+	return g.restore(saved, map[string]string{
+		"mode": "'manual'", "ignore-hosts": gnomeBypass(), "host": "'" + host + "'", "port": strconv.Itoa(port),
+	})
 }
 
 func (g Gsettings) Restore(raw json.RawMessage) error {
+	return g.restore(raw, nil)
+}
+
+func (g Gsettings) restore(raw json.RawMessage, applied map[string]string) error {
 	var saved map[string]string
 	if err := json.Unmarshal(raw, &saved); err != nil {
 		return err
 	}
-	var first error
+	var result error
 	// Restore mode last so a half-restored state is never "manual" with wrong hosts.
 	for i := len(gnomeKeys) - 1; i >= 0; i-- {
 		k := gnomeKeys[i]
@@ -87,11 +113,18 @@ func (g Gsettings) Restore(raw json.RawMessage) error {
 		if !ok {
 			continue
 		}
-		if _, err := g.Run("gsettings", "set", k.schema, k.key, value); err != nil && first == nil {
-			first = fmt.Errorf("restore %s: %w", k.key, err)
+		if applied != nil {
+			out, err := g.Run("gsettings", "get", k.schema, k.key)
+			result = errors.Join(result, err)
+			if err != nil || trim(out) != applied[k.key] {
+				continue
+			}
+		}
+		if _, err := g.Run("gsettings", "set", k.schema, k.key, value); err != nil {
+			result = errors.Join(result, fmt.Errorf("restore %s: %w", k.key, err))
 		}
 	}
-	return first
+	return result
 }
 
 // Kde drives kioslaverc through kwriteconfig5 or kwriteconfig6.
@@ -120,14 +153,7 @@ func (k Kde) Capture() (json.RawMessage, error) {
 }
 
 func (k Kde) Apply(host string, port int) error {
-	addr := "http://" + host + " " + strconv.Itoa(port)
-	no := "localhost,.local," + strings.Join(bypassAddresses, ",")
-	values := [][2]string{
-		{"httpProxy", addr}, {"httpsProxy", addr},
-		{"socksProxy", "socks://" + host + " " + strconv.Itoa(port)},
-		{"NoProxyFor", no}, {"ProxyType", "1"},
-	}
-	for _, v := range values {
+	for _, v := range kdeProxyValues(host, port) {
 		if err := k.write(v[0], v[1]); err != nil {
 			return err
 		}
@@ -136,17 +162,65 @@ func (k Kde) Apply(host string, port int) error {
 	return nil
 }
 
-func (k Kde) IsApplied(host string, port int) bool {
-	out, err := k.Run(k.Read, "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpProxy")
-	if err != nil || trim(out) != "http://"+host+" "+strconv.Itoa(port) {
-		return false
+func kdeProxyValues(host string, port int) [][2]string {
+	addr := "http://" + host + " " + strconv.Itoa(port)
+	no := "localhost,.local," + strings.Join(bypassAddresses, ",")
+	return [][2]string{
+		{"httpProxy", addr}, {"httpsProxy", addr},
+		{"socksProxy", "socks://" + host + " " + strconv.Itoa(port)},
+		{"NoProxyFor", no}, {"ProxyType", "1"},
 	}
+}
+
+func (k Kde) IsApplied(host string, port int) bool {
+	return k.verifyCleared(host, port) != nil
+}
+
+func (k Kde) verifyCleared(host string, port int) error {
 	kind, err := k.Run(k.Read, "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType")
-	return err == nil && trim(kind) == "1"
+	if err != nil {
+		return fmt.Errorf("read KDE ProxyType: %w", err)
+	}
+	if trim(kind) != "1" {
+		return nil
+	}
+	httpAddr := "http://" + host + " " + strconv.Itoa(port)
+	socksAddr := "socks://" + host + " " + strconv.Itoa(port)
+	for _, check := range [][2]string{
+		{"httpProxy", httpAddr},
+		{"httpsProxy", httpAddr},
+		{"socksProxy", socksAddr},
+	} {
+		out, err := k.Run(k.Read, "--file", "kioslaverc", "--group", "Proxy Settings", "--key", check[0])
+		if err != nil {
+			return fmt.Errorf("read KDE %s: %w", check[0], err)
+		}
+		if trim(out) == check[1] {
+			return fmt.Errorf("KDE %s still points to Pipe", check[0])
+		}
+	}
+	return nil
 }
 
 func (k Kde) RestoreIfApplied(saved json.RawMessage, host string, port int) error {
-	return restoreIfApplied(k, saved, host, port)
+	var values map[string]string
+	if err := json.Unmarshal(saved, &values); err != nil {
+		return err
+	}
+	var result error
+	for _, v := range kdeProxyValues(host, port) {
+		out, err := k.Run(k.Read, "--file", "kioslaverc", "--group", "Proxy Settings", "--key", v[0])
+		if err == nil && trim(out) == v[1] {
+			value := values[v[0]]
+			if v[0] == "ProxyType" && value == "" {
+				value = "0"
+			}
+			err = k.write(v[0], value)
+		}
+		result = errors.Join(result, err)
+	}
+	k.notify()
+	return result
 }
 
 func (k Kde) Restore(raw json.RawMessage) error {

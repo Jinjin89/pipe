@@ -21,6 +21,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,8 @@ import (
 
 	"pipe/internal/link"
 	"pipe/internal/localfile"
+
+	"golang.org/x/term"
 )
 
 const (
@@ -43,12 +46,14 @@ type SetupCommand struct {
 	AsPipe bool
 
 	installFromSetup bool
+	enrollmentFile   *os.File
 }
 
 // SetupInterface is one network interface and its addresses.
 type SetupInterface struct {
-	Name  string
-	Addrs []netip.Addr
+	Name     string
+	Addrs    []netip.Addr
+	Loopback bool
 }
 
 // SetupOptions combines the setup choices with the CLI-only controls.
@@ -59,6 +64,7 @@ type SetupOptions struct {
 	FromConfig  bool // Omitted optional services are off when applying a JSON file.
 	NoProxy     bool
 	ClearRescue bool
+	LinkFile    string // exclusive output for an unattended device link
 }
 
 // SetupEnv holds every side effect so tests can replace it.
@@ -75,9 +81,12 @@ type SetupEnv struct {
 	Suffix         func() string
 	In             io.Reader
 	Out            io.Writer
+	unattended     bool
 
-	chownStagedFile func(*os.File, uint32, uint32) error // optional test hook
-	probeBinding    func(setupBinding) error
+	chownStagedFile  func(*os.File, uint32, uint32) error // optional test hook
+	probeBinding     func(setupBinding) error
+	occupiedUDPPorts func() ([]uint16, error)
+	openImage        func(string) (*os.File, error)
 }
 
 // NewSetupEnv returns the real hooks.
@@ -89,9 +98,11 @@ func NewSetupEnv(in io.Reader, out io.Writer) (SetupEnv, error) {
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		executable = resolved
 	}
+	output, outputIsFile := out.(*os.File)
 	return SetupEnv{
 		GOOS: runtime.GOOS, EUID: os.Geteuid(), Executable: executable,
-		Run: runSetupCommand, LookupPipeUser: lookupPipeUser,
+		openImage: localfile.OpenTrustedRunningImage,
+		Run:       runSetupCommand, LookupPipeUser: lookupPipeUser,
 		Interfaces: listSetupInterfaces, PortProbe: setupPortProbe,
 		Suffix: func() string {
 			b := make([]byte, 6)
@@ -99,6 +110,7 @@ func NewSetupEnv(in io.Reader, out io.Writer) (SetupEnv, error) {
 			return hex.EncodeToString(b)
 		},
 		In: in, Out: out,
+		unattended: !outputIsFile || !term.IsTerminal(int(output.Fd())),
 	}, nil
 }
 
@@ -127,13 +139,13 @@ func runSetupCommand(ctx context.Context, c SetupCommand) error {
 		if err != nil || !found {
 			return errors.New("user pipe does not exist")
 		}
-		cmd.Env = append(os.Environ(), "HOME="+setupStateDir)
-		if c.installFromSetup {
-			cmd.Env = append(cmd.Env, setupInstallEnv+"=1")
-		}
+		cmd.Env = setupChildEnvironment(c.installFromSetup)
 		if err := dropCredentials(cmd, uid, gid); err != nil {
 			return err
 		}
+	}
+	if c.enrollmentFile != nil {
+		cmd.ExtraFiles = []*os.File{c.enrollmentFile}
 	}
 	// Interrupt the child instead of killing it so it can restore the terminal.
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -142,6 +154,14 @@ func runSetupCommand(ctx context.Context, c SetupCommand) error {
 		return fmt.Errorf("%s: %w", strings.Join(c.Argv[:min(len(c.Argv), 3)], " "), err)
 	}
 	return nil
+}
+
+func setupChildEnvironment(install bool) []string {
+	env := []string{"HOME=" + setupStateDir, "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"}
+	if install {
+		env = append(env, setupInstallEnv+"=1")
+	}
+	return env
 }
 
 func listSetupInterfaces() ([]SetupInterface, error) {
@@ -155,7 +175,7 @@ func listSetupInterfaces() ([]SetupInterface, error) {
 		if err != nil {
 			continue
 		}
-		entry := SetupInterface{Name: iface.Name}
+		entry := SetupInterface{Name: iface.Name, Loopback: iface.Flags&net.FlagLoopback != 0}
 		for _, a := range addrs {
 			if p, err := netip.ParsePrefix(a.String()); err == nil {
 				entry.Addrs = append(entry.Addrs, p.Addr().Unmap())
@@ -207,8 +227,8 @@ func (r *setupRun) detect(fresh bool) (SetupDetection, error) {
 	}
 	d := detectInterfaces(ifaces)
 	if fresh {
-		d.Port80Busy = portInUse(r.probePort(setupBinding{"HTTP", "tcp", 80, false}))
-		d.Port443Busy = portInUse(r.probePort(setupBinding{"HTTPS", "tcp", 443, false}))
+		d.Port80Busy = portInUse(r.probePort(setupBinding{name: "HTTP", network: "tcp", port: 80}))
+		d.Port443Busy = portInUse(r.probePort(setupBinding{name: "HTTPS", network: "tcp", port: 443}))
 	}
 	return d, nil
 }
@@ -217,6 +237,7 @@ func (e SetupEnv) path(p string) string { return filepath.Join(e.Root, p) }
 
 type setupRun struct {
 	SetupEnv
+	image      *os.File
 	opts       SetupOptions
 	in         *bufio.Reader
 	uid        uint32
@@ -283,6 +304,14 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	r := &setupRun{ctx: ctx, SetupEnv: env, opts: opts, in: bufio.NewReader(env.In)}
+	if env.openImage != nil {
+		image, err := env.openImage(env.Executable)
+		if err != nil {
+			return fmt.Errorf("start setup from a root-owned, protected Pipe executable: %w", err)
+		}
+		defer image.Close()
+		r.image = image
+	}
 	uid, gid, found, err := r.LookupPipeUser()
 	if err != nil {
 		return err
@@ -328,8 +357,17 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 	if plan.saved != nil {
 		saved = *plan.saved
 	}
+	if plan.saved == nil || opts.BlockEgressIPs != nil {
+		blocked, err := normalizeEgressIPs(append(slices.Clone(opts.BlockEgressIPs), det.PublicIPs...))
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(blocked, saved.BlockEgressIPs) {
+			plan.update.BlockEgressIPs = blocked
+		}
+	}
 	proposed, err := plan.update.proposed(saved, func(port uint16) error {
-		binding := setupBinding{"Rescue VMess", "tcp", port, true}
+		binding := setupBinding{name: "Rescue VMess", network: "tcp", port: port, loopback: true}
 		if plan.saved != nil && savedSetupPort(saved, binding) {
 			return nil
 		}
@@ -339,8 +377,33 @@ func Setup(ctx context.Context, env SetupEnv, opts SetupOptions) error {
 		return err
 	}
 	plan.update.VMess = proposed.Ports.VMess
-	if err := r.checkPorts(proposed, plan.saved); err != nil {
+	if plan.fast.Address != "" && plan.fast.Hop == "" {
+		return errors.New("a Fast hop address requires a hopping range")
+	}
+	var hopDestinations []netip.Addr
+	if proposed.FastHop != "" {
+		ifaces, err := r.Interfaces()
+		if err != nil {
+			return err
+		}
+		address, err := parseHopAddress(plan.fast.Address)
+		if err != nil {
+			return err
+		}
+		hopDestinations, err = fastHopDestinations(ifaces, address)
+		if err != nil {
+			return err
+		}
+	}
+	if err := r.checkPorts(proposed, plan.saved, hopDestinations); err != nil {
 		return err
+	}
+	if r.image != nil {
+		for _, dir := range []string{filepath.Dir(setupBinary), setupUnitDir, setupSysctlDir} {
+			if err := localfile.MakeTrustedDirectory(r.path(dir)); err != nil {
+				return err
+			}
+		}
 	}
 	if err := r.prepareState(ctx, found); err != nil {
 		return err
@@ -371,6 +434,9 @@ func fileExists(p string) bool {
 
 func (r *setupRun) installBinary() error {
 	dest := r.path(setupBinary)
+	if r.image != nil {
+		return localfile.InstallTrustedExecutable(r.image, dest)
+	}
 	info, err := os.Lstat(dest)
 	regular := err == nil && info.Mode().IsRegular()
 	if regular {
@@ -801,6 +867,9 @@ func (r *setupRun) authorizedSetupFast(fast SetupFast) (SetupFast, error) {
 	if fast.Port == 0 {
 		fast.Port = installed.Port
 	}
+	if fast.Address == "" {
+		fast.Address = installed.Address
+	}
 	if fast.Hop != "" && fast.Port == 0 {
 		return fast, errors.New("supply --fast-port with --fast-hop when there is no installed pipe-hop.service")
 	}
@@ -836,7 +905,7 @@ func readInstalledSetupHop(path string, pipeUID uint32) (SetupFast, error) {
 			break
 		}
 		fields := strings.Fields(args)
-		if len(fields) != 3 || fields[1] != "--fast-port" {
+		if (len(fields) != 3 && len(fields) != 5) || fields[1] != "--fast-port" {
 			break
 		}
 		port, err := strconv.ParseUint(fields[2], 10, 16)
@@ -846,7 +915,15 @@ func readInstalledSetupHop(path string, pipeUID uint32) (SetupFast, error) {
 		if _, _, err := link.ParseHop(fields[0]); err != nil {
 			break
 		}
-		return SetupFast{Hop: fields[0], Port: uint16(port)}, nil
+		fast := SetupFast{Hop: fields[0], Port: uint16(port)}
+		if len(fields) == 5 {
+			address := strings.Trim(fields[4], `"`)
+			if _, err := parseHopAddress(address); fields[3] != "--address" || err != nil {
+				break
+			}
+			fast.Address = address
+		}
+		return fast, nil
 	}
 	return SetupFast{}, fmt.Errorf("%s must specify a Fast hopping range and UDP port", path)
 }
@@ -991,7 +1068,7 @@ func (r *setupRun) planProxy(plan *setupPlan, o SetupOptions, name string, saved
 		opts.WWW = saved.WWW
 	}
 	if opts.CertMethod == "" {
-		http := setupBinding{"HTTPS proxy HTTP-01", "tcp", 80, false}
+		http := setupBinding{name: "HTTPS proxy HTTP-01", network: "tcp", port: 80}
 		if (plan.saved == nil || !savedSetupPort(*plan.saved, http)) && portInUse(r.probePort(http)) {
 			return errors.New("TCP 80 is in use. Set cert to DNS credentials or certificate files for the HTTPS proxy")
 		}
@@ -1029,7 +1106,7 @@ func setupCertificateOptions(cert *SetupCertificate) (ProxyEnableOptions, error)
 
 func (r *setupRun) applyUpdate(plan setupPlan) error {
 	update := plan.update
-	if plan.saved != nil && update.Proxy == nil && update.Rescue == nil && update.VMess == plan.saved.Ports.VMess {
+	if plan.saved != nil && update.Proxy == nil && update.Rescue == nil && update.VMess == plan.saved.Ports.VMess && update.BlockEgressIPs == nil {
 		return nil
 	}
 	// Stage all privileged inputs before the child can touch the active state.
@@ -1109,8 +1186,16 @@ func (r *setupRun) execute(ctx context.Context, plan setupPlan) (Settings, error
 			} else {
 				r.printf("Device %q is already enrolled. Its existing link stays valid.\n", plan.device)
 			}
-		} else if err := asPipe(setupBinary, "server", "add", plan.device, "--dir", r.opts.Dir); err != nil {
-			return Settings{}, err
+		} else {
+			var err error
+			if r.opts.Yes || r.unattended || r.opts.LinkFile != "" {
+				err = r.enrollToFile(plan.device)
+			} else {
+				err = asPipe(setupBinary, "server", "add", plan.device, "--dir", r.opts.Dir)
+			}
+			if err != nil {
+				return Settings{}, err
+			}
 		}
 	}
 	state, err := filepath.Abs(r.opts.Dir)
@@ -1150,6 +1235,33 @@ func (r *setupRun) execute(ctx context.Context, plan setupPlan) (Settings, error
 		return Settings{}, err
 	}
 	return settings, asRoot("systemctl", "restart", "pipe")
+}
+
+const EnrollSetupDeviceCommand = "--enroll-device"
+
+func (r *setupRun) enrollToFile(device string) error {
+	path := r.opts.LinkFile
+	if path == "" {
+		path = "pipe-device-" + r.Suffix() + ".link"
+	}
+	path, err := filepath.Abs(r.path(path))
+	if err != nil {
+		return err
+	}
+	file, closeFile, err := createSetupOutput(path, r.uid)
+	if err != nil {
+		return err
+	}
+	err = r.Run(r.ctx, SetupCommand{
+		Argv:   []string{setupBinary, "server", "setup", EnrollSetupDeviceCommand, r.opts.Dir, device},
+		AsPipe: true, enrollmentFile: file,
+	})
+	closeErr := closeFile(err == nil)
+	if err != nil {
+		return errors.Join(err, closeErr)
+	}
+	r.printf("Device link written to %s\n", path)
+	return closeErr
 }
 
 func (r *setupRun) installIfChanged(dst string, file installFile) (bool, error) {

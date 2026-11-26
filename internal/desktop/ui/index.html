@@ -124,7 +124,7 @@
   <h2 class="sec">Mode</h2>
   <div class="tiles t3" id="mode-tiles" role="radiogroup" aria-label="Mode"></div>
 
-  <div class="sec-head"><h2 class="sec">Route</h2><button class="btn small" id="test-routes2" disabled>Test routes</button></div>
+  <div class="sec-head"><h2 class="sec">Route</h2><div class="profile-test-actions"><time id="route-tested-at">Never tested</time><button class="btn small" id="test-routes2" disabled>Test routes</button></div></div>
   <div class="tiles t4" id="tier-tiles" role="radiogroup" aria-label="Route"></div>
 
   <h2 class="sec">Rules</h2>
@@ -150,14 +150,16 @@
 </section>
 
 <section class="page" id="page-profiles" hidden>
-  <div class="sec-head"><h1>Profiles</h1><button class="btn" id="test-profiles" disabled>Test</button></div>
+  <div class="sec-head"><h1>Profiles</h1><div class="profile-test-actions"><time id="profiles-tested-at">Never tested</time><button class="btn" id="test-profiles" disabled>Test</button></div></div>
+  <p id="profile-test-progress" class="profile-test-progress" role="status" aria-live="polite"></p>
   <div class="card flush plist" hidden>
     <div class="profile-grid profile-head" aria-hidden="true">
-      <span></span><span class="profile-country"></span>
+      <span>Profile</span><span class="profile-country">Exit</span>
       <span class="profile-metric">Fast</span><span class="profile-metric">Stealth</span><span class="profile-metric">Rescue</span><span></span>
     </div>
     <div id="profile-list"></div>
   </div>
+  <p id="profiles-empty" class="muted">No profiles yet.</p>
   <div class="card add-profile">
     <h2>Add profile</h2>
     <label class="sr" for="add-link">Server link</label>
@@ -203,6 +205,13 @@
     <h2>Logs</h2>
     <div class="setting"><span><b>Log detail</b><small>“Every connection” lists each site and the route it took.</small></span>
       <div class="seg" data-k="logDetail" role="group" aria-label="Log detail"><button data-v="normal">Normal</button><button data-v="connections">Every connection</button></div></div>
+  </div>
+  <div class="card group" id="updates">
+    <h2>Updates</h2>
+    <div class="setting"><span><b>Installed version</b><small id="update-installed">—</small></span><button class="btn small" id="update-check">Check now</button></div>
+    <label class="setting"><span><b>Check automatically</b><small>Check for updates once a day.</small></span><input type="checkbox" class="sw" data-k="updateAuto"></label>
+    <div class="setting update-feedback"><p class="muted small-text" id="update-status" role="status"></p>
+      <button class="btn small primary" id="update-download" hidden>Download</button><button class="btn small" id="update-reveal" hidden>Reveal file</button></div>
   </div>
   <div class="card group">
     <h2>Advanced</h2>

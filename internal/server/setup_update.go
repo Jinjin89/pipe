@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -35,11 +36,12 @@ type setupProxyUpdate struct {
 }
 
 type setupUpdate struct {
-	Initial  *setupInitialSettings
-	Expected string
-	Rescue   *SetupRescue
-	Proxy    *setupProxyUpdate
-	VMess    uint16
+	Initial        *setupInitialSettings
+	Expected       string
+	Rescue         *SetupRescue
+	Proxy          *setupProxyUpdate
+	VMess          uint16
+	BlockEgressIPs []netip.Addr
 }
 
 func settingsDigest(s Settings) string {
@@ -57,6 +59,9 @@ func (u setupUpdate) proposed(saved Settings, probeVMess func(uint16) error) (Se
 		if s.Mode == Shared && s.Ports.Stealth == 0 {
 			s.Ports.Stealth = 8443
 		}
+	}
+	if u.BlockEgressIPs != nil {
+		s.BlockEgressIPs = u.BlockEgressIPs
 	}
 	if u.Rescue != nil {
 		r := u.Rescue

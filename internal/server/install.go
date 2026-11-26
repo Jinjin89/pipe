@@ -6,13 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"pipe/internal/link"
 )
 
 const sysctlConfig = "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\n"
@@ -166,22 +165,27 @@ WantedBy=multi-user.target
 		{"90-pipe.conf", sysctlConfig, 0644},
 	}
 	if fast.Hop != "" {
+		addressArg := ""
+		if fast.Address != "" {
+			addressArg = " --address " + unitArgument(fast.Address)
+		}
 		hopUnit := fmt.Sprintf(`[Unit]
 Description=Pipe Fast UDP port hopping
-After=nftables.service
+Wants=network-online.target
+After=network-online.target nftables.service
 Before=pipe.service
 
 [Service]
 Type=oneshot
 User=root
 RemainAfterExit=yes
-CapabilityBoundingSet=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
-ExecStart=%s server hop-apply --fast-hop %s --fast-port %d
+ExecStart=%s server hop-apply --fast-hop %s --fast-port %d%s
 
 [Install]
 WantedBy=multi-user.target
-`, unitArgument(executable), fast.Hop, fast.Port)
+`, unitArgument(executable), fast.Hop, fast.Port, addressArg)
 		files = append(files, installFile{hopServiceUnit, hopUnit, 0644})
 	}
 	return files
@@ -189,19 +193,43 @@ WantedBy=multi-user.target
 
 const hopTableComment = "pipe Fast port hopping"
 
-func ApplyFastHop(ctx context.Context, ports string, fast uint16) error {
+func ApplyFastHop(ctx context.Context, ports string, fast uint16, address ...netip.Addr) error {
 	if ports == "" || fast == 0 {
 		return errors.New("--fast-hop and --fast-port are required")
 	}
-	return setHopTable(ctx, ports, fast)
+	return setHopTable(ctx, ports, fast, address...)
 }
 
-func setHopTable(ctx context.Context, ports string, fast uint16) error {
+func parseHopAddress(raw string) (netip.Addr, error) {
+	if raw == "" {
+		return netip.Addr{}, nil
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || addr.Zone() != "" || !addr.IsGlobalUnicast() {
+		return netip.Addr{}, errors.New("Fast hop address must be a unicast IP address")
+	}
+	return addr.Unmap(), nil
+}
+
+func setHopTable(ctx context.Context, ports string, fast uint16, address ...netip.Addr) error {
 	if runtime.GOOS != "linux" {
 		return errors.New("Fast port hopping requires nftables on Linux")
 	}
+	var destinations []netip.Addr
 	if ports != "" {
-		if _, _, err := link.ParseHop(ports); err != nil {
+		ifaces, err := listSetupInterfaces()
+		if err != nil {
+			return err
+		}
+		var explicit netip.Addr
+		if len(address) != 0 {
+			explicit = address[0]
+		}
+		destinations, err = fastHopDestinations(ifaces, explicit)
+		if err != nil {
+			return err
+		}
+		if err := checkHopPorts(ports, fast, destinations, occupiedUDPPorts, probeSetupBinding); err != nil {
 			return err
 		}
 	}
@@ -214,10 +242,10 @@ func setHopTable(ctx context.Context, ports string, fast uint16) error {
 		}
 		return string(output), nil
 	}
-	return reconcileHopTable(ports, fast, run)
+	return reconcileHopTable(ports, fast, destinations, run)
 }
 
-func reconcileHopTable(ports string, fast uint16, nft func(string, ...string) (string, error)) error {
+func reconcileHopTable(ports string, fast uint16, addresses []netip.Addr, nft func(string, ...string) (string, error)) error {
 	tables, err := nft("", "list", "tables")
 	if err != nil {
 		return err
@@ -246,8 +274,16 @@ func reconcileHopTable(ports string, fast uint16, nft func(string, ...string) (s
 	if ports != "" {
 		transaction += fmt.Sprintf(`create table inet pipe { comment %q; }
 add chain inet pipe fast_hop { type nat hook prerouting priority dstnat; policy accept; }
-add rule inet pipe fast_hop fib daddr type local udp dport %s redirect to :%d
-`, hopTableComment, ports, fast)
+`, hopTableComment)
+		for _, address := range addresses {
+			family := "ip"
+			if address.Is6() {
+				family = "ip6"
+			}
+			match := fmt.Sprintf("%s daddr %s fib daddr type local udp dport %s", family, address, ports)
+			transaction += "add rule inet pipe fast_hop " + match + " socket wildcard { 0, 1 } return\n"
+			transaction += fmt.Sprintf("add rule inet pipe fast_hop %s redirect to :%d\n", match, fast)
+		}
 	}
 	if transaction == "" {
 		return nil

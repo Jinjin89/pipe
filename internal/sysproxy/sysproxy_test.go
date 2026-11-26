@@ -9,15 +9,22 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"pipe/internal/localfile"
 )
 
 type memBackend struct {
-	state     string
-	applied   int
-	failApply bool
+	state       string
+	captures    int
+	applied     int
+	failApply   bool
+	failRestore bool
 }
 
-func (m *memBackend) Capture() (json.RawMessage, error) { return json.Marshal(m.state) }
+func (m *memBackend) Capture() (json.RawMessage, error) {
+	m.captures++
+	return json.Marshal(m.state)
+}
 func (m *memBackend) Apply(host string, port int) error {
 	m.applied++
 	m.state = "proxy"
@@ -30,7 +37,84 @@ func (m *memBackend) IsApplied(string, int) bool { return m.state == "proxy" }
 func (m *memBackend) RestoreIfApplied(saved json.RawMessage, h string, p int) error {
 	return restoreIfApplied(m, saved, h, p)
 }
-func (m *memBackend) Restore(raw json.RawMessage) error { return json.Unmarshal(raw, &m.state) }
+func (m *memBackend) Restore(raw json.RawMessage) error {
+	if m.failRestore {
+		return errors.New("restore failed")
+	}
+	return json.Unmarshal(raw, &m.state)
+}
+
+func TestFailedProxyRepairRetainsSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.armed")
+	b := &memBackend{state: "original", failRestore: true}
+	m := New(b, path)
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Repair(); err == nil || !m.Armed() {
+		t.Fatalf("repair error = %v, armed = %v", err, m.Armed())
+	}
+	b.failRestore = false
+	if err := m.Repair(); err != nil || m.Armed() || b.state != "original" {
+		t.Fatalf("retry error = %v, armed = %v, state = %s", err, m.Armed(), b.state)
+	}
+}
+
+func TestDamagedProxySnapshotSurvivesRestoreAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.armed")
+	b := &memBackend{state: "original"}
+	m := New(b, path)
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	const broken = `{"saved":`
+	if err := os.WriteFile(path, []byte(broken), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, restore := range []func() error{m.Repair, m.Clear, m.Clear} {
+		if err := restore(); err == nil {
+			t.Error("damaged recovery file was treated as a successful restore")
+		}
+		if raw, err := os.ReadFile(path); err != nil || string(raw) != broken || b.state != "proxy" {
+			t.Fatalf("failed restore lost the recovery file or proxy state: %v", err)
+		}
+	}
+}
+
+func TestSetRejectsDamagedOrUnreadableProxySnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		directory bool
+	}{
+		{name: "invalid JSON", raw: `{"saved":`},
+		{name: "missing saved settings", raw: `{"host":"127.0.0.1","port":7890}`},
+		{name: "null saved settings", raw: `{"saved": null, "host":"127.0.0.1","port":7890}`},
+		{name: "unreadable snapshot", directory: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "proxy.armed")
+			if tc.directory {
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := localfile.WritePrivate(path, []byte(tc.raw)); err != nil {
+				t.Fatal(err)
+			}
+			b := &memBackend{state: "proxy"}
+			if err := New(b, path).Set("127.0.0.1", 7891); err == nil {
+				t.Error("Set accepted an invalid recovery snapshot")
+			}
+			if b.captures != 0 || b.applied != 0 {
+				t.Fatal("Set captured or rewrote the active proxy")
+			}
+			if !tc.directory {
+				if raw, err := os.ReadFile(path); err != nil || string(raw) != tc.raw {
+					t.Fatalf("Set changed the invalid recovery file: %v", err)
+				}
+			}
+		})
+	}
+}
 
 func TestSetClearAndRepair(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxy.armed")
@@ -137,9 +221,40 @@ func TestGsettingsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGsettingsRestoresOnlyOwnedValues(t *testing.T) {
+	r := &recorder{out: map[string]string{
+		"gsettings get org.gnome.system.proxy mode":         "'manual'",
+		"gsettings get org.gnome.system.proxy.http host":    "'127.0.0.1'",
+		"gsettings get org.gnome.system.proxy.http port":    "7890",
+		"gsettings get org.gnome.system.proxy.https host":   "'user-proxy.example'",
+		"gsettings get org.gnome.system.proxy.https port":   "3128",
+		"gsettings get org.gnome.system.proxy ignore-hosts": "['new.example']",
+	}}
+	g := Gsettings{Run: r.run}
+	saved, err := json.Marshal(map[string]string{
+		"org.gnome.system.proxy mode":         "'none'",
+		"org.gnome.system.proxy.http host":    "'original.example'",
+		"org.gnome.system.proxy.http port":    "8080",
+		"org.gnome.system.proxy.https host":   "'original.example'",
+		"org.gnome.system.proxy.https port":   "8080",
+		"org.gnome.system.proxy ignore-hosts": "['original.example']",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.RestoreIfApplied(saved, "127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(r.calls, "\n")
+	if !strings.Contains(all, "set org.gnome.system.proxy.http port 8080") ||
+		strings.Contains(all, "set org.gnome.system.proxy.https") || strings.Contains(all, "set org.gnome.system.proxy ignore-hosts") {
+		t.Fatalf("unexpected restore writes:\n%s", all)
+	}
+}
+
 func TestNetworksetupParsingAndRestore(t *testing.T) {
 	services := "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*Old VPN\nEthernet\n"
-	if got := parseServices(services); len(got) != 2 || got[0] != "Wi-Fi" || got[1] != "Ethernet" {
+	if got := parseServices(services, false); len(got) != 2 || got[0] != "Wi-Fi" || got[1] != "Ethernet" {
 		t.Fatalf("services %v", got)
 	}
 	if p := parseProxy("Enabled: Yes\nServer: 192.0.2.1\nPort: 8080\nAuthenticated Proxy Enabled: 0\n"); !p.Enabled || p.Server != "192.0.2.1" || p.Port != 8080 {
@@ -178,6 +293,206 @@ func TestNetworksetupParsingAndRestore(t *testing.T) {
 	all = strings.Join(r.calls, "\n")
 	if !strings.Contains(all, "-setwebproxy Wi-Fi 192.0.2.1 8080") || !strings.Contains(all, "-setwebproxystate Wi-Fi on") || !strings.Contains(all, "-setsecurewebproxystate Ethernet off") && !strings.Contains(all, "-setsecurewebproxystate Ethernet on") {
 		t.Fatalf("restore calls:\n%s", all)
+	}
+}
+
+func TestNetworksetupSetExtendsSavedServicesBeforeApply(t *testing.T) {
+	const listServices = "networksetup -listallnetworkservices"
+	r := &recorder{out: map[string]string{
+		listServices: "*Wi-Fi\n*Ethernet\n",
+	}}
+	path := filepath.Join(t.TempDir(), "proxy.armed")
+	readSaved := func() json.RawMessage {
+		t.Helper()
+		data, err := ReadPrivate(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var file armedFile
+		if err := json.Unmarshal(data, &file); err != nil {
+			t.Fatal(err)
+		}
+		return file.Saved
+	}
+	n := Networksetup{Run: func(name string, args ...string) (string, error) {
+		out, err := r.run(name, args...)
+		if args[0] == "-getwebproxy" && args[1] == "Ethernet" {
+			r.out[listServices] += "USB Adapter\n" // enabled during Extend
+		}
+		if args[0] == "-setwebproxy" && args[1] == "Ethernet" {
+			var saved []macService
+			if err := json.Unmarshal(readSaved(), &saved); err != nil {
+				t.Fatal(err)
+			}
+			if len(saved) != 3 || saved[0].Name != "Wi-Fi" || saved[0].Web.Server != "192.0.2.1" ||
+				saved[1].Name != "Ethernet" || saved[1].Web.Server != "192.0.2.2" ||
+				saved[2].Name != "USB Adapter" || saved[2].Web.Server != "192.0.2.3" {
+				t.Fatalf("original services were not saved before apply: %+v", saved)
+			}
+		}
+		return out, err
+	}}
+	m := New(n, path)
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readSaved()); got != "[]" {
+		t.Fatalf("empty service snapshot was %s", got)
+	}
+	r.out[listServices] = "Wi-Fi\n*Ethernet\n"
+	r.out["networksetup -getwebproxy Wi-Fi"] = "Enabled: Yes\nServer: 192.0.2.1\nPort: 8080\n"
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	r.calls = nil
+	r.out[listServices] = "Wi-Fi\nEthernet\n"
+	r.out["networksetup -getwebproxy Wi-Fi"] = "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n"
+	r.out["networksetup -getwebproxy Ethernet"] = "Enabled: Yes\nServer: 192.0.2.2\nPort: 8080\n"
+	r.out["networksetup -getwebproxy USB Adapter"] = "Enabled: Yes\nServer: 192.0.2.3\nPort: 8080\n"
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Join(r.calls, "\n"); !strings.Contains(calls, "-setwebproxy Ethernet 127.0.0.1 7890") ||
+		!strings.Contains(calls, "-setwebproxy USB Adapter 127.0.0.1 7890") {
+		t.Fatalf("unexpected proxy writes:\n%s", calls)
+	}
+}
+
+func TestNetworksetupSetBoundsRetriesWhenServicesKeepChanging(t *testing.T) {
+	const listServices = "networksetup -listallnetworkservices"
+	r := &recorder{out: map[string]string{listServices: "Wi-Fi\n"}}
+	enableAfterCapture := map[string]string{"Wi-Fi": "Ethernet", "Ethernet": "Dock", "Dock": "USB Adapter"}
+	n := Networksetup{Run: func(name string, args ...string) (string, error) {
+		out, err := r.run(name, args...)
+		if args[0] == "-getproxybypassdomains" {
+			if next := enableAfterCapture[args[1]]; next != "" {
+				r.out[listServices] += next + "\n"
+				delete(enableAfterCapture, args[1])
+			}
+		}
+		return out, err
+	}}
+	m := New(n, filepath.Join(t.TempDir(), "proxy.armed"))
+	if err := m.Set("127.0.0.1", 7890); !errors.Is(err, errServicesChanged) || m.Armed() {
+		t.Fatalf("Set did not roll back after exhausting retries: armed=%t, error=%v", m.Armed(), err)
+	}
+	calls := strings.Join(r.calls, "\n")
+	if !strings.Contains(calls, "-setwebproxystate Dock off") || strings.Contains(calls, "-setwebproxy ") {
+		t.Fatalf("expected two extensions and a rollback before applying any endpoints:\n%s", calls)
+	}
+}
+
+func TestNetworksetupRestoreSkipsDeletedServices(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		onlyIfOurs bool
+	}{
+		{name: "clear", onlyIfOurs: true},
+		{name: "rollback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const applied = "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n"
+			r := &recorder{out: map[string]string{
+				"networksetup -listallnetworkservices": "Wi-Fi\n*Dock\n",
+				"networksetup -getwebproxy Wi-Fi":      applied,
+				"networksetup -getwebproxy Dock":       applied,
+			}}
+			n := Networksetup{Run: func(name string, args ...string) (string, error) {
+				out, err := r.run(name, args...)
+				if len(args) > 1 && args[1] == "Retired Adapter" {
+					return "", os.ErrNotExist
+				}
+				if args[0] == "-setwebproxystate" && args[2] == "off" {
+					r.out["networksetup -getwebproxy "+args[1]] = "Enabled: No\n"
+				}
+				return out, err
+			}}
+			m := New(n, filepath.Join(t.TempDir(), "proxy.armed"))
+			saved, err := json.Marshal([]macService{{Name: "Retired Adapter"}, {Name: "Wi-Fi"}, {Name: "Dock"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.saveArmed(armedFile{Saved: saved, Host: "127.0.0.1", Port: 7890}); err != nil {
+				t.Fatal(err)
+			}
+			restore := m.Clear
+			if !tc.onlyIfOurs {
+				restore = func() error { return m.restoreLocked(false) }
+			}
+			if err := restore(); err != nil || m.Armed() {
+				t.Fatalf("restore after service deletion: armed=%t, error=%v", m.Armed(), err)
+			}
+			calls := strings.Join(r.calls, "\n")
+			if strings.Contains(calls, "Retired Adapter") || !strings.Contains(calls, "-setwebproxystate Wi-Fi off") ||
+				!strings.Contains(calls, "-setwebproxystate Dock off") {
+				t.Fatalf("restore did not skip only the deleted service:\n%s", calls)
+			}
+		})
+	}
+}
+
+func TestNetworksetupFailedApplyRetainsActiveProxySnapshot(t *testing.T) {
+	const socksSettings = "networksetup -getsocksfirewallproxy Ethernet"
+	r := &recorder{out: map[string]string{
+		"networksetup -listallnetworkservices": "Ethernet\n",
+		socksSettings:                          "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n",
+	}}
+	applyErr := errors.New("fixture secure proxy write failed")
+	n := Networksetup{Run: func(name string, args ...string) (string, error) {
+		out, err := r.run(name, args...)
+		if args[0] == "-setsecurewebproxy" {
+			return "", applyErr
+		}
+		return out, err
+	}}
+	m := New(n, filepath.Join(t.TempDir(), "proxy.armed"))
+	if err := m.Set("127.0.0.1", 7890); !errors.Is(err, applyErr) || !m.Armed() {
+		t.Fatalf("failed apply released the active proxy snapshot: armed=%t, error=%v", m.Armed(), err)
+	}
+	if calls := strings.Join(r.calls, "\n"); !strings.Contains(calls, "-setsocksfirewallproxy Ethernet 127.0.0.1 7890") {
+		t.Fatalf("rollback did not restore the captured SOCKS endpoint:\n%s", calls)
+	}
+	if err := m.Clear(); err == nil || !m.Armed() {
+		t.Fatalf("Clear released an active SOCKS proxy: armed=%t, error=%v", m.Armed(), err)
+	}
+	r.out[socksSettings] = "Enabled: No\n"
+	if err := m.Clear(); err != nil || m.Armed() {
+		t.Fatalf("Clear after disabling the SOCKS proxy: armed=%t, error=%v", m.Armed(), err)
+	}
+}
+
+func TestNetworksetupClearRequiresVerifiedRestoration(t *testing.T) {
+	for _, tc := range []struct {
+		name, socks string
+		err         error
+	}{
+		{name: "unsaved SOCKS proxy", socks: "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n"},
+		{name: "service query failed", err: os.ErrPermission},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "proxy.armed")
+			if err := localfile.WritePrivate(path, []byte(`{"saved":[],"host":"127.0.0.1","port":7890}`)); err != nil {
+				t.Fatal(err)
+			}
+			socks, queryErr := tc.socks, tc.err
+			m := New(Networksetup{Run: func(_ string, args ...string) (string, error) {
+				switch args[0] {
+				case "-listallnetworkservices":
+					return "Ethernet\n", nil
+				case "-getsocksfirewallproxy":
+					return socks, queryErr
+				default:
+					return "Enabled: No\n", nil
+				}
+			}}, path)
+			if err := m.Clear(); err == nil || !m.Armed() {
+				t.Fatalf("Clear released unverified recovery settings: armed=%t, error=%v", m.Armed(), err)
+			}
+			socks, queryErr = "Enabled: No\n", nil
+			if err := m.Clear(); err != nil || m.Armed() {
+				t.Fatalf("Clear did not finish after verification: armed=%t, error=%v", m.Armed(), err)
+			}
+		})
 	}
 }
 
@@ -256,8 +571,11 @@ func TestKdeRequiresProxyTypeAndRestoresUnset(t *testing.T) {
 
 func TestNetworksetupRepairPerService(t *testing.T) {
 	r := &recorder{out: map[string]string{
-		"networksetup -getwebproxy Wi-Fi":    "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n",
-		"networksetup -getwebproxy Ethernet": "Enabled: Yes\nServer: 192.0.2.9\nPort: 3128\n",
+		"networksetup -listallnetworkservices":      "Wi-Fi\nEthernet\n",
+		"networksetup -getwebproxy Wi-Fi":           "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n",
+		"networksetup -getsecurewebproxy Wi-Fi":     "Enabled: Yes\nServer: 192.0.2.9\nPort: 3128\n",
+		"networksetup -getsocksfirewallproxy Wi-Fi": "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n",
+		"networksetup -getwebproxy Ethernet":        "Enabled: Yes\nServer: 192.0.2.9\nPort: 3128\n",
 	}}
 	n := Networksetup{Run: r.run}
 	saved, _ := json.Marshal([]macService{{Name: "Wi-Fi"}, {Name: "Ethernet"}})
@@ -265,7 +583,103 @@ func TestNetworksetupRepairPerService(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := strings.Join(r.calls, "\n")
-	if !strings.Contains(all, "-setwebproxystate Wi-Fi off") || strings.Contains(all, "Ethernet off") {
-		t.Fatalf("only Wi-Fi should be restored:\n%s", all)
+	if !strings.Contains(all, "-setwebproxystate Wi-Fi off") || !strings.Contains(all, "-setsocksfirewallproxystate Wi-Fi off") ||
+		strings.Contains(all, "-setsecurewebproxystate Wi-Fi off") || strings.Contains(all, "Ethernet off") {
+		t.Fatalf("only settings still pointing at Pipe should be restored:\n%s", all)
+	}
+}
+
+func TestNetworksetupSetExtendsServiceEnabledDuringApply(t *testing.T) {
+	const listServices = "networksetup -listallnetworkservices"
+	r := &recorder{out: map[string]string{
+		listServices:                         "Wi-Fi\n*Ethernet\n",
+		"networksetup -getwebproxy Ethernet": "Enabled: Yes\nServer: 192.0.2.9\nPort: 8080\n",
+	}}
+	enabledDuringWrite := false
+	n := Networksetup{Run: func(name string, args ...string) (string, error) {
+		out, err := r.run(name, args...)
+		if !enabledDuringWrite && args[0] == "-setwebproxy" && args[1] == "Wi-Fi" {
+			enabledDuringWrite = true
+			r.out[listServices] = "Wi-Fi\nEthernet\n"
+		}
+		return out, err
+	}}
+	m := New(n, filepath.Join(t.TempDir(), "proxy.armed"))
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatalf("Set failed after service enabled mid-apply: %v", err)
+	}
+	if calls := strings.Join(r.calls, "\n"); !strings.Contains(calls, "-setwebproxy Ethernet 127.0.0.1 7890") {
+		t.Fatalf("service enabled during apply was not configured:\n%s", calls)
+	}
+}
+
+func TestNetworksetupVerifyClearedChecksDisabledServices(t *testing.T) {
+	const applied = "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n"
+	r := &recorder{out: map[string]string{
+		"networksetup -listallnetworkservices":   "*Renamed Dock\n",
+		"networksetup -getwebproxy Renamed Dock": applied,
+	}}
+	m := New(Networksetup{Run: r.run}, filepath.Join(t.TempDir(), "proxy.armed"))
+	saved, _ := json.Marshal([]macService{{Name: "Old Dock"}})
+	if err := m.saveArmed(armedFile{Saved: saved, Host: "127.0.0.1", Port: 7890}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Clear(); err == nil || !m.Armed() {
+		t.Fatalf("Clear released snapshot while disabled service still pointed at Pipe: armed=%t, err=%v", m.Armed(), err)
+	}
+}
+
+func TestNetworksetupTracksLocationAcrossClear(t *testing.T) {
+	const locCmd = "networksetup -getcurrentlocation"
+	r := &recorder{out: map[string]string{
+		locCmd:                                 "Home\n",
+		"networksetup -listallnetworkservices": "Wi-Fi\n",
+	}}
+	m := New(Networksetup{Run: r.run}, filepath.Join(t.TempDir(), "proxy.armed"))
+	if err := m.Set("127.0.0.1", 7890); err != nil {
+		t.Fatal(err)
+	}
+	r.out[locCmd] = "Office\n"
+	if err := m.Clear(); err == nil || !m.Armed() {
+		t.Fatalf("Clear released snapshot from wrong network location: armed=%t, err=%v", m.Armed(), err)
+	}
+	r.out[locCmd] = "Home\n"
+	if err := m.Clear(); err != nil || m.Armed() {
+		t.Fatalf("Clear failed after switching back to saved location: armed=%t, err=%v", m.Armed(), err)
+	}
+}
+
+func TestLinuxVerifyClearedChecksHTTPSAndSOCKSAndReadErrors(t *testing.T) {
+	g := Gsettings{Run: func(_ string, args ...string) (string, error) {
+		switch args[1] + " " + args[2] {
+		case "org.gnome.system.proxy mode":
+			return "'manual'\n", nil
+		case "org.gnome.system.proxy.socks host":
+			return "'127.0.0.1'\n", nil
+		case "org.gnome.system.proxy.socks port":
+			return "7890\n", nil
+		default:
+			return "''\n", nil
+		}
+	}}
+	if err := g.verifyCleared("127.0.0.1", 7890); err == nil {
+		t.Fatal("GNOME verifyCleared missed active SOCKS proxy")
+	}
+	gErr := Gsettings{Run: func(_ string, _ ...string) (string, error) { return "", os.ErrPermission }}
+	if err := gErr.verifyCleared("127.0.0.1", 7890); err == nil {
+		t.Fatal("GNOME verifyCleared treated read error as cleared")
+	}
+	k := Kde{Write: "kwriteconfig6", Read: "kreadconfig6", Run: func(_ string, args ...string) (string, error) {
+		switch args[len(args)-1] {
+		case "ProxyType":
+			return "1\n", nil
+		case "socksProxy":
+			return "socks://127.0.0.1 7890\n", nil
+		default:
+			return "\n", nil
+		}
+	}}
+	if err := k.verifyCleared("127.0.0.1", 7890); err == nil {
+		t.Fatal("KDE verifyCleared missed active SOCKS proxy")
 	}
 }

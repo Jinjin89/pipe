@@ -122,8 +122,9 @@ internal class RoutingView(private val a: Activity, private val act: Actions) {
             val label = when {
                 tier == "auto" && m.connected && !direct -> "Using ${routeName(active)}"
                 item == null || !m.connected -> if (tier == "auto") "Recommended" else ""
-                item.optBoolean("ok") -> "${item.optLong("ms")} ms"
-                else -> "No answer"
+                !item.optBoolean("ok") -> "No reply"
+                item.optLong("ms") == 0L -> "Reachable"
+                else -> "${item.optLong("ms")} ms"
             }
             tile.badge.text = label
             val want = if (label.isEmpty()) View.GONE else View.VISIBLE

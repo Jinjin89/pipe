@@ -35,7 +35,11 @@ type RunOptions struct {
 	WWW         string
 	WebUpstream string
 	CFOriginCA  string
+	FastCert    string
+	BlockEgress []netip.Addr
 	Log         io.Writer
+
+	egress *engine.EgressPolicy
 }
 
 type serverListeners struct {
@@ -59,6 +63,8 @@ func Run(ctx context.Context, options RunOptions) error {
 	if err != nil {
 		return err
 	}
+	options.egress = newServerEgressPolicy(settings, options.BlockEgress)
+	ctx = engine.WithEgressPolicy(ctx, options.egress)
 	devices, err := ReadDevices(options.Dir)
 	if err != nil {
 		return err
@@ -80,7 +86,18 @@ func Run(ctx context.Context, options RunOptions) error {
 	if settings.Mode == Shared {
 		return runShared(ctx, options, settings, devices, address, log)
 	}
+	if options.FastCert != "" {
+		return errors.New("--fast-cert requires shared mode")
+	}
 	return runStandalone(ctx, options, settings, devices, address, log)
+}
+
+func newServerEgressPolicy(settings Settings, extra []netip.Addr) *engine.EgressPolicy {
+	blocked := slices.Concat(settings.BlockEgressIPs, extra)
+	if literal, err := netip.ParseAddr(settings.Domain); err == nil {
+		blocked = append(blocked, literal)
+	}
+	return engine.NewEgressPolicy(blocked...)
 }
 
 func runStandalone(ctx context.Context, options RunOptions, settings Settings, devices []Device, address string, log io.Writer) error {
@@ -121,6 +138,7 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 	if err != nil {
 		return err
 	}
+	defer decoy.Close()
 	var getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	var currentCertificate func(string) *tls.Certificate
 	var httpHandler = redirectHTTPS(settings)
@@ -169,13 +187,13 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 		return fmt.Errorf("obtain HTTPS certificates: %w", err)
 	}
 	var proxy *httpsProxy
-	tlsSite := decoy.main
+	decoyServer := webServer(decoy.main, strictSiteTLS(settings.webName(), getCertificate))
 	if settings.proxyEnabled() {
 		proxy = newHTTPSProxy(decoy.main, devices)
+		proxy.policy = options.egress
 		defer proxy.update(nil)
-		tlsSite = proxy
+		decoyServer = proxyWebServer(proxy, settings.webName(), getCertificate)
 	}
-	decoyServer := webServer(tlsSite, strictProxyTLS(settings.webName(), getCertificate))
 	website, err := serve(decoyServer, "127.0.0.1", settings.Ports.Decoy, serveErrors)
 	if err != nil {
 		return fmt.Errorf("decoy HTTPS listener: %w", err)

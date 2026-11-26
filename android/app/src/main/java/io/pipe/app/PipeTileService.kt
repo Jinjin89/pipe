@@ -23,10 +23,8 @@ class PipeTileService : TileService() {
     private var service: Messenger? = null
     private val listener = Messenger(Handler(Looper.getMainLooper()) { message ->
         if (message.what == VpnControl.STATUS) {
-            val running = message.data.getString(VpnControl.STATUS_JSON)?.let {
-                JSONObject(it).optBoolean("running")
-            } ?: false
-            render(running)
+            val status = message.data.getString(VpnControl.STATUS_JSON)?.let(::JSONObject) ?: JSONObject()
+            render(status.optBoolean("running"), status.optBoolean("blocked"))
         }
         true
     })
@@ -88,11 +86,15 @@ class PipeTileService : TileService() {
         }
     }
 
-    private fun render(running: Boolean) {
-        this.running = running
+    private fun render(running: Boolean, blocked: Boolean = false) {
+        this.running = running || blocked
         qsTile?.apply {
-            state = if (running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-            if (Build.VERSION.SDK_INT >= 29) subtitle = if (running) "Connected" else "Disconnected"
+            state = if (running || blocked) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+            if (Build.VERSION.SDK_INT >= 29) subtitle = when {
+                blocked -> "Traffic blocked"
+                running -> "Connected"
+                else -> "Disconnected"
+            }
             updateTile()
         }
     }

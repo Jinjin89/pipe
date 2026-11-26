@@ -64,7 +64,7 @@ func EncodeOptions(o clientctl.Options) (SessionOptions, error) {
 }
 
 // DecodeOptions validates a request from the app and returns the engine
-// options. TUN is always on.
+// options. TUN mode exposes no anonymous mixed proxy.
 func DecodeOptions(s SessionOptions) (clientctl.Options, error) {
 	profile, err := link.Parse(s.Link)
 	if err != nil {
@@ -130,5 +130,6 @@ func DecodeOptions(s SessionOptions) (clientctl.Options, error) {
 		Listen:   listen,
 		LogLevel: level,
 		TUN:      true,
+		TUNOnly:  true,
 	}, nil
 }

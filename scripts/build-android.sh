@@ -3,10 +3,21 @@
 set -euo pipefail
 umask 077
 
-case ${1:-} in
-  ""|--bind-only|--gradle-only) ;;
-  *) printf 'Usage: %s [--bind-only|--gradle-only]\n' "$0" >&2; exit 2 ;;
-esac
+bind_only=0
+gradle_only=0
+debug_only=0
+for arg in "$@"; do
+  case $arg in
+    --bind-only) bind_only=1 ;;
+    --gradle-only) gradle_only=1 ;;
+    --debug) debug_only=1 ;;
+    *) printf 'Usage: %s [--bind-only|--gradle-only] [--debug]\n' "$0" >&2; exit 2 ;;
+  esac
+done
+if (( bind_only && gradle_only )); then
+  printf 'Choose one of --bind-only and --gradle-only.\n' >&2
+  exit 2
+fi
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd -- "$repo"
@@ -33,6 +44,20 @@ export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$android_user_default}"
 gradle="${GRADLE:-$gradle_default}"
 keytool="${JAVA_HOME:+$JAVA_HOME/bin/}keytool"
 
+if (( !bind_only && !debug_only )); then
+  export PIPE_ANDROID_RELEASE_STORE="${PIPE_ANDROID_RELEASE_STORE:-$HOME/.config/pipe/android-release.p12}"
+  export PIPE_ANDROID_RELEASE_PASSWORD_FILE="${PIPE_ANDROID_RELEASE_PASSWORD_FILE:-$PIPE_ANDROID_RELEASE_STORE.password}"
+  export PIPE_ANDROID_RELEASE_ALIAS="${PIPE_ANDROID_RELEASE_ALIAS:-pipe}"
+  if [[ ! -s $PIPE_ANDROID_RELEASE_STORE || ! -s $PIPE_ANDROID_RELEASE_PASSWORD_FILE ]]; then
+    printf 'Release signing requires the existing keystore and password file. Use --debug for a local debug build.\n' >&2
+    exit 1
+  fi
+  if [[ $(stat -c '%a' -- "$PIPE_ANDROID_RELEASE_PASSWORD_FILE") != 600 ]]; then
+    printf 'The release signing password file must have mode 0600.\n' >&2
+    exit 1
+  fi
+fi
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/pipe-android-build.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 export TMPDIR="$work/tmp"
@@ -45,7 +70,7 @@ bind() {
     -ldflags '-s -w -checklinkname=0' -o "$2" ./mobile
 }
 
-if [[ ${1:-} != --gradle-only ]]; then
+if (( !gradle_only )); then
   PIPE_ANDROID_GO=$(command -v go)
   GOMODCACHE=${GOMODCACHE:-$("$PIPE_ANDROID_GO" env GOMODCACHE)}
   export PIPE_ANDROID_GO PIPE_ANDROID_REPO="$repo" GOMODCACHE
@@ -63,18 +88,24 @@ if [[ ${PIPE_OFFLINE:-} == 1 && $PWD == "$PIPE_ANDROID_REPO" && ${1:-} == list &
   exec "$PIPE_ANDROID_GO" list -m -json "${modules[@]}"
 fi
 if [[ ${1:-} == build && $PWD == "$TMPDIR"/gomobile-work-*/src-android-* ]]; then
-  exec "$PIPE_ANDROID_GO" build -buildvcs=false "${@:2}"
+  exec "$PIPE_ANDROID_GO" build -p 2 -buildvcs=false "${@:2}"
 fi
 exec "$PIPE_ANDROID_GO" "$@"
 SH
   chmod +x "$work/bin/go"
-  bind "$tags" android/app/libs/pipe.aar
+  if (( !debug_only )); then
+    bind "$tags" android/app/libs/pipe.aar
+  fi
   bind "$tags,pipe_debug" android/app/libs/pipe-debug.aar
 fi
-if [[ ${1:-} == --bind-only ]]; then
+if (( bind_only )); then
   exit 0
 fi
-for archive in android/app/libs/pipe.aar android/app/libs/pipe-debug.aar; do
+archives=(android/app/libs/pipe-debug.aar)
+if (( !debug_only )); then
+  archives+=(android/app/libs/pipe.aar)
+fi
+for archive in "${archives[@]}"; do
   if [[ ! -s $archive ]]; then
     printf 'Missing binding %s. Run %s --bind-only first.\n' "$archive" "$0" >&2
     exit 1
@@ -89,73 +120,40 @@ if [[ ! -f $debug_store ]]; then
     -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' -noprompt
 fi
 
-prepare_release_signing() {
-  local store password_file
-  store=$(realpath -m -- "${PIPE_ANDROID_RELEASE_STORE:-$HOME/.config/pipe/android-release.p12}")
-  password_file=$(realpath -m -- "${PIPE_ANDROID_RELEASE_PASSWORD_FILE:-$store.password}")
-  if [[ $store == "$repo" || $store == "$repo/"* ||
-        $password_file == "$repo" || $password_file == "$repo/"* ||
-        $password_file == "$store" || $password_file == "$store.lock" ]]; then
-    printf 'Choose distinct release signing files outside the repository.\n' >&2
-    return 1
-  fi
-  export PIPE_ANDROID_RELEASE_STORE="$store" PIPE_ANDROID_RELEASE_PASSWORD_FILE="$password_file"
-  export PIPE_ANDROID_RELEASE_ALIAS="${PIPE_ANDROID_RELEASE_ALIAS:-pipe}"
-  mkdir -p -- "$(dirname -- "$store")" "$(dirname -- "$password_file")"
-
-  (
-    flock -x 9
-    if [[ ! -e $store && ! -e $password_file ]]; then
-      python3 -c 'import secrets; print(secrets.token_hex(24))' > "$work/release.password"
-      "$keytool" -genkeypair -keystore "$work/release.p12" -storetype PKCS12 \
-        -alias "$PIPE_ANDROID_RELEASE_ALIAS" -storepass:file "$work/release.password" \
-        -keyalg RSA -keysize 2048 -validity 3650 -dname 'CN=Pipe Beta' -noprompt
-
-      local staged_store= staged_password=
-      trap 'rm -f -- "${staged_store:-}" "${staged_password:-}"' EXIT
-      staged_store=$(mktemp "$store.XXXXXX")
-      staged_password=$(mktemp "$password_file.XXXXXX")
-      cat "$work/release.p12" > "$staged_store"
-      cat "$work/release.password" > "$staged_password"
-      mv -T -- "$staged_password" "$password_file"
-      if ! mv -T -- "$staged_store" "$store"; then
-        rm -f -- "$password_file"
-        exit 1
-      fi
-    fi
-    if [[ ! -f $store || ! -f $password_file || ! -s $password_file ]]; then
-      printf 'Release signing requires both the existing keystore and its password file.\n' >&2
-      exit 1
-    fi
-    if [[ $(stat -c '%a' -- "$password_file") != 600 ]]; then
-      printf 'The release signing password file must have mode 0600.\n' >&2
-      exit 1
-    fi
-  ) 9>> "$store.lock"
-}
-
-prepare_release_signing
-
 if [[ ${PIPE_OFFLINE:-} == 1 ]]; then
   mkdir -p "$work/java-home"
   export GRADLE_OPTS="${GRADLE_OPTS:-} -Duser.home=$work/java-home"
 fi
-"$gradle" "${gradle_args[@]}" assembleDebug
-"$gradle" "${gradle_args[@]}" assembleRelease
+tasks=(assembleDebug)
+if (( !debug_only )); then
+  tasks+=(assembleRelease)
+fi
+"$gradle" "${gradle_args[@]}" "${tasks[@]}"
 
 apk_dir=android/app/build/outputs/apk
 shopt -s nullglob
 debug_apks=("$apk_dir"/debug/*.apk)
-release_apks=("$apk_dir"/release/*.apk)
-if (( ${#debug_apks[@]} != 2 || ${#release_apks[@]} != 2 )); then
-  printf 'Expected separate arm64 and x86_64 APKs for each build type.\n' >&2
+if (( ${#debug_apks[@]} != 2 )); then
+  printf 'Expected separate arm64 and x86_64 debug APKs.\n' >&2
   exit 1
 fi
-for apk in "${debug_apks[@]}" "${release_apks[@]}"; do
-  stat -c '%n %s bytes' "$apk"
-done
-arm64_release=("$apk_dir"/release/*arm64-v8a*.apk)
-if (( ${#arm64_release[@]} != 1 )) || (( $(stat -c '%s' "${arm64_release[0]}") > 20000000 )); then
+stat -c '%n %s bytes' "${debug_apks[@]}"
+if (( debug_only )); then
+  exit 0
+fi
+
+arm64_release=("$apk_dir"/release/*arm64-v8a-release.apk)
+x86_release=("$apk_dir"/release/*x86_64-release.apk)
+if (( ${#arm64_release[@]} != 1 || ${#x86_release[@]} != 1 )); then
+  printf 'Expected separate arm64 and x86_64 signed release APKs.\n' >&2
+  exit 1
+fi
+if (( $(stat -c '%s' "${arm64_release[0]}") > 20000000 )); then
   printf 'The arm64 release APK is missing or exceeds 20 MB.\n' >&2
   exit 1
 fi
+dist=${PIPE_RELEASE_DIR:-$repo/dist}
+mkdir -p -- "$dist"
+install -m 0644 -- "${arm64_release[0]}" "$dist/pipe-android-arm64.apk"
+install -m 0644 -- "${x86_release[0]}" "$dist/pipe-android-x86_64.apk"
+stat -c '%n %s bytes' "$dist"/pipe-android-{arm64,x86_64}.apk

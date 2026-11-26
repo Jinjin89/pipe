@@ -38,17 +38,31 @@ func (s *server) testProfile(parent context.Context, raw json.RawMessage) (any, 
 	if err := parent.Err(); err != nil {
 		return nil, err.Error()
 	}
-	uplink := s.opts.Session.DefaultInterface()
-	if uplink == "" {
-		return nil, "Pipe couldn't find the physical network for this test."
-	}
 	ctx, cancel := context.WithTimeout(parent, profileTestTimeout)
 	defer cancel()
-	result := s.opts.probeProfile(ctx, clientctl.ProbeOptions{
-		Profile: profile, Relay: relay.String(), IPv6: p.IPv6, Interface: uplink, SkipExitCountry: p.SkipExitCountry,
-	})
+	opts := clientctl.ProbeOptions{Profile: profile, Relay: relay.String(), IPv6: p.IPv6, SkipExitCountry: p.SkipExitCountry}
+	if p.PreferLive {
+		if session, ok := s.opts.Session.(interface {
+			MeasureProfile(context.Context, clientctl.ProbeOptions) (clientctl.ProfileTestResult, bool)
+		}); ok {
+			if result, used := session.MeasureProfile(ctx, opts); used {
+				return profileTestReply(parent, result)
+			}
+		}
+	}
+	opts.Interface = s.opts.Session.DefaultInterface()
+	if opts.Interface == "" {
+		return nil, "Pipe couldn't find the physical network for this test."
+	}
+	return profileTestReply(parent, s.opts.probeProfile(ctx, opts))
+}
+
+func profileTestReply(parent context.Context, result clientctl.ProfileTestResult) (any, string) {
 	if err := parent.Err(); err != nil {
 		return nil, err.Error()
+	}
+	if result.Error != "" {
+		return nil, result.Error
 	}
 	return result, ""
 }
@@ -80,7 +94,7 @@ func (r *Remote) TestProfileResult(ctx context.Context, opts clientctl.ProbeOpti
 	if err != nil {
 		return result, err
 	}
-	params := TestProfileParams{Link: text, Relay: opts.Relay, IPv6: opts.IPv6, SkipExitCountry: opts.SkipExitCountry}
+	params := TestProfileParams{Link: text, Relay: opts.Relay, IPv6: opts.IPv6, SkipExitCountry: opts.SkipExitCountry, PreferLive: opts.PreferLive}
 	callCtx, cancel := context.WithTimeout(ctx, profileReplyTimeout)
 	defer cancel()
 	_, err = r.call(callCtx, profileReplyTimeout+time.Second, "testProfile", params, &result)

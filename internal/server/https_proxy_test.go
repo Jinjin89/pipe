@@ -16,11 +16,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"pipe/internal/engine"
 )
 
 func TestHTTPSProxyUnauthenticatedRequestsUseTheSite(t *testing.T) {
@@ -387,6 +390,50 @@ func TestHTTPSProxyNAT64DestinationsUseEmbeddedIPv4Policy(t *testing.T) {
 				t.Fatalf("restricted NAT64 destination reached dialer: err=%v dialed=%v", err, dialed)
 			}
 		})
+	}
+}
+
+func TestHTTPSProxyChecksFreshResolvedAddresses(t *testing.T) {
+	p := newHTTPSProxy(http.NotFoundHandler(), nil)
+	p.policy = engine.NewEgressPolicy(netip.MustParseAddr("11.2.3.4"))
+	addresses := []netip.Addr{netip.MustParseAddr("11.2.3.5")}
+	p.lookup = func(context.Context, string, string) ([]netip.Addr, error) { return addresses, nil }
+	var calls []string
+	p.dial = func(_ context.Context, _ string, address string) (net.Conn, error) {
+		calls = append(calls, address)
+		return nil, errors.New("fixture intercepts all dials")
+	}
+	_, _ = p.dialPublic(t.Context(), "tcp", "origin.example:443")
+	addresses = []netip.Addr{netip.MustParseAddr("::ffff:11.2.3.4")}
+	_, _ = p.dialPublic(t.Context(), "tcp", "origin.example:443")
+	if !slices.Equal(calls, []string{"11.2.3.5:443"}) {
+		t.Fatalf("fixture dials = %v", calls)
+	}
+}
+
+type proxyEgressPolicyFunc func(netip.Addr) bool
+
+func (f proxyEgressPolicyFunc) AllowsFresh(ip netip.Addr) bool { return f(ip) }
+
+func TestHTTPSProxyRejectsNewlyLocalFallbackAddress(t *testing.T) {
+	p := newHTTPSProxy(http.NotFoundHandler(), nil)
+	first, fallback := netip.MustParseAddr("11.0.0.80"), netip.MustParseAddr("2001:4860::1")
+	p.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{first, fallback}, nil
+	}
+	var local netip.Addr
+	p.policy = proxyEgressPolicyFunc(func(ip netip.Addr) bool { return ip != local })
+	var calls []string
+	p.dial = func(_ context.Context, _, address string) (net.Conn, error) {
+		calls = append(calls, address)
+		local = fallback
+		return nil, errors.New("first address became unreachable")
+	}
+	if conn, err := p.dialPublic(t.Context(), "tcp", "origin.example:443"); conn != nil || err == nil {
+		t.Fatalf("unexpected proxy dial result: %v, %v", conn, err)
+	}
+	if want := []string{net.JoinHostPort(first.String(), "443")}; !slices.Equal(calls, want) {
+		t.Fatalf("dialed %v, want only %v", calls, want)
 	}
 }
 

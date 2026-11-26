@@ -6,11 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"pipe/internal/clientctl"
+	"pipe/internal/localfile"
 )
 
 func TestFindBrowser(t *testing.T) {
@@ -38,8 +43,8 @@ func TestFindBrowser(t *testing.T) {
 	if got := findBrowser("linux", env, func(string) bool { return false }, none); got != "" {
 		t.Errorf("none installed: %q", got)
 	}
-	args := strings.Join(browserArgs("http://127.0.0.1:1/#boot=x", "/p"), " ")
-	for _, want := range []string{"--app=http://127.0.0.1:1/#boot=x", "--user-data-dir=/p", "--no-proxy-server", "--window-size=1040,700", "--disable-extensions"} {
+	args := strings.Join(browserArgs("file:///fixture/boot.html", "/p"), " ")
+	for _, want := range []string{"--app=file:///fixture/boot.html", "--user-data-dir=/p", "--no-proxy-server", "--window-size=1040,700", "--disable-extensions"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("missing %s", want)
 		}
@@ -102,7 +107,9 @@ func TestSingleInstanceShowsExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(instanceFile{Port: port, Secret: e.srv.ShowSecret()})
-	os.WriteFile(filepath.Join(dir, "app.instance"), raw, 0600)
+	if err := localfile.WritePrivate(filepath.Join(dir, "app.instance"), raw); err != nil {
+		t.Fatal(err)
+	}
 	if err := showExisting(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -114,24 +121,31 @@ func TestSingleInstanceShowsExisting(t *testing.T) {
 }
 
 func TestRunLockAndQuit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	e := newEnv(t)
-	var out strings.Builder
+	out := make(bootstrapOutput, 2)
 	dir := t.TempDir()
-	opts := AppOptions{Config: e.srv.cfg, NoWindow: true, Stdout: &out}
+	opts := AppOptions{Config: e.srv.cfg, NoWindow: true, Stdout: out}
 	opts.Dir = dir
 	opts.ProfilesDir = filepath.Join(dir, "profiles")
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, opts) }()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(dir, "app.instance")); err == nil && strings.Contains(out.String(), "#boot=") {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	var path string
+	select {
+	case line := <-out:
+		path = strings.TrimSpace(line)
+	case err := <-done:
+		t.Fatalf("app exited before printing its bootstrap path: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("app did not print its bootstrap path")
 	}
-	if !strings.Contains(out.String(), "http://127.0.0.1:") {
-		t.Fatalf("no URL printed: %q", out.String())
+	if strings.Contains(path, "#boot=") || !filepath.IsAbs(path) || filepath.Ext(path) != ".html" {
+		t.Fatal("expected the path to a browser bootstrap file")
+	}
+	if body, err := os.ReadFile(path); err != nil || !strings.Contains(string(body), "http://127.0.0.1:") {
+		t.Fatalf("expected the bootstrap file to target the local server: %v", err)
 	}
 	// A second Run with the same dir finds the lock held and asks the first to show.
 	if err := Run(context.Background(), opts); err != nil {
@@ -144,6 +158,85 @@ func TestRunLockAndQuit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "app.instance")); !os.IsNotExist(err) {
 		t.Fatal("instance file left behind")
 	}
+}
+
+func TestRunRetriesProxyRestoreAfterContextCancellation(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	if resp, _ := e.api("POST", "/api/profiles", `{"link":"`+testLink(t, "phone", "")+`"}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("add profile returned %d", resp.StatusCode)
+	}
+	var restoreAllowed atomic.Bool
+	attempts := 0
+	firstAttempt := make(chan struct{})
+	restoreErr := errors.New("fixture restore failure")
+	e.proxy.onRestore = func() {
+		e.proxy.restoreErr = restoreErr
+		if restoreAllowed.Load() {
+			e.proxy.restoreErr = nil
+		}
+		attempts++
+		if attempts == 1 {
+			close(firstAttempt)
+		}
+	}
+	ready := make(chan *App, 1)
+	opts := AppOptions{Config: e.srv.cfg, Background: true, Started: func(a *App) { ready <- a }}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer func() {
+		restoreAllowed.Store(true)
+		cancel()
+	}()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, opts) }()
+	var a *App
+	select {
+	case a = <-ready:
+	case err := <-done:
+		t.Fatalf("app exited during startup: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("app did not start")
+	}
+	if err := a.srv.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-firstAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not trigger proxy restoration")
+	}
+	if e.ctl.Status().State != clientctl.StateOn || !e.srv.cfg.Proxy.Armed() {
+		t.Fatal("failed restoration lost the proxy listener or recovery snapshot")
+	}
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get(a.url + "/")
+	if err != nil {
+		t.Fatalf("app HTTP server stopped while waiting for proxy restoration: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("app HTTP server returned %d while waiting for proxy restoration", resp.StatusCode)
+	}
+	restoreAllowed.Store(true)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("app quit failed after proxy restoration: %v", err)
+		}
+	case <-time.After(shutdownRetryInterval + 3*time.Second):
+		t.Fatal("app did not quit after retrying proxy restoration")
+	}
+	if attempts < 2 || e.proxy.state != "orig" || e.ctl.Status().State != clientctl.StateOff || e.srv.cfg.Proxy.Armed() {
+		t.Fatalf("app did not restore the original proxy before exit, attempts = %d", attempts)
+	}
+}
+
+type bootstrapOutput chan string
+
+func (out bootstrapOutput) Write(p []byte) (int, error) {
+	out <- string(p)
+	return len(p), nil
 }
 
 func TestBackgroundSecondInstanceExitsQuietly(t *testing.T) {

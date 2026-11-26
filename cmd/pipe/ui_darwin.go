@@ -57,8 +57,12 @@ func menuActions(a *desktop.App) menubar.Actions {
 			st := s.Snapshot()
 			set := s.Settings()
 			title := menuTitle(st)
+			status := st.State
+			if st.Guarded || (st.State == "error" && st.Via == "tun") {
+				status = "paused"
+			}
 			return menubar.State{
-				Status: st.State, Title: title, Tooltip: "Pipe: " + title,
+				Status: status, Title: title, Tooltip: "Pipe: " + title,
 				Mode: st.Mode, Tier: st.TierPreference, Rescue: st.RescueAvailable,
 				TUN: set.TUN, TUNAvailable: st.Helper.State != "" && st.Helper.State != helper.StateUnsupported,
 				SystemProxy: set.SystemProxy, RelayHost: st.Relay, RelayState: st.RelayState,
@@ -71,12 +75,19 @@ func menuActions(a *desktop.App) menubar.Actions {
 		SetTUN:         func(on bool) { _ = s.SetTUN(on) },
 		SetSystemProxy: func(on bool) { _ = s.SetSystemProxy(on) },
 		Open:           a.Show,
-		Quit:           a.Quit,
+		Quit: func() {
+			if !a.Quit() {
+				menubar.CancelPendingTermination()
+			}
+		},
 	}
 }
 
 // menuTitle is the first menu line, e.g. "Connected · Fast · 42 ms · TUN".
 func menuTitle(st desktop.StatusResponse) string {
+	if st.Guarded {
+		return "Network traffic paused · TUN"
+	}
 	switch st.State {
 	case "on":
 		parts := []string{"Connected"}

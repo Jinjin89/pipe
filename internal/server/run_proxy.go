@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -22,17 +21,14 @@ func proxyCover(www string, fallback http.Handler) (http.Handler, error) {
 	if www == "" {
 		return fallback, nil
 	}
-	info, err := os.Stat(www)
+	cover, err := directoryCover(www)
 	if err != nil {
 		return nil, fmt.Errorf("open HTTPS proxy web directory: %w", err)
 	}
-	if !info.IsDir() {
-		return nil, errors.New("HTTPS proxy --www must point to a directory")
-	}
-	return http.FileServer(http.Dir(www)), nil
+	return cover, nil
 }
 
-func strictProxyTLS(domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+func strictSiteTLS(domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: getCertificate,
@@ -44,6 +40,21 @@ func strictProxyTLS(domain string, getCertificate func(*tls.ClientHelloInfo) (*t
 			return nil, nil
 		},
 	}
+}
+
+func strictProxyTLS(domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	config := strictSiteTLS(domain, getCertificate)
+	config.NextProtos = []string{"http/1.1"}
+	return config
+}
+
+func proxyWebServer(proxy *httpsProxy, domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *http.Server {
+	// HTTP/1.1 absolute-form forwarding preserves the requested origin scheme.
+	// Go's HTTP/2 handler cannot distinguish HTTP and HTTPS forwards.
+	server := webServer(proxy, strictProxyTLS(domain, getCertificate))
+	server.Protocols = new(http.Protocols)
+	server.Protocols.SetHTTP1(true)
+	return server
 }
 
 // startSharedHTTPSProxy binds the HTTPS proxy's TCP listener and starts its
@@ -108,7 +119,7 @@ func startSharedHTTPSProxy(ctx context.Context, dir, address string, cfg httpsPr
 	if stealth != nil {
 		getCertificate = stealth.proxyCertificate(getCertificate)
 	}
-	server := webServer(proxy, strictProxyTLS(cfg.Domain, getCertificate))
+	server := proxyWebServer(proxy, cfg.Domain, getCertificate)
 	failures := make(chan error, 1)
 	listener, err := serve(server, address, cfg.Port, failures)
 	if err != nil {

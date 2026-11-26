@@ -25,6 +25,14 @@ internal object VpnControl {
     const val CLEAR_LOGS = 7
     const val TEST_ROUTES = 8
     const val TEST_DONE = 9
+    const val UPDATE_POLL = 10
+    const val UPDATE_CHECK = 11
+    const val UPDATE_DOWNLOAD = 12
+    const val UPDATE_STATUS = 13
+    const val UPDATE_INSTALL = 14
+    const val UPDATE_INSTALL_ERROR = 15
+    const val UPDATE_VIA_TUNNEL = 1
+    const val UPDATE_AUTOMATIC = 2
     const val STATUS_JSON = "status"
     const val PAYLOAD = "payload"
     const val AFTER = "after"
@@ -34,12 +42,13 @@ internal object VpnControl {
 
     fun send(
         receiver: Messenger?, what: Int, reply: Messenger? = null, status: String? = null,
-        payload: String? = null, after: Long = 0,
+        payload: String? = null, after: Long = 0, flags: Int = 0,
     ): Boolean {
         if (receiver == null) return false
         return try {
             receiver.send(Message.obtain(null, what).apply {
                 replyTo = reply
+                arg1 = flags
                 if (status != null || payload != null || after != 0L) {
                     data = Bundle().apply {
                         if (status != null) putString(STATUS_JSON, status)

@@ -35,18 +35,19 @@ if [[ $scenario == shared ]]; then
 {
   "ip": "$profile_host",
   "sni": "$proxy_domain",
+  "block_egress_ips": ["$blocked_addr"],
   "cert": { "file": "proxy-pem/cert.pem", "key": "proxy-pem/key.pem" },
-  "fast": { "port": $https_port, "hop": "25000-25003" },
+  "fast": { "port": $https_port, "hop": "25000-25003", "address": "$server_addr" },
   "stealth": { "port": $stealth_port },
   "proxy": { "port": $proxy_port },
   "rescue": { "sni": "$cdn", "port": $rescue_port, "cert": "ca/$cdn.pem", "key": "ca/$cdn-key.pem" },
   "device": "main"
 }
 JSON
-  setup_in_fixture "$work_dir/setup.json" "$work_dir/proxy-hosts" "$state" > "$work_dir/setup.out"
+  setup_in_fixture "$work_dir/setup.json" "$work_dir/proxy-hosts" "$state" "$work_dir/main.link" > "$work_dir/setup.out"
   grep -Fq 'TCP 80 and 443 are in use, so Pipe uses the shared layout' "$work_dir/setup.out"
   grep -Fq "Open TCP $proxy_port" "$work_dir/setup.out"
-  sed -n -e '/^pipe:\/\//p' -e '/^export https_proxy=/p' "$work_dir/setup.out" > "$work_dir/main.link"
+  verify_private_enrollment "$work_dir/setup.out" "$work_dir/main.link"
   pass "$check"
   check='shared preserves an existing web server and installs Fast port hopping'
 else
@@ -65,7 +66,7 @@ else
   "$bin" server add main --dir "$state" > "$work_dir/main.link"
 fi
 : > "$work_dir/smart-target.log"
-ip netns exec "$server_ns" "$fixture" serve --listen "$target_addr:$tls_target_port" \
+ip netns exec "$target_ns" "$fixture" serve --listen "$target_addr:$tls_target_port" \
   --ca "$work_dir/ca" --host "$target_addr" --body 'pipe HTTPS target' >> "$work_dir/smart-target.log" 2>&1 &
 smart_target_pid=$!
 wait_for_log "$smart_target_pid" "$work_dir/smart-target.log" 'TLS fixture ready' 8
@@ -92,19 +93,60 @@ if [[ $scenario == shared ]]; then
   done
   shared_uninstall
 fi
-ip netns exec "$server_ns" "$bin" server hop-apply --fast-hop 25000-25003 --fast-port 443
+ip netns exec "$server_ns" "$bin" server hop-apply --fast-hop 25000-25003 --fast-port 443 --address "$profile_host"
 ip netns exec "$server_ns" nft list table inet pipe > "$work_dir/hop.nft"
 grep -Fq 'udp dport 25000-25003 redirect to :443' "$work_dir/hop.nft"
+if [[ $scenario == shared ]]; then
+  check='Fast hopping preserves UDP services bound after the rule is installed'
+  ip netns exec "$server_ns" python3 -u - "$server_addr" > "$work_dir/hop-service.log" <<'PY' &
+import socket
+import sys
+
+listeners = []
+for address, port in [(sys.argv[1], 25001), ("0.0.0.0", 25002)]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listener.bind((address, port))
+    listener.settimeout(6)
+    listeners.append(listener)
+print("UDP services ready")
+for listener in listeners:
+    data, peer = listener.recvfrom(64)
+    listener.sendto(data, peer)
+PY
+  hop_service_pid=$!
+  wait_for_log "$hop_service_pid" "$work_dir/hop-service.log" 'UDP services ready' 8
+  if ip netns exec "$server_ns" "$bin" server hop-apply --fast-hop 25000-25003 --fast-port 443 \
+    --address "$profile_host" > "$work_dir/hop-reapply.log" 2>&1; then
+    fail 'Fast hopping reapply must detect occupied ports in its scope'
+  fi
+  grep -Fq "check Fast hop UDP port 25001 on $profile_host" "$work_dir/hop-reapply.log"
+  ip netns exec "$client_ns" python3 - "$server_addr" <<'PY'
+import socket
+import sys
+
+for port in (25001, 25002):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conn:
+        conn.settimeout(3)
+        conn.connect((sys.argv[1], port))
+        conn.send(b"fixture")
+        assert conn.recv(64) == b"fixture"
+PY
+  wait "$hop_service_pid"
+  hop_service_pid=
+  pass "$check"
+fi
+check='shared link and proxy exports use the configured endpoints'
 IFS= read -r main_link < "$work_dir/main.link"
-main_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' "$work_dir/main.link")
+proxy_export=$("$bin" server proxy export main --dir "$state")
+main_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' <<<"$proxy_export")
 [[ $main_link == pipe://*@"$profile_host"\?* && $main_link == *"fsni=$proxy_domain"* ]]
 [[ $main_link == *"cdn=$cdn%3A$rescue_port"* ]]
 [[ $main_proxy == https://main:*@"$proxy_domain:$proxy_port" ]]
-[[ $("$bin" server proxy export main --dir "$state") == "export https_proxy=$main_proxy http_proxy=$main_proxy" ]]
+[[ $proxy_export == "export https_proxy=$main_proxy http_proxy=$main_proxy" ]]
 ws_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_path"])' "$state/server.json")
 
 : > "$work_dir/server.log"
-ip netns exec "$server_ns" "$bin" server run --dir "$state" --test-ca "$work_dir/ca" \
+ip netns exec "$server_ns" env SSL_CERT_FILE="$work_dir/ca/ca.pem" "$bin" server run --dir "$state" --test-ca "$work_dir/ca" \
   --test-ports --test-listen "$server_addr" >> "$work_dir/server.log" 2>&1 &
 server_pid=$!
 wait_for_log "$server_pid" "$work_dir/server.log" \
@@ -130,6 +172,9 @@ for tier in fast stealth rescue; do
   check="shared forced $tier tier"
   start_client "$work_dir/shared-health.yaml" "$tier"
   check_target
+  if proxied_curl --max-time 3 "http://$blocked_addr:$target_port/" >/dev/null 2>&1; then
+    fail "$check (persisted NAT address was reachable)"
+  fi
   stop_client
   pass "$check"
 done
@@ -176,13 +221,13 @@ shared_https() {
 
 # Stealth borrows our own HTTPS proxy site (D39): a visitor without a key gets
 # that site's certificate and the same small website Fast shows.
-check='shared Stealth and the HTTPS proxy serve the same cover over HTTP/1.1 and HTTP/2'
+check='shared Stealth and the HTTPS proxy serve the same cover when offered HTTP/2'
 shared_https "$proxy_domain" "$stealth_port" --http1.1 --pinnedpubkey "$proxy_pin" > "$work_dir/shared-stealth.html"
 cmp "$work_dir/proxy-site" "$work_dir/shared-stealth.html"
 version=$(shared_https "$proxy_domain" "$proxy_port" --http2 --pinnedpubkey "$proxy_pin" \
-  --output "$work_dir/shared-h2.html" --write-out '%{http_version}')
-[[ $version == 2 ]]
-cmp "$work_dir/proxy-site" "$work_dir/shared-h2.html"
+  --output "$work_dir/shared-negotiated.html" --write-out '%{http_version}')
+[[ $version == 1.1 ]]
+cmp "$work_dir/proxy-site" "$work_dir/shared-negotiated.html"
 pass "$check"
 
 check='shared HTTP/3 serves the main cover even with the Rescue Host'
@@ -200,6 +245,11 @@ cmp "$work_dir/proxy-site" "$work_dir/shared-h3.html"
 ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:$https_port" \
   "https://$proxy_domain:$https_port/" "$work_dir/fast-cert.der" "$cdn" > "$work_dir/shared-host-h3.html"
 cmp "$work_dir/proxy-site" "$work_dir/shared-host-h3.html"
+if [[ $scenario == shared ]]; then
+  ip netns exec "$client_ns" "$fixture" fetch-http3 "$server_addr:25000" \
+    "https://$proxy_domain:$https_port/" "$work_dir/fast-cert.der" > "$work_dir/shared-hop-h3.html"
+  cmp "$work_dir/proxy-site" "$work_dir/shared-hop-h3.html"
+fi
 pass "$check"
 
 check='shared leaves the existing HTTP and HTTPS website intact'

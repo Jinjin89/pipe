@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,11 +25,14 @@ import (
 	"pipe/internal/link"
 	"pipe/internal/logring"
 	"pipe/internal/sysproxy"
+	"pipe/internal/update"
+	"pipe/internal/webview"
 )
 
 type fakeCtl struct {
 	mu                sync.Mutex
 	state             string
+	guarded           bool
 	started           []clientctl.Options
 	applied           []clientctl.Options
 	mode              string
@@ -48,7 +53,12 @@ func (f *fakeCtl) Start(o clientctl.Options) error {
 	f.started = append(f.started, o)
 	return nil
 }
-func (f *fakeCtl) Stop() error { f.mu.Lock(); f.state = "off"; f.mu.Unlock(); return nil }
+func (f *fakeCtl) Stop() error {
+	f.mu.Lock()
+	f.state, f.guarded = clientctl.StateOff, false
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeCtl) Status() clientctl.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,7 +67,7 @@ func (f *fakeCtl) Status() clientctl.Status {
 		st = "off"
 	}
 	relay, _ := config.ParseRelay(f.relay, "")
-	status := clientctl.Status{State: st, Mode: f.mode, Listen: "127.0.0.1:7890", Relay: relay.Host}
+	status := clientctl.Status{State: st, Guarded: f.guarded, Mode: f.mode, Listen: "127.0.0.1:7890", Relay: relay.Host}
 	if status.Relay != "" {
 		status.RelayState = f.relayState
 	}
@@ -88,12 +98,25 @@ func (f *fakeCtl) TestRoutes(context.Context) map[string]clientctl.RouteLatency 
 	return map[string]clientctl.RouteLatency{"fast": {Ms: 42, OK: true}}
 }
 
-type memProxy struct{ state string }
+type memProxy struct {
+	state      string
+	port       int
+	onRestore  func()
+	restoreErr error
+}
 
 func (m *memProxy) Capture() (json.RawMessage, error) { return json.Marshal(m.state) }
 func (m *memProxy) IsApplied(string, int) bool        { return m.state == "pipe" }
-func (m *memProxy) Apply(string, int) error           { m.state = "pipe"; return nil }
-func (m *memProxy) Restore(raw json.RawMessage) error { return json.Unmarshal(raw, &m.state) }
+func (m *memProxy) Apply(_ string, port int) error    { m.state, m.port = "pipe", port; return nil }
+func (m *memProxy) Restore(raw json.RawMessage) error {
+	if m.onRestore != nil {
+		m.onRestore()
+	}
+	if m.restoreErr != nil {
+		return m.restoreErr
+	}
+	return json.Unmarshal(raw, &m.state)
+}
 
 type fakeAuto struct{ on bool }
 
@@ -111,7 +134,7 @@ type env struct {
 	origin string
 	quit   chan struct{}
 	client *http.Client
-	cookie *http.Cookie
+	token  string
 }
 
 func newEnv(t *testing.T) *env {
@@ -123,6 +146,9 @@ func newEnv(t *testing.T) *env {
 		Proxy:     sysproxy.New(e.proxy, filepath.Join(dir, "proxy.armed")),
 		Autostart: e.auto, Version: "9.9.9-test", Exe: "/opt/pipe",
 		OnQuit: func() { e.quit <- struct{}{} },
+		probeProfile: func(ctx context.Context, _ clientctl.ProbeOptions) clientctl.ProfileTestResult {
+			return clientctl.ProfileTestResult{Routes: e.ctl.TestRoutes(ctx), MetricVersion: clientctl.RTTMetricVersion}
+		},
 	})
 	e.ts = httptest.NewServer(e.srv.Handler())
 	t.Cleanup(e.ts.Close)
@@ -155,25 +181,19 @@ func (e *env) login() {
 	e.t.Helper()
 	nonce := e.srv.NewNonce()
 	resp := e.do("POST", "/api/session", `{"nonce":"`+nonce+`"}`, func(r *http.Request) { r.Header.Set("Origin", e.origin); r.Header.Set("X-Pipe-CSRF", "1") })
-	resp.Body.Close()
-	if resp.StatusCode != 204 {
-		e.t.Fatalf("session status %d", resp.StatusCode)
+	defer resp.Body.Close()
+	var body struct{ Token string }
+	if resp.StatusCode != 200 || len(resp.Cookies()) != 0 || json.NewDecoder(resp.Body).Decode(&body) != nil || len(body.Token) < 40 {
+		e.t.Fatalf("invalid session redemption, status %d", resp.StatusCode)
 	}
-	for _, c := range resp.Cookies() {
-		if c.Name == cookieName {
-			e.cookie = c
-		}
-	}
-	if e.cookie == nil || !e.cookie.HttpOnly || e.cookie.SameSite != http.SameSiteStrictMode || e.cookie.Path != "/" || len(e.cookie.Value) < 40 {
-		e.t.Fatalf("bad cookie %+v", e.cookie)
-	}
+	e.token = body.Token
 }
 
 // api sends an authenticated call with all CSRF headers.
 func (e *env) api(method, path, body string) (*http.Response, map[string]any) {
 	e.t.Helper()
 	resp := e.do(method, path, body, func(r *http.Request) {
-		r.AddCookie(e.cookie)
+		r.Header.Set("Authorization", "Bearer "+e.token)
 		r.Header.Set("Origin", e.origin)
 		r.Header.Set("X-Pipe-CSRF", "1")
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -194,31 +214,327 @@ func testLink(t *testing.T, name string, cdn string) string {
 	return raw
 }
 
+func TestBearerRedemptionWithoutCookie(t *testing.T) {
+	e := newEnv(t)
+	resp := e.do("POST", "/api/session", `{"nonce":"`+e.srv.NewNonce()+`"}`, func(r *http.Request) {
+		r.Header.Set("Origin", e.origin)
+		r.Header.Set("X-Pipe-CSRF", "1")
+	})
+	defer resp.Body.Close()
+	var body struct{ Token string }
+	if resp.StatusCode != http.StatusOK || len(resp.Cookies()) != 0 ||
+		json.NewDecoder(resp.Body).Decode(&body) != nil || body.Token == "" {
+		t.Fatalf("expected bearer redemption without issuing a cookie, status %d", resp.StatusCode)
+	}
+	if got := e.do("GET", "/api/status", "", func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+body.Token)
+	}); got.StatusCode != http.StatusOK {
+		t.Fatalf("valid bearer status %d", got.StatusCode)
+	}
+}
+
+func TestBrowserReloadReusesBearerUntilQuit(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	for range 2 {
+		page := e.do("GET", "/", "")
+		page.Body.Close()
+		if page.StatusCode != http.StatusOK || len(page.Cookies()) != 0 {
+			t.Fatalf("page navigation returned %d", page.StatusCode)
+		}
+		if resp, _ := e.api("GET", "/api/status", ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("the existing bearer returned %d on reload", resp.StatusCode)
+		}
+	}
+	if resp, _ := e.api("POST", "/api/quit", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("quit returned %d", resp.StatusCode)
+	}
+	if resp, _ := e.api("GET", "/api/status", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the bearer returned %d after Quit", resp.StatusCode)
+	}
+}
+
+func TestBearerIdleExpiryAndWindowClose(t *testing.T) {
+	e := newEnv(t)
+	start := time.Now()
+	var elapsed atomic.Int64
+	e.srv.sess.now = func() time.Time { return start.Add(time.Duration(elapsed.Load())) }
+	e.login()
+	for _, minutes := range []int{20, 31} {
+		elapsed.Store(int64(time.Duration(minutes) * time.Minute))
+		if resp, _ := e.api("GET", "/api/status", ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("active request after %d minutes returned %d", minutes, resp.StatusCode)
+		}
+	}
+	elapsed.Store(int64(50 * time.Minute))
+	resp := e.do("GET", "/api/status", "", func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+e.token)
+		r.Header.Set("Origin", "http://127.0.0.1:9999")
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin request returned %d", resp.StatusCode)
+	}
+	elapsed.Store(int64(62 * time.Minute))
+	if resp, _ := e.api("GET", "/api/status", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("request after 31 minutes idle returned %d", resp.StatusCode)
+	}
+	e.login()
+	if resp, _ := e.api("POST", "/api/session/end", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("session end returned %d", resp.StatusCode)
+	}
+	if resp, _ := e.api("GET", "/api/status", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("closed session returned %d", resp.StatusCode)
+	}
+}
+
+func TestUpdateRoutesRequireBearerAndHonorAutoSetting(t *testing.T) {
+	e := newEnv(t)
+	if resp := e.do("GET", "/api/updates", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated update status returned %d", resp.StatusCode)
+	}
+	e.login()
+	if resp, body := e.api("PUT", "/api/settings", `{"updateAuto":false}`); resp.StatusCode != http.StatusOK || body["updateAuto"] != false {
+		t.Fatalf("auto check setting returned %d %v", resp.StatusCode, body)
+	}
+	for _, route := range []struct{ method, path, body string }{
+		{"GET", "/api/updates", ""}, {"POST", "/api/updates/check", `{"automatic":true}`},
+	} {
+		if resp, body := e.api(route.method, route.path, route.body); resp.StatusCode != http.StatusOK || body["state"] != "idle" || body["installed"] != "9.9.9-test" {
+			t.Fatalf("%s returned %d %v", route.path, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestDisconnectRestoresProxyBeforeStoppingListener(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	e.api("POST", "/api/profiles", `{"link":"`+testLink(t, "phone", "")+`"}`)
+	e.api("POST", "/api/connect", "")
+	var liveDuringRestore bool
+	e.proxy.onRestore = func() { liveDuringRestore = e.ctl.Status().State == "on" }
+	if resp, _ := e.api("POST", "/api/disconnect", ""); resp.StatusCode != http.StatusOK || !liveDuringRestore {
+		t.Fatalf("disconnect returned %d, listener active during restore = %t", resp.StatusCode, liveDuringRestore)
+	}
+}
+
+func TestProxyRestoreFailureKeepsListenerUntilRetry(t *testing.T) {
+	for _, retry := range []string{"disconnect", "status"} {
+		t.Run(retry, func(t *testing.T) {
+			e, _ := newTUNEnv(t, helper.StateOK)
+			e.api("POST", "/api/connect", "")
+			e.proxy.restoreErr = errors.New("fixture restore failed")
+			if retry == "status" {
+				if err := e.srv.Shutdown(); !errors.Is(err, e.proxy.restoreErr) {
+					t.Errorf("Shutdown returned %v", err)
+				}
+			} else if resp, out := e.api("POST", "/api/disconnect", ""); resp.StatusCode != 500 || !strings.Contains(fmt.Sprint(out["error"]), "fixture restore failed") {
+				t.Errorf("disconnect returned %d %v", resp.StatusCode, out)
+			}
+			_, status := e.api("GET", "/api/status", "")
+			if status["state"] != clientctl.StateOn || status["via"] != viaProxy || status["systemProxy"] != "error" || !e.srv.cfg.Proxy.Armed() || e.proxy.state != "pipe" {
+				t.Fatal("restore failure lost the listener, owner, or saved proxy state")
+			}
+			e.proxy.restoreErr = nil
+			if retry == "status" {
+				_, status = e.api("GET", "/api/status", "")
+			} else {
+				_, status = e.api("POST", "/api/disconnect", "")
+			}
+			if status["state"] != clientctl.StateOff || status["via"] != "" || e.srv.cfg.Proxy.Armed() || e.proxy.state != "orig" {
+				t.Fatal("successful restoration did not complete the disconnect")
+			}
+		})
+	}
+}
+
+func TestTUNSwitchWaitsForProxyRestoration(t *testing.T) {
+	e, h := newTUNEnv(t, helper.StateOK)
+	e.api("POST", "/api/connect", "")
+	e.proxy.restoreErr = errors.New("fixture restore failed")
+	if err := e.srv.SetTUN(true); !errors.Is(err, e.proxy.restoreErr) {
+		t.Errorf("TUN switch returned %v", err)
+	}
+	if e.srv.Settings().TUN || e.srv.getVia() != viaProxy || e.ctl.Status().State != clientctl.StateOn || len(h.started) != 0 {
+		t.Fatal("TUN switch replaced the proxy listener before restoration")
+	}
+	e.proxy.restoreErr = nil
+	if err := e.srv.SetTUN(true); err != nil || e.ctl.Status().State != clientctl.StateOff || h.Status().State != clientctl.StateOn || e.proxy.state != "orig" {
+		t.Fatalf("TUN switch retry returned %v", err)
+	}
+}
+
+type listenApplyController struct {
+	*fakeCtl
+	onApply func(clientctl.Options) error
+}
+
+func (c *listenApplyController) Apply(opts clientctl.Options) error {
+	if err := c.onApply(opts); err != nil {
+		return err
+	}
+	return c.fakeCtl.Apply(opts)
+}
+
+func TestListenPortRestoresProxyBeforeRebinding(t *testing.T) {
+	const newPort = 7980
+	for _, tc := range []struct {
+		name                   string
+		failRestore, failApply bool
+	}{
+		{name: "success"},
+		{name: "restore fails", failRestore: true},
+		{name: "apply fails", failApply: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newTUNEnv(t, helper.StateOK)
+			_, _ = e.api("POST", "/api/connect", "")
+			var rebound bool
+			e.srv.cfg.Controller = &listenApplyController{fakeCtl: e.ctl, onApply: func(opts clientctl.Options) error {
+				if opts.Listen == fmt.Sprintf("127.0.0.1:%d", newPort) {
+					rebound = true
+					if e.proxy.state != "orig" || e.srv.cfg.Proxy.Armed() {
+						t.Error("OS proxy still pointed to the old listener at rebind")
+					}
+					if tc.failApply {
+						return errors.New("fixture rebind failed")
+					}
+				}
+				return nil
+			}}
+			if tc.failRestore {
+				e.proxy.restoreErr = errors.New("fixture restore failed")
+			}
+			resp, _ := e.api("PUT", "/api/settings", fmt.Sprintf(`{"listenPort":%d}`, newPort))
+			wantPort, wantCode := newPort, http.StatusOK
+			if tc.failApply || tc.failRestore {
+				wantPort, wantCode = 7890, http.StatusInternalServerError
+			}
+			if resp.StatusCode != wantCode || rebound == tc.failRestore || e.srv.Settings().ListenPort != wantPort ||
+				e.proxy.state != "pipe" || e.proxy.port != wantPort || e.ctl.Status().State != clientctl.StateOn {
+				t.Fatalf("response=%d, rebound=%t, saved=%d, proxy=%s:%d", resp.StatusCode, rebound, e.srv.Settings().ListenPort, e.proxy.state, e.proxy.port)
+			}
+		})
+	}
+}
+
+func TestQuitWaitsForProxyRestoration(t *testing.T) {
+	e, _ := newTUNEnv(t, helper.StateOK)
+	e.api("POST", "/api/connect", "")
+	e.proxy.restoreErr = errors.New("fixture restore failed")
+	if resp, _ := e.api("POST", "/api/quit", ""); resp.StatusCode != 500 {
+		t.Errorf("quit returned %d after restore failure", resp.StatusCode)
+	}
+	if resp, status := e.api("GET", "/api/status", ""); resp.StatusCode != 200 || status["via"] != viaProxy || status["state"] != clientctl.StateOn {
+		t.Fatal("restore failure lost the authenticated window or listener")
+	}
+	e.proxy.restoreErr = nil
+	if resp, _ := e.api("POST", "/api/quit", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("quit retry returned %d", resp.StatusCode)
+	}
+	select {
+	case <-e.quit:
+	case <-time.After(time.Second):
+		t.Fatal("quit was not called after successful restoration")
+	}
+}
+
+func TestProfileCopyUsesProtectedClipboard(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	p := link.Profile{Host: "example.com", Name: "phone", HTTPSProxy: "proxy.example:9443", Seed: [32]byte{1}}
+	raw, err := p.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, ok := link.ProxyURL(p)
+	if !ok {
+		t.Fatal("test profile has no HTTPS proxy URL")
+	}
+	resp, saved := e.api("POST", "/api/profiles", `{"link":"`+raw+`"}`)
+	rev, _ := saved["rev"].(string)
+	if resp.StatusCode != http.StatusOK || rev == "" {
+		t.Fatalf("saving the clipboard fixture returned %d", resp.StatusCode)
+	}
+	const path = "/api/profiles/phone/copy"
+	var copied = make(chan string, 3)
+	e.srv.cfg.copySensitive = func(value string) error { copied <- value; return nil }
+	for _, test := range []struct{ format, value string }{{"link", raw}, {"proxy", proxy}, {"export", link.ProxyExport(proxy)}} {
+		body := `{"format":"` + test.format + `","rev":"` + rev + `","text":"ignored"}`
+		if resp, out := e.api("POST", path, body); resp.StatusCode != http.StatusNoContent || out != nil {
+			t.Fatalf("copy %s returned %d", test.format, resp.StatusCode)
+		}
+		select {
+		case value := <-copied:
+			if value != test.value {
+				t.Fatalf("copy %s did not use the value from the saved profile", test.format)
+			}
+		default:
+			t.Fatalf("copy %s did not call the protected clipboard", test.format)
+		}
+	}
+	body := `{"format":"link","rev":"` + rev + `"}`
+	if resp := e.do("POST", path, body, func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+e.token)
+		r.Header.Set("Origin", e.origin)
+	}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("copy without CSRF returned %d", resp.StatusCode)
+	}
+	if resp, _ := e.api("POST", path, `{"format":"link","rev":"stale"}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("copy with a stale revision returned %d", resp.StatusCode)
+	}
+	if len(copied) != 0 {
+		t.Fatal("a rejected request copied a value")
+	}
+	e.srv.cfg.copySensitive = func(string) error { return webview.ErrUnsupported }
+	if resp, out := e.api("POST", path, body); resp.StatusCode != http.StatusOK || len(out) != 1 || out["fallback"] != true {
+		t.Fatalf("unsupported clipboard returned %d", resp.StatusCode)
+	}
+}
+
+func TestImportPreviewShowsEndpoints(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	raw, err := (link.Profile{
+		Host: "origin.example", Name: "phone", FastPort: 1443, StealthPort: 8443,
+		HTTPSProxy: "proxy.example:9443",
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{"link": raw})
+	resp, got := e.api("POST", "/api/profiles/preview", string(body))
+	if resp.StatusCode != http.StatusOK || got["fast"] != "origin.example:1443" ||
+		got["stealth"] != "origin.example:8443" || got["httpsProxy"] != "proxy.example:9443" {
+		t.Fatalf("import preview did not show distinct tier and proxy endpoints: %+v", got)
+	}
+}
+
 func TestAuthRules(t *testing.T) {
 	e := newEnv(t)
 	e.login()
-	cookie := func(r *http.Request) { r.AddCookie(e.cookie) }
+	bearer := func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+e.token) }
 
 	if r := e.do("GET", "/api/status", ""); r.StatusCode != 401 {
-		t.Errorf("no cookie: %d", r.StatusCode)
+		t.Errorf("no bearer: %d", r.StatusCode)
 	}
-	if r := e.do("GET", "/api/status", "", cookie); r.StatusCode != 200 {
-		t.Errorf("cookie GET: %d", r.StatusCode)
+	if r := e.do("GET", "/api/status", "", bearer); r.StatusCode != 200 {
+		t.Errorf("bearer GET: %d", r.StatusCode)
 	}
-	if r := e.do("GET", "/api/status", "", cookie, func(r *http.Request) { r.Host = "evil.example:80" }); r.StatusCode != 403 {
+	if r := e.do("GET", "/api/status", "", bearer, func(r *http.Request) { r.Host = "evil.example:80" }); r.StatusCode != 403 {
 		t.Errorf("wrong host: %d", r.StatusCode)
 	}
 	if r := e.do("GET", "/", "", func(r *http.Request) { r.Host = "localhost:" + strings.Split(e.srv.hostValue(), ":")[1] }); r.StatusCode != 403 {
 		t.Errorf("localhost host (rebinding): %d", r.StatusCode)
 	}
-	if r := e.do("GET", "/api/status", "", cookie, func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "cross-site") }); r.StatusCode != 403 {
+	if r := e.do("GET", "/api/status", "", bearer, func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "cross-site") }); r.StatusCode != 403 {
 		t.Errorf("cross-site GET: %d", r.StatusCode)
 	}
-	if r := e.do("GET", "/api/status", "", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: cookieName, Value: "forged"}) }); r.StatusCode != 401 {
-		t.Errorf("forged cookie: %d", r.StatusCode)
+	if r := e.do("GET", "/api/status", "", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "pipe_session", Value: e.token}) }); r.StatusCode != 401 {
+		t.Errorf("cookie authorization: %d", r.StatusCode)
 	}
 	post := func(mut ...func(*http.Request)) int {
-		return e.do("PUT", "/api/mode", `{"mode":"global"}`, append([]func(*http.Request){cookie}, mut...)...).StatusCode
+		return e.do("PUT", "/api/mode", `{"mode":"global"}`, append([]func(*http.Request){bearer}, mut...)...).StatusCode
 	}
 	good := func(r *http.Request) { r.Header.Set("Origin", e.origin); r.Header.Set("X-Pipe-CSRF", "1") }
 	if c := post(good); c != 200 {
@@ -242,7 +558,7 @@ func TestAuthRules(t *testing.T) {
 	if c := post(good, func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "") }); c != 403 {
 		t.Errorf("empty Sec-Fetch-Site PUT: %d", c)
 	}
-	if r := e.do("GET", "/api/nothing", "", cookie); r.StatusCode != 404 {
+	if r := e.do("GET", "/api/nothing", "", bearer); r.StatusCode != 404 {
 		t.Errorf("unknown api: %d", r.StatusCode)
 	}
 }
@@ -268,7 +584,7 @@ func TestNonceSingleUseAndExpiry(t *testing.T) {
 	session := func(n string) int {
 		return e.do("POST", "/api/session", `{"nonce":"`+n+`"}`, csrf).StatusCode
 	}
-	if c := session(nonce); c != 204 {
+	if c := session(nonce); c != 200 {
 		t.Fatalf("first use: %d", c)
 	}
 	if c := session(nonce); c != 401 {
@@ -295,7 +611,7 @@ func TestNonceSingleUseAndExpiry(t *testing.T) {
 	if c := e.do("POST", "/api/session", `{"nonce":"`+fresh+`"}`, func(r *http.Request) { r.Header.Set("Origin", e.origin) }).StatusCode; c != 403 {
 		t.Fatalf("session without CSRF header: %d", c)
 	}
-	if c := session(fresh); c != 204 {
+	if c := session(fresh); c != 200 {
 		t.Fatalf("failed attempts must not burn the nonce: %d", c)
 	}
 }
@@ -392,7 +708,7 @@ func TestProfilesLifecycleNeverReturnsLink(t *testing.T) {
 	}
 	// Every profile endpoint must not echo the link.
 	for _, p := range []string{"/api/profiles", "/api/status", "/api/routing"} {
-		r := e.do("GET", p, "", func(r *http.Request) { r.AddCookie(e.cookie) })
+		r := e.do("GET", p, "", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+e.token) })
 		body, _ := io.ReadAll(r.Body)
 		if bytes.Contains(body, []byte("pipe://")) {
 			t.Fatalf("%s leaked a link", p)
@@ -430,6 +746,35 @@ func TestProfilesLifecycleNeverReturnsLink(t *testing.T) {
 	_, list = e.api("GET", "/api/profiles", "")
 	if list["active"] != "other" {
 		t.Fatalf("active falls to the remaining profile: %v", list)
+	}
+}
+
+func TestProfileEditsRejectStoreLoadErrorBeforeMutation(t *testing.T) {
+	for _, tc := range []struct{ method, body string }{
+		{http.MethodPatch, `{"name":"renamed"}`},
+		{http.MethodDelete, ""},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			e := newEnv(t)
+			e.login()
+			if resp, _ := e.api("POST", "/api/profiles", `{"link":"`+testLink(t, "phone", "")+`"}`); resp.StatusCode != http.StatusOK {
+				t.Fatalf("add profile returned %d", resp.StatusCode)
+			}
+			if err := e.srv.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			e.srv.store.loadErr = errors.New("could not read fixture app.json")
+			resp, out := e.api(tc.method, "/api/profiles/phone", tc.body)
+			if resp.StatusCode != http.StatusInternalServerError || out["error"] != "Could not read fixture app.json" {
+				t.Fatalf("profile edit returned %d %v", resp.StatusCode, out)
+			}
+			if !e.srv.profiles.Exists("phone") || e.srv.profiles.Exists("renamed") || e.srv.store.Snapshot().Active != "phone" {
+				t.Fatal("profile edit changed the files or active name despite the store error")
+			}
+			if e.ctl.Status().State != clientctl.StateOn {
+				t.Fatal("profile edit stopped the active connection despite the store error")
+			}
+		})
 	}
 }
 
@@ -729,6 +1074,7 @@ type fakeHelper struct {
 	removed   int
 	installE  error
 	removeE   error
+	stopE     error
 	stops     int
 	onChange  func()
 
@@ -747,7 +1093,7 @@ func (h *fakeHelper) TestProfileResult(ctx context.Context, opts clientctl.Probe
 	if h.probeProfile != nil {
 		return h.probeProfile(ctx, opts)
 	}
-	return clientctl.ProfileTestResult{}, nil
+	return clientctl.ProfileTestResult{Routes: h.TestRoutes(ctx), MetricVersion: clientctl.RTTMetricVersion}, nil
 }
 
 func (h *fakeHelper) Info() helper.Info { h.imu.Lock(); defer h.imu.Unlock(); return h.info }
@@ -775,8 +1121,245 @@ func (h *fakeHelper) Remove() error {
 func (h *fakeHelper) Stop() error {
 	h.imu.Lock()
 	h.stops++
+	err := h.stopE
 	h.imu.Unlock()
+	if err != nil {
+		return err
+	}
 	return h.fakeCtl.Stop()
+}
+
+type updateTestHelper struct {
+	*fakeHelper
+	checks int
+}
+
+type leaseTestHelper struct {
+	*fakeHelper
+	start func(clientctl.Options) error
+	holds int
+}
+
+func (h *leaseTestHelper) Start(opts clientctl.Options) error { return h.start(opts) }
+func (h *leaseTestHelper) HoldSession()                       { h.holds++ }
+
+func TestTUNStartTracksOwnershipBeforeRPCAndReconcilesError(t *testing.T) {
+	for _, tc := range []struct {
+		state   string
+		guarded bool
+		wantVia string
+	}{
+		{state: clientctl.StateOn, wantVia: viaTUN},
+		{state: clientctl.StateError, wantVia: viaTUN},
+		{state: clientctl.StateOff, guarded: true, wantVia: viaTUN},
+		{state: clientctl.StateOff},
+	} {
+		t.Run(fmt.Sprintf("%s/guarded=%t", tc.state, tc.guarded), func(t *testing.T) {
+			e, h := newTUNEnv(t, helper.StateOK)
+			remote := &leaseTestHelper{fakeHelper: h, start: func(clientctl.Options) error {
+				if e.srv.getVia() != viaTUN {
+					t.Error("Start sent before reserving Helper ownership")
+				}
+				h.state, h.guarded = tc.state, tc.guarded
+				return errors.New("Start reply lost")
+			}}
+			e.srv.cfg.Helper = remote
+			if err := e.srv.SetTUN(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.srv.Connect(); err == nil || e.srv.getVia() != tc.wantVia {
+				t.Fatalf("Connect error=%v, via=%q", err, e.srv.getVia())
+			}
+			if wantHold := tc.guarded || tc.state == clientctl.StateOn; (remote.holds > 0) != wantHold {
+				t.Fatalf("unexpected hold count %d after Start", remote.holds)
+			}
+		})
+	}
+}
+
+func TestTUNStartupAndStatusReattachHelperLease(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   string
+		guarded bool
+	}{
+		{name: "startup with live Helper", state: clientctl.StateOn},
+		{name: "status finds paused Helper", state: clientctl.StateError, guarded: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, h := newTUNEnv(t, helper.StateOK)
+			remote := &leaseTestHelper{fakeHelper: h, start: func(clientctl.Options) error {
+				t.Error("app restarted the existing Helper session")
+				return errors.New("unexpected restart")
+			}}
+			cfg := e.srv.cfg
+			cfg.Helper = remote
+			if !tc.guarded {
+				h.state = tc.state
+			}
+			s := NewServer(cfg)
+			if !tc.guarded && (s.getVia() != viaTUN || remote.holds == 0) {
+				t.Fatal("startup did not reattach the live Helper")
+			}
+			h.state, h.guarded = tc.state, tc.guarded
+			st := s.Snapshot()
+			if st.Via != viaTUN || st.Guarded != tc.guarded || remote.holds == 0 || s.StateIsOff() {
+				t.Fatalf("status failed to reattach the Helper: %+v", st)
+			}
+			if err := s.store.Update(func(d *appData) { d.Settings.ConnectOnLaunch = true }); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.ConnectIfConfigured(); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Disconnect(); err != nil || h.stops != 1 || s.getVia() != "" || h.Status().Guarded {
+				t.Fatalf("could not explicitly disconnect the Helper: %v", err)
+			}
+		})
+	}
+}
+
+func (h *updateTestHelper) UpdateRoute() update.Route {
+	h.checks++
+	return update.UnavailableRoute(update.ErrTunnelUnavailable)
+}
+
+func TestTUNStatusErrorPreservesUpdateRoute(t *testing.T) {
+	e, h := newTUNEnv(t, helper.StateOK)
+	routes := &updateTestHelper{fakeHelper: h}
+	e.srv.cfg.Helper = routes
+	e.api("PUT", "/api/settings", `{"tun":true}`)
+	e.api("POST", "/api/connect", "")
+	h.mu.Lock()
+	h.state = clientctl.StateError
+	h.mu.Unlock()
+	_, status := e.api("GET", "/api/status", "")
+	if status["state"] != clientctl.StateError || status["via"] != viaTUN || e.srv.StateIsOff() {
+		t.Error("an indeterminate Helper status lost TUN ownership")
+	}
+	// The invalid build version keeps even a mistaken direct check offline.
+	updates := update.NewManager("invalid", update.Target{OS: "linux", ABI: "amd64"}, t.TempDir())
+	t.Cleanup(updates.Close)
+	updates.Check(e.srv.updateRoute(), false)
+	deadline := time.Now().Add(time.Second)
+	for updates.Status().State == "checking" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if st := updates.Status(); st.Error != update.ErrTunnelUnavailable.Error() {
+		t.Errorf("update check during the Helper status error: %+v", st)
+	}
+	h.mu.Lock()
+	h.state = clientctl.StateOn
+	h.mu.Unlock()
+	_, status = e.api("GET", "/api/status", "")
+	if status["state"] != clientctl.StateOn || status["via"] != viaTUN {
+		t.Fatalf("status did not recover: %v", status)
+	}
+	e.srv.updateRoute()
+	if routes.checks != 1 {
+		t.Error("the recovered Helper did not select the update route")
+	}
+	h.fakeCtl.Stop()
+	_, status = e.api("GET", "/api/status", "")
+	if status["state"] != clientctl.StateOff || status["via"] != "" {
+		t.Fatalf("a confirmed stop did not clear ownership: %v", status)
+	}
+}
+
+func TestFailedHelperStopRetainsTUNOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		err           error
+		switchToProxy bool
+	}{
+		{name: "disconnect after dial timeout", err: context.DeadlineExceeded},
+		{name: "switch to proxy after permission denied", err: os.ErrPermission, switchToProxy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, h := newTUNEnv(t, helper.StateOK)
+			e.api("PUT", "/api/settings", `{"tun":true}`)
+			e.api("POST", "/api/connect", "")
+			h.stopE = tc.err
+			stop := e.srv.Disconnect
+			wantState := clientctl.StateOn
+			if tc.switchToProxy {
+				stop = func() error { return e.srv.SetTUN(false) }
+				h.mu.Lock()
+				h.state = clientctl.StateError
+				h.mu.Unlock()
+				wantState = clientctl.StateError
+			}
+			if err := stop(); !errors.Is(err, h.stopE) {
+				t.Errorf("Stop returned %v", err)
+			}
+			if e.srv.getVia() != viaTUN || h.Status().State != wantState || len(e.ctl.started) != 0 || !e.srv.Settings().TUN {
+				t.Fatal("failed Stop lost the TUN session or started a local session")
+			}
+			h.stopE = nil
+			if err := stop(); err != nil || h.stops != 2 || h.Status().State != clientctl.StateOff || e.srv.getVia() == viaTUN {
+				t.Fatalf("Helper Stop retry returned %v", err)
+			}
+		})
+	}
+}
+
+type unconfirmedStopHelper struct{ *fakeHelper }
+
+func (*unconfirmedStopHelper) Stop() error { return nil }
+
+func TestHelperStopRequiresConfirmedOff(t *testing.T) {
+	e, h := newTUNEnv(t, helper.StateOK)
+	e.srv.cfg.Helper = &unconfirmedStopHelper{fakeHelper: h}
+	e.api("PUT", "/api/settings", `{"tun":true}`)
+	e.api("POST", "/api/connect", "")
+	h.mu.Lock()
+	h.state = clientctl.StateError
+	h.mu.Unlock()
+	if err := e.srv.Disconnect(); err == nil || e.srv.getVia() != viaTUN {
+		t.Fatal("an unconfirmed stop released TUN ownership")
+	}
+	h.fakeCtl.Stop()
+	if _, status := e.api("GET", "/api/status", ""); status["via"] != "" {
+		t.Fatal("a confirmed off status retained TUN ownership")
+	}
+}
+
+func TestRemovedHelperAllowsDisconnectAndQuit(t *testing.T) {
+	for _, tc := range []struct {
+		action string
+		status int
+	}{
+		{action: "disconnect", status: http.StatusOK},
+		{action: "quit", status: http.StatusNoContent},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			e, h := newTUNEnv(t, helper.StateOK)
+			e.srv.cfg.Helper = &unconfirmedStopHelper{fakeHelper: h}
+			if err := e.srv.SetTUN(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.srv.Connect(); err != nil || e.srv.getVia() != viaTUN {
+				t.Fatalf("Connect did not establish TUN ownership: %v", err)
+			}
+			h.mu.Lock()
+			h.state = clientctl.StateError
+			h.mu.Unlock()
+			h.imu.Lock()
+			h.info = helper.Info{State: helper.StateMissing}
+			h.imu.Unlock()
+			resp, out := e.api("POST", "/api/"+tc.action, "")
+			if resp.StatusCode != tc.status || e.srv.getVia() != "" {
+				t.Fatalf("operation after Helper removal returned %d %v, via=%q", resp.StatusCode, out, e.srv.getVia())
+			}
+			if tc.action == "quit" {
+				select {
+				case <-e.quit:
+				case <-time.After(time.Second):
+					t.Fatal("Quit did not signal app exit")
+				}
+			}
+		})
+	}
 }
 
 func newTUNEnv(t *testing.T, state string) (*env, *fakeHelper) {
@@ -934,10 +1517,10 @@ func TestInstallCanceledAndRemove(t *testing.T) {
 	// The new endpoints keep the usual security checks.
 	for _, c := range [][2]string{{"GET", "/api/helper"}, {"POST", "/api/helper/install"}, {"POST", "/api/helper/remove"}} {
 		if r := e.do(c[0], c[1], ""); r.StatusCode != 401 {
-			t.Errorf("%v without cookie: %d", c, r.StatusCode)
+			t.Errorf("%v without bearer: %d", c, r.StatusCode)
 		}
 		if c[0] == "POST" {
-			if r := e.do(c[0], c[1], "", func(r *http.Request) { r.AddCookie(e.cookie) }); r.StatusCode != 403 {
+			if r := e.do(c[0], c[1], "", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+e.token) }); r.StatusCode != 403 {
 				t.Errorf("%v without csrf: %d", c, r.StatusCode)
 			}
 		}
@@ -1024,7 +1607,7 @@ func TestProfileSecretEndpoint(t *testing.T) {
 	}
 
 	// GET /api/profiles must never contain link text or derived proxy passwords.
-	listResp := e.do("GET", "/api/profiles", "", func(r *http.Request) { r.AddCookie(e.cookie) })
+	listResp := e.do("GET", "/api/profiles", "", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+e.token) })
 	listBody, _ := io.ReadAll(listResp.Body)
 	listResp.Body.Close()
 	if bytes.Contains(listBody, []byte("pipe://")) ||
@@ -1034,27 +1617,27 @@ func TestProfileSecretEndpoint(t *testing.T) {
 	}
 
 	// Auth, CSRF, Host, Origin, and Sec-Fetch-Site checks.
-	cookie := func(r *http.Request) { r.AddCookie(e.cookie) }
+	bearer := func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+e.token) }
 	good := func(r *http.Request) {
-		r.AddCookie(e.cookie)
+		r.Header.Set("Authorization", "Bearer "+e.token)
 		r.Header.Set("Origin", e.origin)
 		r.Header.Set("X-Pipe-CSRF", "1")
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
 	}
 	if r := e.do("POST", "/api/profiles/phone/secret", ""); r.StatusCode != 401 || r.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("no cookie: %d cc=%q", r.StatusCode, r.Header.Get("Cache-Control"))
+		t.Errorf("no bearer: %d cc=%q", r.StatusCode, r.Header.Get("Cache-Control"))
 	}
 	if r := e.do("POST", "/api/profiles/phone/secret", "", func(r *http.Request) {
-		r.AddCookie(&http.Cookie{Name: cookieName, Value: "forged"})
+		r.AddCookie(&http.Cookie{Name: "pipe_session", Value: e.token})
 		r.Header.Set("Origin", e.origin)
 		r.Header.Set("X-Pipe-CSRF", "1")
 	}); r.StatusCode != 401 {
-		t.Errorf("forged cookie: %d", r.StatusCode)
+		t.Errorf("cookie authorization: %d", r.StatusCode)
 	}
-	if r := e.do("POST", "/api/profiles/phone/secret", "", cookie, func(r *http.Request) { r.Header.Set("Origin", e.origin) }); r.StatusCode != 403 {
+	if r := e.do("POST", "/api/profiles/phone/secret", "", bearer, func(r *http.Request) { r.Header.Set("Origin", e.origin) }); r.StatusCode != 403 {
 		t.Errorf("without csrf: %d", r.StatusCode)
 	}
-	if r := e.do("POST", "/api/profiles/phone/secret", "", cookie, func(r *http.Request) { r.Header.Set("X-Pipe-CSRF", "1") }); r.StatusCode != 403 {
+	if r := e.do("POST", "/api/profiles/phone/secret", "", bearer, func(r *http.Request) { r.Header.Set("X-Pipe-CSRF", "1") }); r.StatusCode != 403 {
 		t.Errorf("without origin: %d", r.StatusCode)
 	}
 	if r := e.do("POST", "/api/profiles/phone/secret", "", good, func(r *http.Request) { r.Header.Set("Origin", "http://evil.example") }); r.StatusCode != 403 {
@@ -1069,7 +1652,7 @@ func TestProfileSecretEndpoint(t *testing.T) {
 	if r := e.do("POST", "/api/profiles/phone/secret", "", good, func(r *http.Request) { r.Header.Add("Sec-Fetch-Site", "cross-site") }); r.StatusCode != 403 {
 		t.Errorf("multi Sec-Fetch-Site: %d", r.StatusCode)
 	}
-	if r := e.do("GET", "/api/profiles/phone/secret", "", cookie); r.StatusCode == 200 {
+	if r := e.do("GET", "/api/profiles/phone/secret", "", bearer); r.StatusCode == 200 {
 		t.Errorf("GET must not serve secret: %d", r.StatusCode)
 	}
 	if resp, _ := e.api("POST", "/api/profiles/missing/secret", ""); resp.StatusCode != 404 {

@@ -26,7 +26,9 @@ relay_topology() {
   ip -n "$server_ns" addr add "$relay_target/32" dev veth-srv
   ip -n "$relay_server2_ns" addr add "$relay_server2_addr/24" dev veth-srv
   ip -n "$relay_server2_ns" addr add "$relay_target2/32" dev veth-srv
-  ip -n "$relay_server2_ns" addr add "$target_addr/32" dev lo
+  ip netns add "$relay_target2_ns"
+  relay_target2_ns_created=1
+  connect_origin "$relay_server2_ns" "$relay_target2_ns"
   ip -n "$relay_ns" link set lo up
   ip -n "$relay_ns" link set veth-rly-cli up
   ip -n "$relay_ns" link set veth-rly-srv up
@@ -72,7 +74,7 @@ relay_start_server2() {
     "HTTPS proxy listening on $relay_server2_addr:$proxy_port" 8
 
   : > "$work_dir/relay-target2.log"
-  ip netns exec "$relay_server2_ns" python3 -u "$work_dir/target.py" "$target_addr" "$target_port" 'pipe e2e target 2' \
+  ip netns exec "$relay_target2_ns" python3 -u "$work_dir/target.py" "$target_addr" "$target_port" 'pipe e2e target 2' \
     >> "$work_dir/relay-target2.log" 2>&1 &
   relay_target2_pid=$!
   wait_for_log "$relay_target2_pid" "$work_dir/relay-target2.log" 'Target ready' 8
@@ -216,7 +218,7 @@ RULES
   if relay_cover "$relay_front" "$proxy_port" >/dev/null 2>&1; then fail "$check (proxy port)"; fi
   if relay_cover "$relay_target" "$stealth_port" >/dev/null 2>&1; then fail "$check (direct route)"; fi
   : > "$work_dir/cover.log"
-  ip netns exec "$server_ns" python3 -u "$work_dir/target.py" "$target_addr" "$stealth_port" 'other host' \
+  ip netns exec "$target_ns" python3 -u "$work_dir/target.py" "$target_addr" "$stealth_port" 'other host' \
     >> "$work_dir/cover.log" 2>&1 &
   cover_pid=$!
   wait_for_log "$cover_pid" "$work_dir/cover.log" 'Target ready' 8

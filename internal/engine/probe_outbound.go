@@ -49,18 +49,23 @@ func (o *probeOutbound) DialContext(ctx context.Context, network string, target 
 	go func() {
 		defer server.Close()
 		_ = server.SetDeadline(time.Now().Add(6 * time.Second))
-		req, err := http.ReadRequest(bufio.NewReader(io.LimitReader(server, 4096)))
-		if err != nil {
-			return
+		reader := bufio.NewReader(io.LimitReader(server, 16<<10))
+		for round := range 4 {
+			req, err := http.ReadRequest(reader)
+			if err != nil || req.Method != http.MethodGet || req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+				return
+			}
+			status, body := ProbeResponse(req)
+			closeAfter := req.Close || round == 3 || status != http.StatusOK || body != "OK"
+			res := &http.Response{
+				StatusCode: status, ProtoMajor: 1, ProtoMinor: 1, Close: closeAfter,
+				Header:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+				ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body)),
+			}
+			if err := res.Write(server); err != nil || closeAfter {
+				return
+			}
 		}
-		defer req.Body.Close()
-		status, body := ProbeResponse(req)
-		res := &http.Response{
-			StatusCode: status, ProtoMajor: 1, ProtoMinor: 1, Close: true,
-			Header:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
-			ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body)),
-		}
-		_ = res.Write(server)
 	}()
 	return client, nil
 }

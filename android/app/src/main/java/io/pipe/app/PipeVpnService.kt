@@ -25,18 +25,22 @@ import android.service.quicksettings.TileService
 import android.content.ComponentName
 import mobile.Mobile
 import mobile.Platform
+import mobile.Updates
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.Executors
 
 class PipeVpnService : VpnService(), Platform {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var connectivity: ConnectivityManager
+    private lateinit var updates: Updates
     private val subscribers = LinkedHashSet<Messenger>()
     private var latestStatus = JSONObject().put("running", false)
     private var foreground = false
     @Volatile private var latestStart = 0
     @Volatile private var running = false
+    @Volatile private var blocked = false
     @Volatile private var destroyed = false
     @Volatile private var sessionGeneration = 0L
     @Volatile private var networkState = "{}"
@@ -70,6 +74,26 @@ class PipeVpnService : VpnService(), Platform {
             VpnControl.APPLY_PREFS -> {
                 val startId = latestStart
                 worker.execute { if (startId == latestStart && !destroyed) applyPreferences(startId) }
+            }
+            VpnControl.UPDATE_POLL -> sendUpdateStatus(reply, updates.status())
+            VpnControl.UPDATE_CHECK, VpnControl.UPDATE_DOWNLOAD -> if (reply != null) {
+                val what = message.what
+                val flags = message.arg1
+                worker.execute {
+                    if (!destroyed) {
+                        val tunneled = running || blocked || (flags and VpnControl.UPDATE_VIA_TUNNEL) != 0
+                        val automatic = (flags and VpnControl.UPDATE_AUTOMATIC) != 0
+                        val status = if (what == VpnControl.UPDATE_CHECK) updates.check(tunneled, automatic)
+                        else updates.download(tunneled)
+                        sendUpdateStatus(reply, status)
+                    }
+                }
+            }
+            VpnControl.UPDATE_INSTALL -> if (reply != null) {
+                val artifact = message.data.getString(VpnControl.PAYLOAD).orEmpty()
+                installer.execute {
+                    if (!destroyed) installUpdate(artifact, reply)
+                }
             }
         }
         true
@@ -120,24 +144,22 @@ class PipeVpnService : VpnService(), Platform {
             val reset = changes.update(snapshot) ?: return
             networkState = snapshot.json
             if (reset) Mobile.networkChanged() else Mobile.refreshNetwork()
-            // A rebuild for the new network that failed, rollback included,
-            // leaves no session: stop the service instead of showing Connected.
-            if (!JSONObject(Mobile.status()).optBoolean("running")) {
-                val startId = latestStart
-                stopVPN(generation)
-                publishStopped("Pipe stopped: it could not restart on the new network", startId)
-                stopServiceStart(startId)
+            val status = JSONObject(Mobile.status())
+            if (!status.optBoolean("running")) {
+                reportTunnelFailure(status, "Pipe could not restart on the new network", latestStart, generation)
             }
         }
 
         private fun onWorker(update: () -> Unit) {
-            worker.execute { if (!destroyed && ownsSession(generation)) update() }
+            worker.execute { if (!destroyed && running && ownsSession(generation)) update() }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         connectivity = getSystemService(ConnectivityManager::class.java)
+        updates = updateManager ?: Mobile.newUpdates(File(noBackupFilesDir, "updates").absolutePath, updateAbi())
+            .also { updateManager = it }
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "Pipe VPN", NotificationManager.IMPORTANCE_LOW)
         )
@@ -170,7 +192,7 @@ class PipeVpnService : VpnService(), Platform {
             if (destroyed || startId != latestStart) return@execute
             if (action == VpnControl.DISCONNECT) {
                 disconnect(startId, sessionGeneration)
-            } else if (!running) {
+            } else if (!running && !blocked) {
                 connect(startId)
             }
         }
@@ -234,7 +256,7 @@ class PipeVpnService : VpnService(), Platform {
     private fun applyPreferences(startId: Int) {
         var current = applied ?: return
         val generation = sessionGeneration
-        if (!ownsSession(generation)) return
+        if (!running || !ownsSession(generation)) return
         try {
             val profile = ProfileStore(this).read().current
             val relay = profile?.takeIf { it.link == appliedProfileLink }?.relay?.enabledCode ?: current.relay
@@ -261,11 +283,53 @@ class PipeVpnService : VpnService(), Platform {
             if (status.optBoolean("running")) {
                 publish(status.put("lastError", "Could not apply VPN settings").toString())
             } else {
-                stopVPN(generation)
-                publishStopped("Could not apply VPN settings", startId)
-                stopServiceStart(startId)
+                reportTunnelFailure(status, "Could not apply VPN settings", startId, generation)
             }
         }
+    }
+
+    private fun reportTunnelFailure(status: JSONObject, error: String, startId: Int, generation: Long) {
+        if (status.optBoolean("blocked")) {
+            blocked = true
+            running = false
+            publish(status.put("lastError", error).toString(), startId)
+        } else {
+            stopVPN(generation)
+            publishStopped(error, startId)
+            stopServiceStart(startId)
+        }
+    }
+
+    private fun sendUpdateStatus(reply: Messenger?, status: String) {
+        if (destroyed || !VpnControl.send(reply, VpnControl.UPDATE_STATUS, payload = status)) return
+        val snapshot = JSONObject(status)
+        if (snapshot.optString("state") == "available" && snapshot.optBoolean("verifying")) {
+            waitForStagedUpdate(reply)
+        }
+    }
+
+    private fun waitForStagedUpdate(reply: Messenger?) {
+        main.postDelayed({
+            if (!destroyed) {
+                val status = updates.status()
+                if (JSONObject(status).optBoolean("verifying")) waitForStagedUpdate(reply)
+                else VpnControl.send(reply, VpnControl.UPDATE_STATUS, payload = status)
+            }
+        }, 750)
+    }
+
+    private fun installUpdate(artifact: String, reply: Messenger) {
+        val error = try {
+            val path = updates.artifact(artifact)
+            val version = JSONObject(updates.status()).optString("version")
+            submitVerifiedApk(this, File(path), version, updateAbi())
+            return
+        } catch (error: UpdateInstallException) {
+            error.message ?: "Android could not prepare the update."
+        } catch (_: Exception) {
+            "Android could not prepare the verified update."
+        }
+        VpnControl.send(reply, VpnControl.UPDATE_INSTALL_ERROR, payload = error)
     }
 
     override fun openTun(optionsJSON: String): Int {
@@ -339,6 +403,7 @@ class PipeVpnService : VpnService(), Platform {
     private fun stopVPN(generation: Long) {
         if (!ownsSession(generation)) return
         running = false
+        blocked = false
         networkCallback?.let { callback ->
             runCatching { connectivity.unregisterNetworkCallback(callback) }
         }
@@ -377,13 +442,19 @@ class PipeVpnService : VpnService(), Platform {
             if (destroyed || generation != sessionGeneration || (startId != null && startId != latestStart)) return@post
             val status = JSONObject(json)
             if (status.optBoolean("running") && !running) return@post
-            val changed = latestStatus.optBoolean("running") != status.optBoolean("running")
+            val changed = latestStatus.optBoolean("running") != status.optBoolean("running") ||
+                latestStatus.optBoolean("blocked") != status.optBoolean("blocked")
             val tier = status.optString("tier")
             val tierChanged = latestStatus.optString("tier") != tier
             latestStatus = status
             if (changed) TileService.requestListeningState(this, ComponentName(this, PipeTileService::class.java))
-            if (foreground && status.optBoolean("running") && (changed || tierChanged)) {
-                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification("Connected · $tier"))
+            if (foreground && (changed || tierChanged)) {
+                val text = when {
+                    status.optBoolean("blocked") -> "Traffic blocked"
+                    status.optBoolean("running") -> "Connected · $tier"
+                    else -> null
+                }
+                if (text != null) getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
             }
             val iterator = subscribers.iterator()
             while (iterator.hasNext()) {
@@ -422,7 +493,10 @@ class PipeVpnService : VpnService(), Platform {
         val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "Pipe VPN") }
         val aux = Executors.newSingleThreadExecutor { task -> Thread(task, "Pipe logs").apply { isDaemon = true } }
         val prober = Executors.newSingleThreadExecutor { task -> Thread(task, "Pipe probe").apply { isDaemon = true } }
+        val installer = Executors.newSingleThreadExecutor { task -> Thread(task, "Pipe installer").apply { isDaemon = true } }
         var nextGeneration = 0L
         var activeService: PipeVpnService? = null
+        // Preserve a verified download while the activity visits Android's installer settings.
+        var updateManager: Updates? = null
     }
 }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -181,8 +182,9 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range []string{"Before=pipe.service", "Type=oneshot", "User=root", "RemainAfterExit=yes",
-		"CapabilityBoundingSet=CAP_NET_ADMIN", "NoNewPrivileges=yes",
+	for _, line := range []string{"Wants=network-online.target", "After=network-online.target nftables.service",
+		"Before=pipe.service", "Type=oneshot", "User=root", "RemainAfterExit=yes",
+		"CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", "NoNewPrivileges=yes",
 		"ExecStart=\"/tmp/pipe\" server hop-apply --fast-hop 20000-20010 --fast-port 14443", "WantedBy=multi-user.target"} {
 		if !bytes.Contains(hopService, []byte(line+"\n")) {
 			t.Errorf("hopping service is missing %q", line)
@@ -340,15 +342,25 @@ func TestHopTableOwnership(t *testing.T) {
 			return "", errors.New("unexpected nft invocation")
 		}
 	}
-	if err := reconcileHopTable("20000-20001", 443, nft); err == nil || applied != "" {
+	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.8"), netip.MustParseAddr("2001:db8::8")}
+	if err := reconcileHopTable("20000-20001", 443, addresses, nft); err == nil || applied != "" {
 		t.Fatal("installer took ownership of an unrelated table")
 	}
 	owned = true
-	if err := reconcileHopTable("20000-20001", 443, nft); err != nil ||
-		!strings.Contains(applied, "udp dport 20000-20001 redirect to :443") || strings.Contains(applied, "unrelated") {
+	if err := reconcileHopTable("20000-20001", 443, addresses, nft); err != nil ||
+		!strings.Contains(applied, "ip daddr 192.0.2.8 fib daddr type local udp dport 20000-20001 redirect to :443") ||
+		!strings.Contains(applied, "ip6 daddr 2001:db8::8 fib daddr type local udp dport 20000-20001 redirect to :443") || strings.Contains(applied, "unrelated") {
 		t.Fatalf("unexpected hopping transaction: %v", err)
 	}
-	if err := reconcileHopTable("", 0, nft); err != nil || applied != "delete table inet pipe\n" {
+	for _, scope := range []string{"ip daddr 192.0.2.8", "ip6 daddr 2001:db8::8"} {
+		match := scope + " fib daddr type local udp dport 20000-20001"
+		exempt := strings.Index(applied, match+" socket wildcard { 0, 1 } return")
+		redirect := strings.Index(applied, match+" redirect to :443")
+		if exempt < 0 || exempt > redirect {
+			t.Fatalf("%s needs a live bound-socket check before redirect", scope)
+		}
+	}
+	if err := reconcileHopTable("", 0, nil, nft); err != nil || applied != "delete table inet pipe\n" {
 		t.Fatalf("unexpected removal transaction: %v", err)
 	}
 }

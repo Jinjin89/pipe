@@ -3,15 +3,15 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -145,7 +145,7 @@ func TestHTTPSProxyH2RevokeUnblocksStalledResponse(t *testing.T) {
 	}
 }
 
-func TestHTTPSProxyH2ForwardsPlainHTTPOnlyWithValidAuth(t *testing.T) {
+func TestHTTPSProxyH2RejectsForwardWithoutScheme(t *testing.T) {
 	const path = "/plain?query=1"
 	device := Device{Name: "phone"}
 	device.HTTPSProxyPassword = "secret"
@@ -158,56 +158,60 @@ func TestHTTPSProxyH2ForwardsPlainHTTPOnlyWithValidAuth(t *testing.T) {
 	})
 	p := newHTTPSProxy(site, []Device{device})
 	var dials atomic.Int32
-	p.dial = func(_ context.Context, network, address string) (net.Conn, error) {
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
 		dials.Add(1)
-		if network != "tcp" || address != "11.0.0.80:8080" {
-			return nil, fmt.Errorf("unexpected proxy destination %s", address)
-		}
-		proxy, target := net.Pipe()
-		go func() {
-			defer target.Close()
-			_ = target.SetDeadline(time.Now().Add(4 * time.Second))
-			req, err := http.ReadRequest(bufio.NewReader(target))
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if req.RequestURI != path || req.Header.Get("Proxy-Authorization") != "" {
-				t.Error("forwarded path or headers are wrong")
-			}
-			_, _ = io.WriteString(target, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\norigin")
-		}()
-		return proxy, nil
+		return nil, errors.New("fixture intercepts all dials")
 	}
-	conn := openH2ProxyTestClient(t, p, 0)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
 	for _, test := range []struct {
 		auth, body string
 		status     int
 	}{
 		{"", "site", http.StatusTeapot},
 		{basicProxyAuth(device.Name, "wrong"), "site", http.StatusTeapot},
-		{basicProxyAuth(device.Name, device.HTTPSProxyPassword), "origin", http.StatusOK},
+		{basicProxyAuth(device.Name, device.HTTPSProxyPassword), "Bad Request\n", http.StatusBadRequest},
 	} {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://11.0.0.80:8080"+path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host, req.ProtoMajor = "11.0.0.80:8080", 2
 		if test.auth != "" {
 			req.Header.Set("Proxy-Authorization", test.auth)
 		}
-		res, err := conn.RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, err := io.ReadAll(res.Body)
-		_ = res.Body.Close()
-		if err != nil || res.ProtoMajor != 2 || res.StatusCode != test.status || string(body) != test.body {
-			t.Fatalf("wanted HTTP/2 status %d, got %s %s with body %q: %v", test.status, res.Proto, res.Status, body, err)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		if w.Code != test.status || w.Body.String() != test.body {
+			t.Fatalf("wanted HTTP/2 status %d, got %d with body %q", test.status, w.Code, w.Body.String())
 		}
 	}
-	if dials.Load() != 1 {
-		t.Fatalf("expected only the authenticated request to reach the origin, got %d dials", dials.Load())
+	if dials.Load() != 0 {
+		t.Fatalf("scheme-less requests attempted %d dials", dials.Load())
+	}
+}
+
+func TestHTTPSProxyH2ExplicitHTTPSStartsWithTLS(t *testing.T) {
+	device := Device{Name: "fixture"}
+	device.HTTPSProxyPassword = "fixture-password"
+	p := newHTTPSProxy(http.NotFoundHandler(), []Device{device})
+	peer := make(chan []byte, 1)
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
+		proxy, origin := net.Pipe()
+		go func() {
+			defer origin.Close()
+			_ = origin.SetReadDeadline(time.Now().Add(time.Second))
+			var header [5]byte
+			n, _ := io.ReadFull(origin, header[:])
+			peer <- header[:n]
+		}()
+		return proxy, nil
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://11.0.0.80/upload", strings.NewReader("fixture payload"))
+	req.ProtoMajor = 2
+	req.Header.Set("Proxy-Authorization", basicProxyAuth(device.Name, device.HTTPSProxyPassword))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+	select {
+	case first := <-peer:
+		if len(first) != 5 || first[0] != 22 || first[1] != 3 {
+			t.Fatal("the forward did not start with a TLS handshake")
+		}
+	default:
+		t.Fatal("the authorized forward did not reach the fixture")
 	}
 }

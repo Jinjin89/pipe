@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,12 +75,14 @@ func runServer(ctx context.Context, args []string) error {
 		fs.StringVar(&options.WWW, "www", "", "directory of static site files")
 		fs.StringVar(&options.WebUpstream, "web-upstream", "", "HTTP(S) site to reverse proxy")
 		fs.StringVar(&options.CFOriginCA, "cf-origin-ca", "", "PEM CA for Cloudflare Authenticated Origin Pulls")
+		fs.StringVar(&options.FastCert, "fast-cert", "", "shared Fast public certificate chain PEM (default: fast-chain.pem in the state directory)")
+		registerEgressIPFlag(fs, &options.BlockEgress)
 	case "install":
 		fs.StringVar(&deployMode, "mode", "auto", "use or confirm the mode saved by init")
 	case "uninstall":
 		fs.BoolVar(&uninstallOptions.Purge, "purge", false, "also delete the state directory and all device keys")
 		fs.BoolVar(&uninstallOptions.Yes, "yes", false, "skip the purge confirmation")
-	case "revoke", "list", "relay-command":
+	case "revoke", "list", "relay-command", "fast-csr":
 	default:
 		return fmt.Errorf("unknown server command %q", command)
 	}
@@ -180,6 +183,13 @@ func runServer(ctx context.Context, args []string) error {
 	case "run":
 		options.Log = os.Stderr
 		return server.Run(ctx, options)
+	case "fast-csr":
+		request, err := server.FastCertificateRequest(options.Dir)
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(request)
+		return err
 	case "relay-command":
 		line, hint, err := server.RelayCommand(ctx, options.Dir)
 		if err != nil {
@@ -216,11 +226,23 @@ func runServer(ctx context.Context, args []string) error {
 	return nil
 }
 
+func registerEgressIPFlag(fs *flag.FlagSet, addresses *[]netip.Addr) {
+	fs.Func("block-egress-ip", "public or NAT IP owned by this server (repeatable)", func(value string) error {
+		address, err := netip.ParseAddr(value)
+		if err != nil || address.Zone() != "" || !address.IsGlobalUnicast() {
+			return errors.New("--block-egress-ip requires a unicast IP address")
+		}
+		*addresses = append(*addresses, address.Unmap())
+		return nil
+	})
+}
+
 func runServerHopApply(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("pipe server hop-apply", flag.ContinueOnError)
-	var ports string
+	var ports, rawAddress string
 	var fast uint16
 	fs.StringVar(&ports, "fast-hop", "", "Fast UDP hopping range")
+	fs.StringVar(&rawAddress, "address", "", "local IP address for Fast hopping")
 	registerPortFlag(fs, &fast, "fast-port", "Fast UDP listening port")
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -228,7 +250,14 @@ func runServerHopApply(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 {
 		return errors.New("server hop-apply takes only flags")
 	}
-	return server.ApplyFastHop(ctx, ports, fast)
+	if rawAddress == "" {
+		return server.ApplyFastHop(ctx, ports, fast)
+	}
+	address, err := netip.ParseAddr(rawAddress)
+	if err != nil || address.Zone() != "" || !address.IsGlobalUnicast() {
+		return errors.New("--address requires a unicast IP address")
+	}
+	return server.ApplyFastHop(ctx, ports, fast, address.Unmap())
 }
 
 func serverStateDir(dir string) (string, error) {

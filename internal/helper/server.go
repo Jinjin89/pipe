@@ -90,7 +90,8 @@ type server struct {
 	opts ServeOptions
 	peer func(*net.UnixConn) (int, error)
 
-	probeSlots chan struct{}
+	probeSlots   chan struct{}
+	updateRoutes updateRouteState
 
 	ctl sync.Mutex // serializes start, apply, stop, setMode, setTier
 
@@ -179,7 +180,7 @@ func (s *server) sessionStopped() {
 	defer s.ctl.Unlock()
 	// A start may have taken the lock first: only a session that is still down
 	// gives up its lease and the system DNS.
-	if state := s.opts.Session.Status().State; state == clientctl.StateOn || state == clientctl.StateConnecting {
+	if status := s.opts.Session.Status(); status.Guarded || status.State == clientctl.StateOn || status.State == clientctl.StateConnecting {
 		return
 	}
 	s.disarmLease()
@@ -281,12 +282,16 @@ func (s *server) handle(ctx context.Context, conn *net.UnixConn) {
 		reply(conn, nil, err.Error())
 		return
 	}
-	conn.SetReadDeadline(time.Time{})
 	var req Request
 	if err := json.Unmarshal(line, &req); err != nil {
 		reply(conn, nil, "That request isn't valid.")
 		return
 	}
+	if req.Method == "updateStream" {
+		s.serveUpdateStream(ctx, conn, req.Params)
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
 	if req.Method == "hold" {
 		s.hold(ctx, conn)
 		return
@@ -352,37 +357,46 @@ func (s *server) dispatch(ctx context.Context, req Request) (any, string) {
 		s.ctl.Lock()
 		defer s.ctl.Unlock()
 		var dnsErr error
+		ready := func() error {
+			err := s.updateDNS(true)
+			if dnsErr == nil {
+				dnsErr = err
+			}
+			return err
+		}
 		if req.Method == "start" {
-			err = ses.StartWithReady(opts, func() error {
-				dnsErr = s.updateDNS(true)
-				return dnsErr
-			})
+			err = ses.StartWithReady(opts, ready)
+		} else if session, ok := ses.(interface {
+			ApplyWithReady(clientctl.Options, func() error) error
+		}); ok {
+			err = session.ApplyWithReady(opts, ready)
 		} else {
 			err = ses.Apply(opts)
+			if err == nil && ses.Status().State == clientctl.StateOn {
+				_ = ready()
+			}
 		}
-		if dnsErr == nil {
-			if ses.Status().State != clientctl.StateOn {
-				s.disarmLease()
-				_ = s.restoreDNS()
-				if err == nil {
-					return nil, "The client session is not running."
-				}
+		status := ses.Status()
+		// A failed DNS update on an unchanged session still leaves TUN active.
+		if status.Guarded || status.State == clientctl.StateOn || status.State == clientctl.StateConnecting {
+			s.armLease()
+		} else {
+			s.disarmLease()
+			if dnsErr != nil {
+				_ = ses.Stop()
 			}
-			if err != nil {
-				return nil, err.Error()
-			}
-			if req.Method == "apply" {
-				dnsErr = s.updateDNS(true)
-			}
+			_ = s.restoreDNS()
 		}
 		if dnsErr != nil {
-			s.disarmLease()
-			_ = ses.Stop()
-			_ = s.restoreDNS()
 			return nil, fmt.Sprintf("Could not set system DNS: %v", dnsErr)
 		}
-		s.armLease()
-		return ses.Status(), ""
+		if err != nil {
+			return nil, err.Error()
+		}
+		if status.State != clientctl.StateOn {
+			return nil, "The client session is not running."
+		}
+		return status, ""
 	case "stop":
 		s.ctl.Lock()
 		defer s.ctl.Unlock()
@@ -407,7 +421,9 @@ func (s *server) dispatch(ctx context.Context, req Request) (any, string) {
 		defer s.ctl.Unlock()
 		modeErr := ses.SetMode(p.Mode)
 		status := ses.Status()
-		if status.State != clientctl.StateOn {
+		if status.Guarded {
+			s.armLease()
+		} else if status.State != clientctl.StateOn {
 			s.disarmLease()
 			_ = s.restoreDNS()
 		}
@@ -448,6 +464,10 @@ func (s *server) updateDNS(tun bool) error {
 }
 
 func (s *server) restoreDNS() error { return s.updateDNS(false) }
+
+// HoldSession renews the lease for a session observed through Status, including
+// an active session whose Start reply went missing or whose GUI restarted.
+func (r *Remote) HoldSession() { r.startHold() }
 
 // hold keeps the lease alive for as long as the connection stays open.
 func (s *server) hold(ctx context.Context, conn *net.UnixConn) {
@@ -516,6 +536,8 @@ func (s *server) schedule(d time.Duration) {
 }
 
 func (s *server) expire(gen uint64) {
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
 	s.lmu.Lock()
 	if gen != s.gen || s.holds > 0 || !s.active {
 		s.lmu.Unlock()
@@ -523,14 +545,6 @@ func (s *server) expire(gen uint64) {
 	}
 	s.active = false
 	s.lmu.Unlock()
-	s.ctl.Lock()
-	defer s.ctl.Unlock()
-	// A start may have re-armed the lease while we waited for ctl.
-	s.lmu.Lock()
-	rearmed := s.active
-	s.lmu.Unlock()
-	if !rearmed {
-		s.opts.Session.Stop()
-		_ = s.restoreDNS()
-	}
+	s.opts.Session.Stop()
+	_ = s.restoreDNS()
 }

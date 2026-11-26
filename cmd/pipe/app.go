@@ -29,7 +29,7 @@ func runApp(ctx context.Context, args []string) error {
 	var background, noWindow, installEntry bool
 	var dir string
 	fs.BoolVar(&background, "background", false, "start without a window")
-	fs.BoolVar(&noWindow, "no-window", false, "print the app URL instead of opening a window")
+	fs.BoolVar(&noWindow, "no-window", false, "print the private bootstrap file path instead of opening a window")
 	fs.StringVar(&dir, "dir", "", "config directory (default: the user config dir, pipe)")
 	fs.BoolVar(&installEntry, "install-desktop-entry", false, "add Pipe to the application menu (Linux)")
 	if err := parseFlags(fs, args); err != nil {

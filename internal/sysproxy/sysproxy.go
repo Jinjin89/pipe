@@ -7,11 +7,11 @@
 package sysproxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"pipe/internal/localfile"
@@ -38,6 +38,12 @@ type Backend interface {
 	// IsApplied reports whether the OS proxy still points at host:port.
 	IsApplied(host string, port int) bool
 }
+
+type extender interface {
+	Extend(json.RawMessage) (json.RawMessage, error)
+}
+
+var errServicesChanged = errors.New("enabled network services changed while setting the system proxy")
 
 // Manager applies a proxy and guarantees a way back.
 type Manager struct {
@@ -69,38 +75,81 @@ func (m *Manager) Set(host string, port int) error {
 		return ErrUnsupported
 	}
 	var saved json.RawMessage
-	if data, err := ReadPrivate(m.armedPath); err == nil {
+	data, err := ReadPrivate(m.armedPath)
+	switch {
+	case err == nil:
 		var existing armedFile
-		if json.Unmarshal(data, &existing) == nil && len(existing.Saved) > 0 {
-			saved = existing.Saved // keep the original values; only the address changes
+		if err := json.Unmarshal(data, &existing); err != nil {
+			return fmt.Errorf("proxy.armed is damaged: %w", err)
 		}
-	}
-	if saved == nil {
-		captured, err := m.backend.Capture()
+		if len(existing.Saved) == 0 || bytes.Equal(bytes.TrimSpace(existing.Saved), []byte("null")) {
+			return errors.New("proxy.armed is damaged: saved proxy settings are missing")
+		}
+		saved = existing.Saved
+		if backend, ok := m.backend.(extender); ok {
+			saved, err = backend.Extend(saved)
+			if err != nil {
+				return err
+			}
+		}
+	case errors.Is(err, os.ErrNotExist):
+		saved, err = m.backend.Capture()
 		if err != nil {
 			return err
 		}
-		saved = captured
+	default:
+		return fmt.Errorf("read proxy.armed: %w", err)
 	}
-	data, err := json.Marshal(armedFile{Saved: saved, Host: host, Port: port})
+	file := armedFile{Saved: saved, Host: host, Port: port}
+	if err := m.saveArmed(file); err != nil {
+		return err
+	}
+	if err := m.apply(file); err != nil {
+		return errors.Join(err, m.restoreLocked(false))
+	}
+	return nil
+}
+
+func (m *Manager) saveArmed(file armedFile) error {
+	data, err := json.Marshal(file)
 	if err != nil {
 		return err
 	}
-	if err := writeFile(m.armedPath, data); err != nil {
+	if err := localfile.WritePrivateAtomic(m.armedPath, data); err != nil {
 		return fmt.Errorf("save previous proxy settings: %w", err)
 	}
-	if err := m.backend.Apply(host, port); err != nil {
-		_ = m.restoreLocked(false)
-		return err
-	}
 	return nil
+}
+
+func (m *Manager) apply(file armedFile) error {
+	backend, ok := m.backend.(interface {
+		extender
+		applySaved(json.RawMessage, string, int) error
+	})
+	if !ok {
+		return m.backend.Apply(file.Host, file.Port)
+	}
+	const maxRetries = 2
+	for retries := 0; ; retries++ {
+		err := backend.applySaved(file.Saved, file.Host, file.Port)
+		if !errors.Is(err, errServicesChanged) || retries == maxRetries {
+			return err
+		}
+		file.Saved, err = backend.Extend(file.Saved)
+		if err != nil {
+			return err
+		}
+		if err := m.saveArmed(file); err != nil {
+			return err
+		}
+	}
 }
 
 // Clear restores the saved settings. It does nothing when not armed.
 func (m *Manager) Clear() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.restoreLocked(false)
+	return m.restoreLocked(true)
 }
 
 // Repair restores settings left behind by a crash.
@@ -131,18 +180,25 @@ func (m *Manager) restoreLocked(onlyIfOurs bool) error {
 	}
 	var file armedFile
 	if err := json.Unmarshal(data, &file); err != nil {
-		_ = os.Remove(m.armedPath)
-		return fmt.Errorf("proxy.armed is damaged and was removed: %w", err)
+		return fmt.Errorf("proxy.armed is damaged: %w", err)
 	}
 	if onlyIfOurs {
-		err := m.backend.RestoreIfApplied(file.Saved, file.Host, file.Port)
-		if rmErr := os.Remove(m.armedPath); err == nil {
-			err = rmErr
+		if err := m.backend.RestoreIfApplied(file.Saved, file.Host, file.Port); err != nil {
+			return err
 		}
+	} else if err := m.backend.Restore(file.Saved); err != nil {
 		return err
 	}
-	if err := m.backend.Restore(file.Saved); err != nil {
-		return err
+	if backend, ok := m.backend.(interface{ verifyClearedSaved(json.RawMessage, string, int) error }); ok {
+		if err := backend.verifyClearedSaved(file.Saved, file.Host, file.Port); err != nil {
+			return err
+		}
+	} else if backend, ok := m.backend.(interface{ verifyCleared(string, int) error }); ok {
+		if err := backend.verifyCleared(file.Host, file.Port); err != nil {
+			return err
+		}
+	} else if m.backend.IsApplied(file.Host, file.Port) {
+		return errors.New("system proxy still points at Pipe")
 	}
 	return os.Remove(m.armedPath)
 }
@@ -152,39 +208,7 @@ func ReadPrivate(path string) ([]byte, error) { return ReadPrivateLimit(path, 64
 
 // ReadPrivateLimit is ReadPrivate with a size limit.
 func ReadPrivateLimit(path string, limit int64) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s must not be a symlink", path)
-	}
-	return localfile.Read(path, limit, true)
-}
-
-func writeFile(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".armed-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	_, err = tmp.Write(data)
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Chmod(name, 0600)
-	}
-	if err == nil {
-		err = os.Rename(name, path)
-	}
-	if err != nil {
-		os.Remove(name)
-	}
-	return err
+	return localfile.ReadProtected(path, limit)
 }
 
 // restoreIfApplied is the all-or-nothing form used by backends without parts.

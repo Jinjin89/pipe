@@ -4,6 +4,7 @@ package sysdns
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -79,8 +80,8 @@ func TestSetSavesAndSetsEnabledServicesBeforeApplying(t *testing.T) {
 	}
 	all := strings.Join(recorder.calls, "\n")
 	for _, want := range []string{
-		"/usr/sbin/networksetup -setdnsservers Wi-Fi " + TUNDNSAddress,
-		"/usr/sbin/networksetup -setdnsservers Ethernet " + TUNDNSAddress,
+		"/usr/sbin/networksetup -setdnsservers Wi-Fi 172.19.0.2",
+		"/usr/sbin/networksetup -setdnsservers Ethernet 172.19.0.2",
 		"/usr/bin/dscacheutil -flushcache",
 		"/usr/bin/killall -HUP mDNSResponder",
 	} {
@@ -111,6 +112,23 @@ func TestRestoreUsesEmptyForAutomaticDNS(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("armed file remains after restore: %v", err)
+	}
+}
+
+func TestRepairRestoresLegacyTunnelResolver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns.armed")
+	saved := []byte(`{"saved":{"services":[{"name":"Wi-Fi","automatic":true}]}}`)
+	if err := os.WriteFile(path, saved, 0600); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &dnsCommandRecorder{outputs: baseDNSCommands()}
+	recorder.outputs["/usr/sbin/networksetup -getdnsservers Wi-Fi"] = "223.5.5.5\n"
+	manager := New(Networksetup{Run: recorder.run}, path)
+	if err := manager.Repair(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(recorder.calls, "\n"), "-setdnsservers Wi-Fi Empty") {
+		t.Fatalf("legacy DNS was not restored: %v", recorder.calls)
 	}
 }
 
@@ -280,6 +298,34 @@ func TestSetFailureKeepsServicesThatCouldNotBeRolledBack(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(recorder.calls, "\n"), "/usr/sbin/networksetup -setdnsservers Ethernet Empty") {
 		t.Fatalf("rollback did not continue after a service error: %v", recorder.calls)
+	}
+}
+
+func TestFailedRepeatedSetKeepsArmedDNS(t *testing.T) {
+	recorder := &dnsCommandRecorder{outputs: baseDNSCommands()}
+	path := filepath.Join(t.TempDir(), "dns.armed")
+	manager := New(Networksetup{Run: recorder.run}, path)
+	if err := manager.Set(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.calls = nil
+	recorder.fail = map[string]error{
+		"/usr/sbin/networksetup -setdnsservers Ethernet " + TUNDNSAddress: os.ErrPermission,
+	}
+	if err := manager.Set(); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("reapply returned %v", err)
+	}
+	for _, call := range recorder.calls {
+		if strings.Contains(call, "-setdnsservers") && !strings.HasSuffix(call, " "+TUNDNSAddress) {
+			t.Fatalf("reapply restored physical DNS while armed: %s", call)
+		}
+	}
+	if after, err := os.ReadFile(path); err != nil || string(after) != string(before) {
+		t.Fatalf("reapply lost the original DNS snapshot: %v", err)
 	}
 }
 

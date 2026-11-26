@@ -5,12 +5,15 @@ package helper
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -18,6 +21,7 @@ import (
 	"time"
 
 	"pipe/internal/clientctl"
+	"pipe/internal/localfile"
 	"pipe/internal/logring"
 )
 
@@ -26,7 +30,7 @@ type RemoteOptions struct {
 	Socket  string        // default: PathsFor(runtime.GOOS).Socket
 	Logs    *logring.Ring // helper log lines are copied here by SyncLogs
 	Version string        // the app's version; any other helper version is outdated
-	Exe     string        // the app executable, run elevated for install and remove
+	Exe     string        // path to the running app executable for installation
 }
 
 const (
@@ -52,10 +56,14 @@ type Remote struct {
 	opts   RemoteOptions
 	goos   string
 	socket string
+	// macOS has no /proc/self/exe. Hold the image open from app startup.
+	darwinDigest func() (string, error)
 
 	// Test hooks.
 	run         func(name string, args ...string) ([]byte, error)
 	lookPath    func(string) (string, error)
+	trustedPath func(string) (string, error)
+	openImage   func(string) (*os.File, error)
 	dialContext func(context.Context, string, string) (net.Conn, error)
 
 	mu        sync.Mutex
@@ -77,7 +85,11 @@ func (r *Remote) OnChange(f func()) {
 }
 
 func NewRemote(opts RemoteOptions) *Remote {
-	r := &Remote{opts: opts, goos: runtime.GOOS, lookPath: exec.LookPath}
+	r := &Remote{opts: opts, goos: runtime.GOOS, lookPath: exec.LookPath,
+		trustedPath: localfile.TrustedExecutable, openImage: openHelperImage}
+	if r.goos == "darwin" && opts.Exe != "" {
+		r.darwinDigest = pinHelperDigest(opts.Exe, r.openImage)
+	}
 	r.run = func(name string, args ...string) ([]byte, error) {
 		return exec.Command(name, args...).CombinedOutput()
 	}
@@ -91,9 +103,9 @@ func NewRemote(opts RemoteOptions) *Remote {
 }
 
 // call sends one request and decodes the result into out (when not nil).
-// The error text is friendly. notAnswering reports that the socket could not be dialed.
+// The error text is friendly. absent reports confirmed socket absence.
 // A done ctx closes the connection at once.
-func (r *Remote) call(ctx context.Context, timeout time.Duration, method string, params any, out any) (notAnswering bool, err error) {
+func (r *Remote) call(ctx context.Context, timeout time.Duration, method string, params any, out any) (absent bool, err error) {
 	if r.socket == "" {
 		return true, errors.New(msgUnsupported)
 	}
@@ -104,7 +116,7 @@ func (r *Remote) call(ctx context.Context, timeout time.Duration, method string,
 	}
 	conn, err := dial(ctx, "unix", r.socket)
 	if err != nil {
-		return true, errors.New(msgNotAnswering)
+		return errors.Is(err, os.ErrNotExist), errors.New(msgNotAnswering)
 	}
 	defer conn.Close()
 	defer context.AfterFunc(ctx, func() { conn.Close() })()
@@ -184,10 +196,11 @@ func (r *Remote) Apply(opts clientctl.Options) error {
 
 func (r *Remote) Stop() error {
 	r.SyncLogs()
-	notAnswering, err := r.call(context.Background(), stopLimit, "stop", nil, nil)
+	absent, err := r.call(context.Background(), stopLimit, "stop", nil, nil)
 	r.stopHold()
-	if notAnswering {
-		return nil // no helper, so no session to stop
+	r.dropInfo() // shutdown callers need a fresh probe if Status cannot confirm it
+	if absent {
+		return nil // confirmed absent, so there is no session to stop
 	}
 	return err
 }
@@ -238,6 +251,7 @@ func (r *Remote) Info() Info {
 func (r *Remote) dropInfo() {
 	r.mu.Lock()
 	r.info = Info{}
+	r.infoAt = time.Time{}
 	r.mu.Unlock()
 }
 
@@ -249,9 +263,9 @@ func (r *Remote) probe() Info {
 		Version  string `json:"version"`
 		Protocol int    `json:"protocol"`
 	}
-	notAnswering, err := r.call(context.Background(), helloTimeout, "hello", nil, &hello)
+	absent, err := r.call(context.Background(), helloTimeout, "hello", nil, &hello)
 	switch {
-	case notAnswering:
+	case absent:
 		return Info{State: StateMissing, Note: msgMissing}
 	case err != nil:
 		return Info{State: StateError, Note: err.Error()}
@@ -420,22 +434,107 @@ func elevateCommand(goos, exe string, uid int, remove bool) (string, []string) {
 	}
 }
 
-func (r *Remote) elevate(remove bool) error {
-	if r.socket == "" {
-		return errors.New(msgUnsupported)
+func openHelperImage(path string) (*os.File, error) {
+	if runtime.GOOS == "linux" {
+		path = "/proc/self/exe"
 	}
+	return os.Open(path)
+}
+
+func pinHelperDigest(path string, open func(string) (*os.File, error)) func() (string, error) {
+	file, err := open(path)
+	return sync.OnceValues(func() (string, error) {
+		if err != nil {
+			return "", fmt.Errorf("open the running Pipe executable: %w", err)
+		}
+		defer file.Close()
+		return digestHelperImage(file)
+	})
+}
+
+func digestHelperImage(file *os.File) (string, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return "", errors.New("Pipe's running image must be a regular executable")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("read the running Pipe executable: %w", err)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func (r *Remote) installImage() (path, digest string, err error) {
 	exe := r.opts.Exe
 	if exe == "" {
-		e, err := os.Executable()
+		exe, err = os.Executable()
 		if err != nil {
-			return err
+			return "", "", err
 		}
-		exe = e
+	}
+	if trusted, err := r.trustedPath(exe); err == nil {
+		return trusted, "", nil
+	}
+	path, err = filepath.Abs(exe)
+	if err != nil {
+		return "", "", err
+	}
+	readDigest := r.darwinDigest
+	if r.goos != "darwin" || readDigest == nil {
+		readDigest = pinHelperDigest(path, r.openImage)
+	}
+	digest, err = readDigest()
+	return path, digest, err
+}
+
+func elevateStagedHelper(goos, path, digest, dir string, uid int) (string, []string) {
+	shell := []string{"-c", stageHelperScript, "pipe-helper", path, digest, dir, strconv.Itoa(uid), goos}
+	if goos == "darwin" {
+		args := []string{
+			"-e", "on run argv",
+			"-e", `set commandLine to "/bin/sh"`,
+			"-e", "repeat with arg in argv",
+			"-e", `set commandLine to commandLine & " " & quoted form of (contents of arg)`,
+			"-e", "end repeat",
+			"-e", `do shell script commandLine with prompt "Pipe wants to install Pipe Helper so TUN can start without asking again." with administrator privileges`,
+			"-e", "end run", "--",
+		}
+		return "osascript", append(args, shell...)
+	}
+	return "pkexec", append([]string{"/bin/sh"}, shell...)
+}
+
+func (r *Remote) elevate(remove bool) error {
+	paths, supported := PathsFor(r.goos)
+	if r.socket == "" || !supported {
+		return errors.New(msgUnsupported)
+	}
+	var exe, digest string
+	var err error
+	if remove {
+		exe, err = r.trustedPath(paths.Binary)
+	} else {
+		exe, digest, err = r.installImage()
+	}
+	if err != nil {
+		if remove {
+			return fmt.Errorf("verify the installed Pipe Helper: %w", err)
+		}
+		return err
 	}
 	uid := os.Getuid()
 	name, args := elevateCommand(r.goos, exe, uid, remove)
+	if digest != "" {
+		name, args = elevateStagedHelper(r.goos, exe, digest, filepath.Dir(paths.Binary), uid)
+	}
 	if name == "pkexec" {
 		if _, err := r.lookPath("pkexec"); err != nil {
+			if digest != "" {
+				return errors.New("Installing Pipe Helper from a portable package requires pkexec.")
+			}
 			quoted := "'" + strings.ReplaceAll(exe, "'", `'\''`) + "'"
 			cmd := fmt.Sprintf("sudo %s helper install --uid %d", quoted, uid)
 			if remove {

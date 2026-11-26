@@ -8,6 +8,8 @@ server_ns_created=0
 client_ns_created=0
 relay_ns_created=0
 relay_server2_ns_created=0
+target_ns_created=0
+relay_target2_ns_created=0
 relay_server2_pid=
 relay_target2_pid=
 server_pid=
@@ -17,15 +19,19 @@ web_pid=
 named_pid=
 cover_pid=
 wrong_relay_pid=
+hop_service_pid=
 client_pid=
 download_pid=
 server_ns=pipe-srv
 client_ns=pipe-cli
 relay_ns=pipe-rly
 relay_server2_ns=pipe-srv2
+target_ns=pipe-origin
+relay_target2_ns=pipe-origin2
 server_addr=10.83.0.1
 client_addr=10.83.0.2
 target_addr=11.0.0.80
+blocked_addr=11.0.0.81
 target_port=8080
 https_port=18443
 mixed_port=17890
@@ -72,6 +78,7 @@ cleanup() {
   stop_pid "$named_pid"
   stop_pid "$cover_pid"
   stop_pid "$wrong_relay_pid"
+  stop_pid "$hop_service_pid"
   stop_pid "$relay_server2_pid"
   stop_pid "$relay_target2_pid"
   stop_pid "$smart_target_pid"
@@ -80,6 +87,8 @@ cleanup() {
   if ((server_ns_created)); then ip netns del "$server_ns" || true; fi
   if ((relay_server2_ns_created)); then ip netns del "$relay_server2_ns" || true; fi
   if ((relay_ns_created)); then ip netns del "$relay_ns" || true; fi
+  if ((target_ns_created)); then ip netns del "$target_ns" || true; fi
+  if ((relay_target2_ns_created)); then ip netns del "$relay_target2_ns" || true; fi
   if [[ -n $work_dir ]]; then rm -rf -- "$work_dir"; fi
 }
 
@@ -196,11 +205,10 @@ check_cover_page() {
 # Run the real setup command with fixture-only system directories and service tools.
 # The test drives the service explicitly later, inside the server network namespace.
 setup_in_fixture() {
-  local config=$1 hosts=$2 state=$3 system=$work_dir/setup-system
+  local config=$1 hosts=$2 state=$3 link_file=$4 system=$work_dir/setup-system
   mkdir -p "$system"/{bin,units,sysctl,commands}
   chmod 0711 "$work_dir"
   chmod 0755 "$system/bin"
-  install -m 0755 "$bin" "$system/setup-pipe"
   printf 'root:x:0:0:root:/root:/bin/sh\npipe:x:%s:%s:Pipe:/var/lib/pipe:/bin/false\n' \
     "$setup_uid" "$setup_gid" > "$system/passwd"
   printf 'root:x:0:\npipe:x:%s:\n' "$setup_gid" > "$system/group"
@@ -222,7 +230,11 @@ SH
     set -euo pipefail
     system=$1
     hosts=$2
-    shift 2
+    executable=$3
+    shift 3
+    mount -t tmpfs -o mode=0755 tmpfs /run
+    mount -t tmpfs -o mode=0755 tmpfs /var/lib
+    install -m 0755 "$executable" /run/pipe-setup
     mount --bind "$system/bin" /usr/local/bin
     mount --bind "$system/units" /etc/systemd/system
     mount --bind "$system/sysctl" /etc/sysctl.d
@@ -230,8 +242,31 @@ SH
     mount --bind "$system/group" /etc/group
     mount --bind "$hosts" /etc/hosts
     export PATH="$system/commands:/usr/bin:/bin:/usr/sbin:/sbin"
-    exec "$@"
-  ' setup-fixture "$system" "$hosts" "$system/setup-pipe" server setup --config "$config" --dir "$state"
+    unset SUDO_UID
+    exec /run/pipe-setup "$@"
+  ' setup-fixture "$system" "$hosts" "$bin" server setup --config "$config" --dir "$state" --device-link-file "$link_file"
+}
+
+verify_private_enrollment() {
+  local output=$1 link_file=$2
+  grep -Fq "Device link written to $link_file" "$output"
+  [[ $(stat -c '%u:%a' "$link_file") == 0:600 ]]
+  grep -q '^pipe://' "$link_file"
+  if grep -Eq 'pipe://|^export https_proxy=' "$output"; then
+    fail "$check (the provisioning log contained enrollment material)"
+  fi
+}
+
+connect_origin() {
+  local server=$1 target=$2
+  ip -n "$server" link add veth-origin type veth peer name veth-server netns "$target"
+  ip -n "$server" addr add 10.84.0.1/30 dev veth-origin
+  ip -n "$target" addr add 10.84.0.2/30 dev veth-server
+  ip -n "$target" addr add "$target_addr/32" dev lo
+  ip -n "$server" link set veth-origin up
+  ip -n "$target" link set veth-server up
+  ip -n "$target" link set lo up
+  ip -n "$server" route add "$target_addr/32" via 10.84.0.2
 }
 
 check='isolated topology'
@@ -247,7 +282,16 @@ else
   ip -n "$server_ns" addr add "$server_addr/24" dev veth-srv
   ip -n "$client_ns" addr add "$client_addr/24" dev veth-cli
 fi
-ip -n "$server_ns" addr add "$target_addr/32" dev lo
+ip netns add "$target_ns"
+target_ns_created=1
+connect_origin "$server_ns" "$target_ns"
+ip -n "$target_ns" addr add "$blocked_addr/32" dev lo
+ip -n "$server_ns" route add "$blocked_addr/32" via 10.84.0.2
+if [[ $scenario == relay ]]; then
+  # The relay tests also send ordinary routed client traffic to the origin.
+  ip netns exec "$server_ns" sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  ip -n "$target_ns" route add "$client_addr/32" via 10.84.0.1
+fi
 ip -n "$server_ns" link set lo up
 ip -n "$client_ns" link set lo up
 ip -n "$server_ns" link set veth-srv up
@@ -284,7 +328,7 @@ with ThreadingHTTPServer((sys.argv[1], int(sys.argv[2])), Target) as server:
     server.serve_forever()
 PY
 : > "$work_dir/target.log"
-ip netns exec "$server_ns" python3 -u "$work_dir/target.py" "$target_addr" "$target_port" 'pipe e2e target' \
+ip netns exec "$target_ns" python3 -u "$work_dir/target.py" 0.0.0.0 "$target_port" 'pipe e2e target' \
   >> "$work_dir/target.log" 2>&1 &
 target_pid=$!
 wait_for_log "$target_pid" "$work_dir/target.log" 'Target ready' 8
@@ -303,8 +347,9 @@ ip -n "$client_ns" route add "$server_addr/32" dev veth-cli src "$cf_client_addr
 
 check='standalone JSON setup uses free ports and preserves devices when enabling optional services'
 printf '127.0.0.1 localhost\n' > "$work_dir/setup-hosts"
-printf '{"sni":"%s","device":"setup-fixture"}\n' "$origin" > "$work_dir/setup.json"
-setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" > "$work_dir/setup.out"
+printf '{"sni":"%s","device":"setup-fixture","block_egress_ips":["%s"]}\n' "$origin" "$blocked_addr" > "$work_dir/setup.json"
+setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" "$work_dir/setup.link" > "$work_dir/setup.out"
+verify_private_enrollment "$work_dir/setup.out" "$work_dir/setup.link"
 grep -Fq 'TCP 80 and 443 are free, so Pipe uses the standalone layout' "$work_dir/setup.out"
 cp "$work_dir/state/devices.json" "$work_dir/setup-devices.json"
 cat > "$work_dir/setup.json" <<JSON
@@ -315,7 +360,7 @@ cat > "$work_dir/setup.json" <<JSON
   "device": "setup-fixture"
 }
 JSON
-setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" > "$work_dir/setup.out"
+setup_in_fixture "$work_dir/setup.json" "$work_dir/setup-hosts" "$work_dir/state" "$work_dir/setup.link" > "$work_dir/setup.out"
 grep -Fq 'Its existing link stays valid' "$work_dir/setup.out"
 cmp "$work_dir/setup-devices.json" "$work_dir/state/devices.json"
 "$bin" server revoke setup-fixture --dir "$work_dir/state" >/dev/null
@@ -332,18 +377,18 @@ revoked_proxy=$(sed -n 's/^export https_proxy=\([^ ]*\).*/\1/p' "$work_dir/revok
 tls_target_port=18447
 "$fixture" cert "$work_dir/ca" "$target_addr" >/dev/null
 : > "$work_dir/web.log"
-ip netns exec "$server_ns" "$fixture" serve --listen "$target_addr:$tls_target_port" \
+ip netns exec "$target_ns" "$fixture" serve --listen "$target_addr:$tls_target_port" \
   --ca "$work_dir/ca" --host "$target_addr" --body 'pipe HTTPS target' >> "$work_dir/web.log" 2>&1 &
 web_pid=$!
 wait_for_log "$web_pid" "$work_dir/web.log" 'TLS fixture ready' 8
 "$fixture" cert "$work_dir/ca" "$named" >/dev/null
 : > "$work_dir/named.log"
-ip netns exec "$server_ns" "$fixture" serve --listen "$target_addr:$named_port" \
+ip netns exec "$target_ns" "$fixture" serve --listen "$target_addr:$named_port" \
   --ca "$work_dir/ca" --host "$named" --body 'pipe named target' >> "$work_dir/named.log" 2>&1 &
 named_pid=$!
 wait_for_log "$named_pid" "$work_dir/named.log" 'TLS fixture ready' 8
 : > "$work_dir/server.log"
-ip netns exec "$server_ns" "$bin" server run --dir "$work_dir/state" --test-ca "$work_dir/ca" \
+ip netns exec "$server_ns" env SSL_CERT_FILE="$work_dir/ca/ca.pem" "$bin" server run --dir "$work_dir/state" --test-ca "$work_dir/ca" \
   --test-ports --test-listen "$server_addr" --test-hosts "other.split.test=$target_addr" \
   --test-hosts "other.split.example.net=$target_addr" --test-hosts "other.split.example.org=$target_addr" \
   --test-hosts "$named=$target_addr" \
@@ -434,7 +479,7 @@ for name in "$cdn" unknown.pipe.test; do
 done
 pass "$check"
 
-check='standalone HTTPS selects a stable cover by SNI over HTTP/1.1 and HTTP/2'
+check='standalone HTTPS selects a stable cover by SNI when offered HTTP/2'
 for domain in "$origin" "$cdn"; do
   ip netns exec "$client_ns" curl --http1.1 --noproxy '*' --fail --silent --show-error --max-time 8 \
     --cacert "$work_dir/ca/ca.pem" --resolve "$domain:$https_port:$server_addr" \
@@ -451,9 +496,9 @@ ip netns exec "$client_ns" curl --http1.1 --noproxy '*' --fail --silent --show-e
 cmp "$standalone_cover" "$work_dir/decoy-host.html"
 version=$(ip netns exec "$client_ns" curl --http2 --noproxy '*' --fail --silent --show-error --max-time 8 \
   --cacert "$work_dir/ca/ca.pem" --resolve "$origin:$https_port:$server_addr" \
-  --output "$work_dir/decoy-h2.html" --write-out '%{http_version}' "https://$origin:$https_port/")
-[[ $version == 2 ]]
-cmp "$standalone_cover" "$work_dir/decoy-h2.html"
+  --output "$work_dir/decoy-negotiated.html" --write-out '%{http_version}' "https://$origin:$https_port/")
+[[ $version == 1.1 ]]
+cmp "$standalone_cover" "$work_dir/decoy-negotiated.html"
 pass "$check"
 
 check='standalone Fast presents only its own certificate and always serves the main cover'

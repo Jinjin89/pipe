@@ -25,6 +25,12 @@ import (
 )
 
 func runClient(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "--migrate-private" {
+		if len(args) != 2 {
+			return errors.New("--migrate-private requires a file path")
+		}
+		return localfile.MigratePrivate(args[1])
+	}
 	options, err := parseClientOptions(args)
 	if err != nil {
 		return err
@@ -34,9 +40,6 @@ func runClient(ctx context.Context, args []string) error {
 		EngineLogOutput: os.Stderr,
 		OnTier:          func(tier failover.Tier) { fmt.Fprintln(os.Stderr, "Tier", tier) },
 		OnRelayStatus:   printRelayChanges(os.Stderr),
-		OnTUNIPv6Fallback: func() {
-			fmt.Fprintln(os.Stderr, "The TUN couldn't get an IPv6 address; Pipe uses IPv4.")
-		},
 		OnFailoverError: func(err error) {
 			select {
 			case failoverErrors <- err:
@@ -75,7 +78,7 @@ func printRelayChanges(stderr io.Writer) func(string, string) {
 func parseClientOptions(args []string) (clientctl.Options, error) {
 	fs := flag.NewFlagSet("pipe run", flag.ContinueOnError)
 	options := clientctl.Options{TUNOnly: true, RulesInDirect: true}
-	var mode, tier, profiles, testCA, testAddress string
+	var mode, tier, profiles, linkFile, testCA, testAddress string
 	var tun bool
 	fs.BoolVar(&tun, "tun", false, "use TUN for whole-device routing")
 	fs.StringVar(&mode, "mode", "smart", "routing mode: smart, global or direct")
@@ -85,14 +88,15 @@ func parseClientOptions(args []string) (clientctl.Options, error) {
 	fs.StringVar(&options.Relay, "relay", "", "relay `code`, IP address or DNS name")
 	fs.StringVar(&options.LogLevel, "log", "warn", "engine log detail: warn, info or debug")
 	fs.StringVar(&profiles, "profile-dir", "", "directory of private NAME.link files (or PIPE_PROFILE_DIR)")
+	fs.StringVar(&linkFile, "link-file", "", "read a link from an owner-only file (use - for stdin)")
 	fs.StringVar(&testCA, "test-ca", "", "trust the local test CA from this directory")
 	fs.StringVar(&testAddress, "test-address", "", "private test IP for both origin and CDN")
 	registerTestHostsFlag(fs, &options.TestHosts)
 	if err := parseFlags(fs, args); err != nil {
 		return options, err
 	}
-	if fs.NArg() != 1 {
-		return options, errors.New("run requires a pipe link or YAML file")
+	if (linkFile == "" && fs.NArg() != 1) || (linkFile != "" && fs.NArg() != 0) {
+		return options, errors.New("run requires one pipe link, protected link file, or YAML file")
 	}
 	switch options.LogLevel {
 	case "warn", "info", "debug":
@@ -101,7 +105,26 @@ func parseClientOptions(args []string) (clientctl.Options, error) {
 	}
 	prefs := config.Defaults()
 	source := fs.Arg(0)
-	if strings.HasPrefix(source, "pipe:") {
+	if linkFile != "" || source == "-" {
+		var data []byte
+		var err error
+		const maxLinkBytes = 4096
+		if linkFile == "-" || source == "-" {
+			data, err = io.ReadAll(io.LimitReader(os.Stdin, maxLinkBytes+1))
+		} else {
+			data, err = localfile.ReadProtected(linkFile, maxLinkBytes)
+		}
+		if err != nil {
+			return options, err
+		}
+		if len(data) > maxLinkBytes {
+			return options, errors.New("device link input is too large")
+		}
+		options.Profile, err = link.Parse(strings.TrimSpace(string(data)))
+		if err != nil {
+			return options, errors.New("invalid device link input")
+		}
+	} else if strings.HasPrefix(source, "pipe:") {
 		profile, err := link.Parse(source)
 		if err != nil {
 			return options, err

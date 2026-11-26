@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -161,11 +162,43 @@ func fastCertificateForName(name string, getCertificate func(*tls.ClientHelloInf
 				return nil, err
 			}
 		}
-		if len(leaf.DNSNames) != 1 || len(leaf.IPAddresses) != 0 || !equalDNS(leaf.DNSNames[0], name) {
-			return nil, fmt.Errorf("Fast TLS certificate must cover only %s", name)
+		if err := checkFastSAN(leaf, name); err != nil {
+			return nil, err
 		}
 		return cert, nil
 	}
+}
+
+var oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
+
+func checkFastSAN(leaf *x509.Certificate, name string) error {
+	if len(leaf.DNSNames) != 1 || len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 || len(leaf.URIs) != 0 || !equalDNS(leaf.DNSNames[0], name) {
+		return fmt.Errorf("Fast TLS certificate must cover only %s", name)
+	}
+	// Verify the raw SAN extension contains exactly one GeneralName (no otherName/directoryName/etc.).
+	for _, ext := range leaf.Extensions {
+		if !ext.Id.Equal(oidSubjectAltName) {
+			continue
+		}
+		var seq asn1.RawValue
+		rest, err := asn1.Unmarshal(ext.Value, &seq)
+		if err != nil || len(rest) != 0 || seq.Class != asn1.ClassUniversal || seq.Tag != asn1.TagSequence || !seq.IsCompound {
+			return fmt.Errorf("Fast TLS certificate has an invalid SAN extension for %s", name)
+		}
+		count := 0
+		for inner := seq.Bytes; len(inner) > 0; count++ {
+			var elem asn1.RawValue
+			inner, err = asn1.Unmarshal(inner, &elem)
+			if err != nil {
+				return fmt.Errorf("Fast TLS certificate has an invalid SAN entry for %s", name)
+			}
+		}
+		if count != 1 {
+			return fmt.Errorf("Fast TLS certificate must cover only %s", name)
+		}
+		return nil
+	}
+	return fmt.Errorf("Fast TLS certificate must cover only %s", name)
 }
 
 func loadOrCreateTestRoot(dir string, now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {

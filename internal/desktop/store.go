@@ -16,7 +16,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"pipe/internal/clientctl"
 	"pipe/internal/config"
 	"pipe/internal/link"
 	"pipe/internal/localfile"
@@ -35,6 +37,7 @@ type Settings struct {
 	IPv6            bool   `json:"ipv6"`
 	LogDetail       string `json:"logDetail"`
 	Theme           string `json:"theme"`
+	UpdateAuto      *bool  `json:"updateAuto,omitempty"`
 }
 
 // RuleObject is the API form of a routing rule (design section 2.5).
@@ -58,12 +61,37 @@ func (r ProfileRelay) enabledCode() string {
 }
 
 type appData struct {
-	Settings Settings                `json:"settings"`
-	Mode     string                  `json:"mode"`
-	Tier     string                  `json:"tier"`
-	Rules    []RuleObject            `json:"rules"`
-	Active   string                  `json:"active"`
-	Relays   map[string]ProfileRelay `json:"relays,omitempty"`
+	Settings         Settings                    `json:"settings"`
+	Mode             string                      `json:"mode"`
+	Tier             string                      `json:"tier"`
+	Rules            []RuleObject                `json:"rules"`
+	Active           string                      `json:"active"`
+	Relays           map[string]ProfileRelay     `json:"relays,omitempty"`
+	Measurements     map[string]savedMeasurement `json:"measurements,omitempty"`
+	LastProfileBatch time.Time                   `json:"lastProfileBatch,omitzero"`
+}
+
+type savedMeasurement struct {
+	profileTestResponse
+	Relay         string `json:"relay,omitempty"`
+	IPv6          bool   `json:"ipv6"` // user setting matched against the current profile
+	EffectiveIPv6 *bool  `json:"effectiveIPv6,omitempty"`
+}
+
+func (d *appData) setMeasurement(name string, measurement savedMeasurement) {
+	if d.Measurements == nil {
+		d.Measurements = make(map[string]savedMeasurement)
+	}
+	d.Measurements[name] = measurement
+}
+
+func (d appData) measurementFor(p ProfileInfo) *profileTestResponse {
+	result, ok := d.Measurements[p.Name]
+	if !ok || result.Rev != p.Rev || result.MetricVersion != clientctl.RTTMetricVersion ||
+		result.IPv6 != d.Settings.IPv6 || result.Relay != d.relayFor(p.Name, p.Server).enabledCode() {
+		return nil
+	}
+	return &result.profileTestResponse
 }
 
 func (d *appData) setRelay(name string, relay ProfileRelay) {
@@ -96,25 +124,34 @@ func defaultData() appData {
 
 // Store persists app.json with atomic writes.
 type Store struct {
-	mu   sync.Mutex
-	path string
-	data appData
+	mu      sync.Mutex
+	path    string
+	data    appData
+	loadErr error
 }
 
-// OpenStore loads path, falling back to defaults when it is missing or damaged.
+// OpenStore loads path and uses defaults for display if it cannot read it.
+// A read error on an existing file blocks saves.
 func OpenStore(path string) *Store {
 	return openStore(path, nil)
 }
+
+// Err returns the load error that prevents updating this store.
+func (s *Store) Err() error { return s.loadErr }
 
 func openStore(path string, profiles *Profiles) *Store {
 	s := &Store{path: path, data: defaultData()}
 	raw, err := sysproxy.ReadPrivateLimit(path, localfile.MaxConfigBytes)
 	if err == nil {
 		loaded := defaultData()
-		if json.Unmarshal(raw, &loaded) == nil {
+		if err := json.Unmarshal(raw, &loaded); err != nil {
+			s.loadErr = fmt.Errorf("couldn't parse app.json: %w", err)
+		} else {
 			s.data = loaded
 			s.sanitize(profiles)
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.loadErr = fmt.Errorf("couldn't load app.json: %w", err)
 	}
 	return s
 }
@@ -164,13 +201,56 @@ func validTier(t string) bool {
 func validLogDetail(v string) bool { return v == "normal" || v == "connections" }
 func validTheme(v string) bool     { return v == "system" || v == "light" || v == "dark" }
 
+// StatusFields returns the small subset of settings needed by /api/status
+// without cloning all saved rules, relays and profile measurements.
+func (s *Store) StatusFields(profiles *Profiles) (mode, tier string, listenPort int, measurement *profileTestResponse) {
+	s.mu.Lock()
+	mode, tier, listenPort = s.data.Mode, s.data.Tier, s.data.Settings.ListenPort
+	active := s.data.Active
+	m, hasM := s.data.Measurements[active]
+	var relay ProfileRelay
+	if hasM {
+		relay = s.data.Relays[active]
+	}
+	ipv6 := s.data.Settings.IPv6
+	s.mu.Unlock()
+	if !hasM || active == "" || profiles == nil {
+		return mode, tier, listenPort, nil
+	}
+	info, err := profiles.Info(active)
+	if err != nil {
+		return mode, tier, listenPort, nil
+	}
+	// Evaluate measurement match using the lightweight copy of active's data.
+	partial := appData{
+		Settings:     Settings{IPv6: ipv6},
+		Relays:       map[string]ProfileRelay{active: relay},
+		Measurements: map[string]savedMeasurement{active: m},
+	}
+	return mode, tier, listenPort, partial.measurementFor(info)
+}
+
 // Snapshot returns a copy of the current data.
 func (s *Store) Snapshot() appData {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	d := s.data
+	return s.data.clone()
+}
+
+func (d appData) clone() appData {
 	d.Rules = append([]RuleObject{}, d.Rules...)
 	d.Relays = maps.Clone(d.Relays)
+	d.Measurements = maps.Clone(d.Measurements)
+	for name, measurement := range d.Measurements {
+		measurement.Routes = maps.Clone(measurement.Routes)
+		if measurement.EffectiveIPv6 != nil {
+			measurement.EffectiveIPv6 = new(*measurement.EffectiveIPv6)
+		}
+		d.Measurements[name] = measurement
+	}
+	if d.Settings.UpdateAuto != nil {
+		d.Settings.UpdateAuto = new(*d.Settings.UpdateAuto)
+	}
 	return d
 }
 
@@ -178,15 +258,16 @@ func (s *Store) Snapshot() appData {
 func (s *Store) Update(change func(*appData)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.data
-	next.Rules = append([]RuleObject{}, next.Rules...)
-	next.Relays = maps.Clone(next.Relays)
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	next := s.data.clone()
 	change(&next)
 	raw, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := WriteFileAtomic(s.path, raw, 0600); err != nil {
+	if err := localfile.WritePrivateAtomic(s.path, raw); err != nil {
 		return fmt.Errorf("save settings: %w", err)
 	}
 	s.data = next
@@ -249,12 +330,13 @@ func RuleText(r RuleObject) (string, error) {
 
 // ProfileInfo is the public face of a saved profile. It never holds the link.
 type ProfileInfo struct {
-	Name        string       `json:"name"`
-	Server      string       `json:"server"`
-	Routes      []string     `json:"routes"`
-	Fingerprint string       `json:"fingerprint"`
-	Relay       ProfileRelay `json:"relay"`
-	Rev         string       `json:"rev,omitempty"`
+	Name        string               `json:"name"`
+	Server      string               `json:"server"`
+	Routes      []string             `json:"routes"`
+	Fingerprint string               `json:"fingerprint"`
+	Relay       ProfileRelay         `json:"relay"`
+	Rev         string               `json:"rev,omitempty"`
+	Measurement *profileTestResponse `json:"measurement,omitempty"`
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -301,13 +383,22 @@ func infoFor(name string, p link.Profile, revision string) ProfileInfo {
 	return ProfileInfo{Name: name, Server: p.Host, Routes: routes, Fingerprint: strings.Join(fp, ":"), Rev: revision}
 }
 
-// Profiles manages NAME.link files, shared with the CLI.
-type Profiles struct {
-	dir string
-	mu  sync.Mutex
+type cachedProfileInfo struct {
+	size    int64
+	modTime int64
+	info    ProfileInfo
 }
 
-func NewProfiles(dir string) *Profiles { return &Profiles{dir: dir} }
+// Profiles manages NAME.link files, shared with the CLI.
+type Profiles struct {
+	dir   string
+	mu    sync.Mutex
+	cache map[string]cachedProfileInfo
+}
+
+func NewProfiles(dir string) *Profiles {
+	return &Profiles{dir: dir, cache: map[string]cachedProfileInfo{}}
+}
 
 func (p *Profiles) path(name string) string { return filepath.Join(p.dir, name+".link") }
 
@@ -375,7 +466,7 @@ func (p *Profiles) Save(name string, profile link.Profile) (ProfileInfo, error) 
 		name = stored // replace the existing file, whatever its case
 	}
 	raw := []byte(encoded + "\n")
-	if err := WriteFileAtomic(p.path(name), raw, 0600); err != nil {
+	if err := localfile.WritePrivateAtomic(p.path(name), raw); err != nil {
 		return ProfileInfo{}, err
 	}
 	return infoFor(name, profile, savedLinkRevision(raw)), nil
@@ -406,13 +497,35 @@ func (p *Profiles) Delete(name string) error {
 	return os.Remove(p.path(name))
 }
 
-// Info returns the public info of one profile.
+// Info returns the public info of one profile, caching by file size and mtime
+// so 1-second status polls avoid reparsing and hashing unchanged link files.
 func (p *Profiles) Info(name string) (ProfileInfo, error) {
+	if !config.ValidAlias(name) {
+		return ProfileInfo{}, os.ErrNotExist
+	}
+	st, err := os.Stat(p.path(name))
+	if err != nil {
+		p.mu.Lock()
+		delete(p.cache, name)
+		p.mu.Unlock()
+		return ProfileInfo{}, err
+	}
+	modNano := st.ModTime().UnixNano()
+	p.mu.Lock()
+	if cached, ok := p.cache[name]; ok && cached.size == st.Size() && cached.modTime == modNano {
+		p.mu.Unlock()
+		return cached.info, nil
+	}
+	p.mu.Unlock()
 	profile, revision, err := p.load(name)
 	if err != nil {
 		return ProfileInfo{}, err
 	}
-	return infoFor(name, profile, revision), nil
+	info := infoFor(name, profile, revision)
+	p.mu.Lock()
+	p.cache[name] = cachedProfileInfo{size: st.Size(), modTime: modNano, info: info}
+	p.mu.Unlock()
+	return info, nil
 }
 
 // Preview parses a pasted link without saving it.

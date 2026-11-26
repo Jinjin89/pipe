@@ -127,12 +127,13 @@ internal class HomeView(private val a: Activity, private val act: Actions) {
         val message = s.optString("lastError")
         power.state = when {
             m.connecting && !m.connected -> PowerButton.State.CONNECTING
-            m.connected -> PowerButton.State.ON
+            m.connected || m.blocked -> PowerButton.State.ON
             else -> PowerButton.State.OFF
         }
-        power.isEnabled = !m.connecting || m.connected
+        power.isEnabled = !m.connecting || m.connected || m.blocked
         status.text = when {
             m.connected -> "Connected"
+            m.blocked -> "Traffic blocked"
             m.connecting -> "Connecting…"
             else -> "Not connected"
         }
@@ -153,6 +154,7 @@ internal class HomeView(private val a: Activity, private val act: Actions) {
                 relay,
             ).joinToString(" · ")
             m.connecting -> "Setting up the tunnel"
+            m.blocked -> "Tap the button to disconnect"
             noProfile -> "Add a server to get started"
             else -> "Tap the button to connect"
         }
@@ -193,7 +195,12 @@ internal class HomeView(private val a: Activity, private val act: Actions) {
         routeMs.text = ms?.let { "$it ms" } ?: "—"
         val parts = ROUTES.mapNotNull { name ->
             val item = routes?.optJSONObject(name) ?: return@mapNotNull null
-            "${routeName(name)} " + if (item.optBoolean("ok")) "${item.optLong("ms")} ms" else "no answer"
+            val result = when {
+                !item.optBoolean("ok") -> "No reply"
+                item.optLong("ms") == 0L -> "Reachable"
+                else -> "${item.optLong("ms")} ms"
+            }
+            "${routeName(name)} $result" + if (item.optString("via") == "relay") " via relay" else ""
         }
         routeList.text = if (parts.isEmpty()) "Tap Test to check every route." else parts.joinToString(" · ")
         test.isEnabled = !m.testing

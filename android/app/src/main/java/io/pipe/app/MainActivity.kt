@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Messenger
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -46,10 +47,12 @@ class MainActivity : Activity(), Actions {
     private var service: Messenger? = null
     private var bound = false
     private var started = false
+    private var resumed = false
     private var pendingPrefs = false
     private var importDialog: AlertDialog? = null
     private var chooser: AlertDialog? = null
     private var pendingLink: String? = null
+    private class PendingImport(var link: String?)
     private val imageLoader = Executors.newSingleThreadExecutor()
 
     private val poll = object : Runnable {
@@ -67,6 +70,11 @@ class MainActivity : Activity(), Actions {
         applyPreferences()
     }
     private val testTimeout = Runnable { endTest() }
+    private var updateStatus = JSONObject()
+    private val updatePoll = Runnable(::pollUpdates)
+    private val installPrepTimeout = Runnable {
+        UpdateInstallResult.cancelPreparation("Pipe updater timed out. Try again.")
+    }
 
     private val listener = Messenger(Handler(Looper.getMainLooper()) { message ->
         when (message.what) {
@@ -81,6 +89,19 @@ class MainActivity : Activity(), Actions {
                 logCursor = runCatching { JSONObject(it).getLong("next") }.getOrDefault(logCursor)
             }
             VpnControl.TEST_DONE -> endTest()
+            VpnControl.UPDATE_STATUS -> message.data.getString(VpnControl.PAYLOAD)?.let {
+                updateStatus = JSONObject(it)
+                settings.renderUpdates(updateStatus)
+                ui.removeCallbacks(updatePoll)
+                if (resumed && updateStatus.optString("state") in setOf("checking", "downloading")) {
+                    ui.postDelayed(updatePoll, 750)
+                }
+            }
+            VpnControl.UPDATE_INSTALL_ERROR -> {
+                ui.removeCallbacks(installPrepTimeout)
+                UpdateInstallResult.finish(message.data.getString(VpnControl.PAYLOAD).orEmpty())
+                pollUpdates()
+            }
         }
         true
     })
@@ -90,6 +111,7 @@ class MainActivity : Activity(), Actions {
             service = Messenger(binder)
             VpnControl.send(service, VpnControl.SUBSCRIBE, listener)
             if (pendingPrefs) applyPreferences()
+            if (resumed) resumeUpdateChecks()
             startPolling()
         }
 
@@ -99,6 +121,9 @@ class MainActivity : Activity(), Actions {
             model.connected = false
             model.testing = false
             model.status = JSONObject()
+            updateStatus = JSONObject()
+            UpdateInstallResult.cancelPreparation("Pipe updater disconnected. Try again.")
+            settings.renderUpdates(updateStatus)
             render()
         }
     }
@@ -156,15 +181,21 @@ class MainActivity : Activity(), Actions {
         root.padForSystemBars()
         tab = savedInstanceState?.getInt("tab") ?: 0
         showTab(tab)
-        if (savedInstanceState == null) receiveLink(intent)
-        else savedInstanceState.getString("link")?.let { confirmImport(it) }
+        @Suppress("DEPRECATION")
+        (lastNonConfigurationInstance as? PendingImport)?.let { retained ->
+            val raw = retained.link
+            retained.link = null
+            raw?.let(::confirmImport)
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putInt("tab", tab)
-        pendingLink?.let { outState.putString("link", it) }
     }
+
+    @Suppress("DEPRECATION")
+    override fun onRetainNonConfigurationInstance(): Any? = pendingLink?.let { PendingImport(it) }
 
     private fun showTab(index: Int) {
         if (index != SETTINGS_TAB) settings.hideSecret()
@@ -197,9 +228,25 @@ class MainActivity : Activity(), Actions {
         if (tab == LOGS_TAB) poll.run()
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        UpdateInstallResult.changed = ::renderInstallation
+        renderInstallation()
+        resumeUpdateChecks()
+    }
+
     override fun onPause() {
+        resumed = false
+        UpdateInstallResult.changed = null
+        ui.removeCallbacks(updatePoll)
         settings.hideSecret()
         super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) SecretClipboard.clearExpired(this)
     }
 
     override fun onStop() {
@@ -221,14 +268,10 @@ class MainActivity : Activity(), Actions {
         super.onStop()
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        receiveLink(intent)
-    }
-
     override fun onDestroy() {
         importDialog?.dismiss()
         importDialog = null
+        pendingLink = null
         chooser?.dismiss()
         chooser = null
         routing.dismiss()
@@ -277,7 +320,7 @@ class MainActivity : Activity(), Actions {
     // Actions
 
     override fun toggleConnect() {
-        if (model.connected) {
+        if (model.connected || model.blocked) {
             startService(VpnControl.intent(this, VpnControl.DISCONNECT))
         } else if (model.profiles.current == null) {
             showImport()
@@ -340,6 +383,60 @@ class MainActivity : Activity(), Actions {
         startActivityForResult(Intent(this, SettingsActivity::class.java), APPS)
     }
 
+    private fun resumeUpdateChecks() {
+        if (UpdatesView.automatic(this)) checkUpdates(automatic = true)
+        else pollUpdates()
+    }
+
+    private fun pollUpdates() {
+        VpnControl.send(service, VpnControl.UPDATE_POLL, listener)
+    }
+
+    private fun updateFlags(): Int =
+        if (model.connected || model.connecting || model.blocked) VpnControl.UPDATE_VIA_TUNNEL else 0
+
+    override fun checkUpdates(automatic: Boolean) {
+        if (!automatic) UpdateInstallResult.finish("")
+        val flag = if (automatic) VpnControl.UPDATE_AUTOMATIC else 0
+        if (!VpnControl.send(service, VpnControl.UPDATE_CHECK, listener, flags = updateFlags() or flag) && !automatic) {
+            toast("Pipe updater is unavailable. Try again.")
+        }
+    }
+
+    override fun downloadUpdate() {
+        UpdateInstallResult.finish("")
+        if (!VpnControl.send(service, VpnControl.UPDATE_DOWNLOAD, listener, flags = updateFlags())) {
+            toast("Pipe updater is unavailable. Try again.")
+        }
+    }
+
+    override fun installUpdate() {
+        val artifact = updateStatus.optString("artifact")
+        if (artifact.isEmpty() || UpdateInstallResult.busy) return
+        if (!packageManager.canRequestPackageInstalls()) {
+            val source = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+            if (runCatching { startActivity(source) }.isFailure) toast("Allow Pipe to install updates in Android settings.")
+            return
+        }
+        UpdateInstallResult.begin()
+        ui.removeCallbacks(installPrepTimeout)
+        ui.postDelayed(installPrepTimeout, 15_000L)
+        if (!VpnControl.send(service, VpnControl.UPDATE_INSTALL, listener, payload = artifact)) {
+            ui.removeCallbacks(installPrepTimeout)
+            UpdateInstallResult.finish("Pipe updater is unavailable. Try again.")
+        }
+    }
+
+    private fun renderInstallation() {
+        settings.renderUpdates(updateStatus)
+        if (!resumed || isFinishing || isDestroyed) return
+        UpdateInstallResult.takeApproval()?.let {
+            if (runCatching { startActivity(it) }.isFailure) {
+                UpdateInstallResult.finish("Android could not open the installer.")
+            }
+        }
+    }
+
     override fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
 
     private fun connectVPN() {
@@ -361,14 +458,6 @@ class MainActivity : Activity(), Actions {
 
     private fun applyPreferences() {
         pendingPrefs = !VpnControl.send(service, VpnControl.APPLY_PREFS)
-    }
-
-    private fun receiveLink(intent: Intent) {
-        if (intent.action == Intent.ACTION_VIEW && intent.data?.scheme == "pipe") {
-            val raw = intent.dataString
-            setIntent(Intent(this, MainActivity::class.java))
-            if (raw != null) confirmImport(raw)
-        }
     }
 
     override fun showImport() {
@@ -439,30 +528,32 @@ class MainActivity : Activity(), Actions {
     private fun confirmImport(link: String) {
         importDialog?.dismiss()
         val raw = link.trim()
-        pendingLink = raw
         val summary = try {
             describe(raw)
         } catch (_: Exception) {
-            pendingLink = null
             toast("Invalid Pipe link")
             return
         }
         val name = summary.getString("name")
-        val domain = summary.getString("domain")
-        val cdn = summary.getString("cdn").ifEmpty { "None" }
         val fingerprint = summary.getString("keyFingerprint")
         val saved = runCatching { profileStore.read() }
         val recovery = saved.isFailure
-        val endpoints = if (summary.has("fastEndpoint")) {
-            "Fast: ${summary.getString("fastEndpoint")}\nStealth: ${summary.getString("stealthEndpoint")}"
-        } else {
-            "Server: $domain"
+        val current = saved.getOrNull()?.current?.let { runCatching { describe(it.link) }.getOrNull() }
+        fun endpoint(preview: JSONObject, key: String, fallback: String): String =
+            preview.optString(key).ifEmpty { preview.optString(fallback).ifEmpty { "None" } }
+        fun line(label: String, key: String, fallback: String = key): String {
+            val incoming = endpoint(summary, key, fallback)
+            val previous = current?.let { endpoint(it, key, fallback) }
+            return if (previous != null && previous != incoming) "$label: $previous → $incoming" else "$label: $incoming"
         }
-        val message = "Name: $name\n$endpoints\nCDN: $cdn\n\nKey fingerprint\n$fingerprint"
+        val message = listOf(
+            "Name: $name", line("Fast", "fastEndpoint", "domain"), line("Stealth", "stealthEndpoint", "domain"),
+            line("Rescue CDN", "cdn"), line("HTTPS proxy", "proxyAuthority"), "", "Key fingerprint", fingerprint,
+        ).joinToString("\n")
         val dialog = AlertDialog.Builder(this)
             .setTitle("Confirm profile import")
             .setMessage(if (recovery) "$message\n\nSaved profiles are unreadable. Replace them with this profile?" else message)
-            .setNegativeButton("Cancel") { _, _ -> pendingLink = null }
+            .setNegativeButton("Cancel", null)
         if (recovery) {
             dialog.setPositiveButton("Replace") { _, _ -> saveImport(raw, replace = true, recover = true) }
         } else {
@@ -471,14 +562,20 @@ class MainActivity : Activity(), Actions {
                 dialog.setNeutralButton("Replace") { _, _ -> saveImport(raw, replace = true) }
             }
         }
-        showImportDialog(dialog)
+        showImportDialog(dialog, raw)
     }
 
-    private fun showImportDialog(builder: AlertDialog.Builder) {
+    private fun showImportDialog(builder: AlertDialog.Builder, raw: String? = null) {
         importDialog?.dismiss()
         val dialog = builder.create()
-        dialog.setOnDismissListener { if (importDialog === dialog) importDialog = null }
+        dialog.setOnDismissListener {
+            if (importDialog === dialog) {
+                importDialog = null
+                pendingLink = null
+            }
+        }
         importDialog = dialog
+        pendingLink = raw
         dialog.show()
     }
 
@@ -532,7 +629,7 @@ class MainActivity : Activity(), Actions {
     }
 
     private fun dropConnection() {
-        if (model.connected || model.connecting) {
+        if (model.connected || model.connecting || model.blocked) {
             startService(VpnControl.intent(this, VpnControl.DISCONNECT))
             toast("Disconnected. Tap the button to connect with this profile.")
         }

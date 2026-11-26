@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,6 +47,7 @@ func TestPorts() Ports {
 type Settings struct {
 	Mode               DeployMode                `json:"mode"`
 	Domain             string                    `json:"domain"`
+	BlockEgressIPs     []netip.Addr              `json:"block_egress_ips,omitempty"`
 	CDNDomain          string                    `json:"cdn_domain,omitempty"`
 	RealityPrivateKey  string                    `json:"reality_private_key"`
 	RealityPublicKey   string                    `json:"reality_public_key"`
@@ -211,6 +213,29 @@ func Add(dir, name string, testPorts bool) (string, *qr.Code, error) {
 }
 
 func AddWithProxy(dir, name string, testPorts bool) (string, *qr.Code, string, error) {
+	return addWithDelivery(dir, name, testPorts, nil)
+}
+
+// EnrollSetupDevice writes an unattended link to the open output descriptor
+// before committing the device. Setup removes the file if enrollment fails.
+func EnrollSetupDevice(dir, name string, file *os.File) error {
+	if file == nil {
+		return errors.New("enrollment requires an output descriptor")
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() != 0 {
+		return errors.New("enrollment requires a new owner-only regular file")
+	}
+	_, _, _, err = addWithDelivery(dir, name, false, func(encoded string) error {
+		if _, err := fmt.Fprintln(file, encoded); err != nil {
+			return err
+		}
+		return file.Sync()
+	})
+	return err
+}
+
+func addWithDelivery(dir, name string, testPorts bool, deliver func(string) error) (string, *qr.Code, string, error) {
 	if !link.ValidName(name) {
 		return "", nil, "", errors.New("device name must contain 1–128 bytes of printable text")
 	}
@@ -276,6 +301,11 @@ func AddWithProxy(dir, name string, testPorts bool) (string, *qr.Code, string, e
 		proxyURL = link.FormatProxyURL(authority, name, credentials.HTTPSProxyPassword)
 	}
 	devices = append(devices, Device{Name: name, CreatedAt: time.Now().UTC(), Credentials: credentials})
+	if deliver != nil {
+		if err := deliver(encoded); err != nil {
+			return "", nil, "", fmt.Errorf("write device enrollment file: %w", err)
+		}
+	}
 	if err := writeJSON(dir, devicesFile, devices); err != nil {
 		return "", nil, "", err
 	}

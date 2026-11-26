@@ -4,19 +4,14 @@ package io.pipe.app
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ClipData
-import android.content.ClipDescription
-import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PersistableBundle
 import android.provider.Settings
 import android.text.InputType
 import android.util.Base64
@@ -35,6 +30,7 @@ import org.json.JSONObject
 
 internal class SettingsView(private val a: Activity, private val act: Actions) {
     val root = ScrollView(a)
+    private val updates = UpdatesView(a, act)
     private val profileList = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
     private val relayButton = a.button("Relay").apply { visibility = View.GONE }
     private val deviceLinkCard = a.card()
@@ -123,10 +119,10 @@ internal class SettingsView(private val a: Activity, private val act: Actions) {
         logs.add(logLevel, top = 8)
         logs.add(logHint, top = 8)
         col.add(logs, top = 12)
+        col.add(updates.root, top = 12)
 
         val about = a.card()
         about.add(a.heading("About"))
-        about.add(a.text("pipe ${Mobile.version()}", 16f, a.c(R.color.text), true), top = 4)
         about.add(a.text("A private VPN. Logs stay in memory and are never saved to disk.", 13f, a.c(R.color.muted)), top = 2)
         col.add(about, top = 12)
     }
@@ -161,23 +157,29 @@ internal class SettingsView(private val a: Activity, private val act: Actions) {
         secretShown.add(a.text("Link", 13f, a.c(R.color.muted), true), top = 12)
         secretShown.add(linkText, top = 4)
         secretShown.add(a.button("Copy link").apply {
+            visibility = if (SecretClipboard.supported) View.VISIBLE else View.GONE
             setOnClickListener { copySensitive("Pipe link", revealedLink, "Device link copied") }
         }, MATCH, WRAP, top = 6)
+        if (!SecretClipboard.supported) {
+            secretShown.add(a.text("Use the QR code to share on this Android version.", 13f, a.c(R.color.muted)), top = 8)
+        }
 
         proxyBox.add(a.text("HTTPS proxy", 13f, a.c(R.color.muted), true), top = 12)
         proxyBox.add(proxyText, top = 4)
         proxyBox.add(a.button("Copy proxy URL").apply {
+            visibility = if (SecretClipboard.supported) View.VISIBLE else View.GONE
             setOnClickListener { copySensitive("Pipe HTTPS proxy", revealedProxy, "HTTPS proxy URL copied") }
         }, MATCH, WRAP, top = 6)
         proxyBox.add(a.text("Terminal command", 13f, a.c(R.color.muted), true), top = 12)
         proxyBox.add(exportText, top = 4)
         proxyBox.add(a.button("Copy export command").apply {
+            visibility = if (SecretClipboard.supported) View.VISIBLE else View.GONE
             setOnClickListener { copySensitive("Pipe proxy command", revealedCmd, "Terminal command copied") }
         }, MATCH, WRAP, top = 6)
         secretShown.add(proxyBox)
 
         secretShown.add(noProxyNote, top = 10)
-        secretShown.add(a.text("Hides automatically after 30 s.", 13f, a.c(R.color.muted)), top = 10)
+        secretShown.add(a.text("Hides automatically after 30 s. Copied text is cleared after 30 s when Pipe is active.", 13f, a.c(R.color.muted)), top = 10)
         secretShown.add(a.button("Hide").apply { setOnClickListener { hideSecret() } }, MATCH, WRAP, top = 8)
         deviceLinkCard.add(secretShown)
         deviceLinkCard.visibility = View.GONE
@@ -259,16 +261,11 @@ internal class SettingsView(private val a: Activity, private val act: Actions) {
     }
 
     private fun copySensitive(label: String, value: String, message: String) {
-        if (value.isEmpty()) return
-        val clip = ClipData.newPlainText(label, value)
-        if (Build.VERSION.SDK_INT >= 33) {
-            clip.description.extras = PersistableBundle().apply {
-                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
-            }
-        }
-        a.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
-        act.toast(message)
+        if (SecretClipboard.copy(a, label, value)) act.toast(message)
+        else act.toast("Could not copy to clipboard.")
     }
+
+    fun renderUpdates(status: JSONObject) = updates.render(status)
 
     fun render(m: Model) {
         val level = m.prefs.logLevel

@@ -2,6 +2,9 @@ plugins {
     id("com.android.application")
 }
 
+val pipeVersion = Regex("""const Version = "([^"]+)"""")
+    .find(rootProject.projectDir.parentFile.resolve("internal/version/version.go").readText())!!.groupValues[1]
+
 android {
     namespace = "io.pipe.app"
     compileSdk = 36
@@ -12,8 +15,8 @@ android {
         applicationId = "io.pipe.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
-        versionName = "0.7.4-alpha"
+        versionCode = 16
+        versionName = pipeVersion
     }
     buildFeatures {
         buildConfig = true
@@ -50,6 +53,14 @@ android {
     }
     // The Go shared library compresses well. Keep that saving in the APK.
     packaging.jniLibs.useLegacyPackaging = true
+}
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    doFirst {
+        check(android.signingConfigs.findByName("release") != null) {
+            "Release requires the existing PIPE_ANDROID_RELEASE_STORE and PIPE_ANDROID_RELEASE_PASSWORD_FILE."
+        }
+    }
 }
 
 dependencies {

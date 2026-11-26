@@ -10,15 +10,37 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"sync"
 
+	"pipe/internal/localfile"
 	"pipe/internal/sysproxy"
 )
 
-const TUNDNSAddress = "223.5.5.5"
+const TUNDNSAddress = "172.19.0.2"
 
 const defaultArmedPath = "/Library/Application Support/io.pipe.helper/dns.armed"
+
+var ErrTUNProtected = errors.New("system DNS remains armed while TUN traffic is blocked")
+
+// The controller and its DNS manager can be owned by separate components
+// in the same process. Serialize restore operations with guard acquisition.
+var restoreProtection struct {
+	sync.RWMutex
+	guards int
+}
+
+// HoldRestore keeps the saved resolver in place during a protected rebuild.
+// The caller releases the hold after capture resumes or the user stops TUN.
+func HoldRestore() func() {
+	restoreProtection.Lock()
+	restoreProtection.guards++
+	restoreProtection.Unlock()
+	return sync.OnceFunc(func() {
+		restoreProtection.Lock()
+		restoreProtection.guards--
+		restoreProtection.Unlock()
+	})
+}
 
 // Backend owns platform DNS settings. Saved state is opaque JSON owned by the
 // platform implementation.
@@ -64,7 +86,8 @@ func (m *Manager) Set() error {
 	}
 	var saved json.RawMessage
 	data, err := sysproxy.ReadPrivateLimit(m.armedPath, 64<<10)
-	if err == nil {
+	wasArmed := err == nil
+	if wasArmed {
 		var existing armedFile
 		if json.Unmarshal(data, &existing) != nil || len(existing.Saved) == 0 {
 			return errors.New("system DNS armed file is damaged")
@@ -84,19 +107,39 @@ func (m *Manager) Set() error {
 			return err
 		}
 	}
-	data, err = json.Marshal(armedFile{Saved: saved})
-	if err != nil {
-		return err
-	}
-	if err := writeArmedFile(m.armedPath, data); err != nil {
-		return fmt.Errorf("save previous DNS settings: %w", err)
-	}
-	if err := m.backend.Apply(saved); err != nil {
+	for attempt := 0; ; attempt++ {
+		data, err = json.Marshal(armedFile{Saved: saved})
+		if err != nil {
+			return err
+		}
+		if err := writeArmedFile(m.armedPath, data); err != nil {
+			return fmt.Errorf("save previous DNS settings: %w", err)
+		}
+		err = m.backend.Apply(saved)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errDNSServicesChanged) && attempt < 2 {
+			extended, extErr := m.backend.Extend(saved)
+			if extErr != nil {
+				err = errors.Join(err, extErr)
+			} else {
+				saved = extended
+				continue
+			}
+		}
+		if wasArmed {
+			return err // the active TUN still owns the system resolver
+		}
+		restoreProtection.RLock()
+		defer restoreProtection.RUnlock()
+		if restoreProtection.guards != 0 {
+			return err
+		}
 		remaining, restoreErr := m.backend.Restore(saved)
 		fileErr := m.saveRemaining(saved, remaining, restoreErr)
 		return errors.Join(err, restoreErr, fileErr)
 	}
-	return nil
 }
 
 // Restore restores all saved service settings. It leaves the armed file in
@@ -117,6 +160,11 @@ func (m *Manager) Repair() error {
 func (m *Manager) restoreLocked(onlyIfApplied bool) error {
 	if m.backend == nil || m.armedPath == "" {
 		return nil
+	}
+	restoreProtection.RLock()
+	defer restoreProtection.RUnlock()
+	if restoreProtection.guards != 0 {
+		return ErrTUNProtected
 	}
 	data, err := sysproxy.ReadPrivateLimit(m.armedPath, 64<<10)
 	if errors.Is(err, os.ErrNotExist) {
@@ -205,40 +253,5 @@ func writeArmedFile(path string, data []byte) error {
 	if path == "" {
 		return errors.New("system DNS armed file path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".dns-armed-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	_, err = tmp.Write(data)
-	if err == nil {
-		err = tmp.Chmod(0600)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(name, path)
-	}
-	if err == nil {
-		dir, openErr := os.Open(filepath.Dir(path))
-		if openErr != nil {
-			err = openErr
-		} else {
-			err = dir.Sync()
-			if closeErr := dir.Close(); err == nil {
-				err = closeErr
-			}
-		}
-	}
-	if err != nil {
-		_ = os.Remove(name)
-	}
-	return err
+	return localfile.WritePrivateAtomicSyncDir(path, data)
 }

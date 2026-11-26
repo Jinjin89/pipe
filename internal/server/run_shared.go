@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,7 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 	if err != nil {
 		return err
 	}
+	defer decoy.Close()
 	initial, err := renewFastCertificate(options.Dir, time.Now())
 	if err != nil {
 		return err
@@ -43,11 +45,6 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 	}
 	defer masquerade.Close()
 	listeners := serverListeners{masquerade: masquerade.Addr().(*net.TCPAddr).Port}
-	var certificate atomic.Pointer[tls.Certificate]
-	certificate.Store(initial)
-	getCertificate := fastCertificateForName(settings.fastName(), func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		return certificate.Load(), nil
-	})
 	ctx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	defer func() {
@@ -56,7 +53,21 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 	}()
 	log = &synchronizedServerLog{writer: log}
 	warn := func(message string) { fmt.Fprintln(log, "Warning:", message) }
+	certPath := options.FastCert
+	if certPath == "" {
+		certPath = filepath.Join(options.Dir, "fast-chain.pem")
+	}
+	var certificate atomic.Pointer[tls.Certificate]
+	first, publicErr := chooseFastCertificate(certPath, settings.fastName(), initial, nil, nil, time.Now())
+	if publicErr != nil {
+		warn("Fast uses its pinned certificate. Ordinary HTTP/3 clients need a trusted fast-chain.pem issued for the Fast key")
+	}
+	certificate.Store(first)
+	getCertificate := fastCertificateForName(settings.fastName(), func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return certificate.Load(), nil
+	})
 	workers.Go(func() {
+		wasPublic := publicErr == nil
 		tick := time.NewTicker(time.Hour)
 		defer tick.Stop()
 		for {
@@ -73,7 +84,12 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 					fmt.Fprintf(log, "Warning: Fast certificate renewal delayed: %v\n", err)
 					continue
 				}
-				certificate.Store(pair)
+				next, loadErr := chooseFastCertificate(certPath, settings.fastName(), pair, certificate.Load(), nil, now)
+				if loadErr != nil && wasPublic {
+					warn("Fast public certificate could not renew: " + loadErr.Error())
+				}
+				wasPublic = loadErr == nil
+				certificate.Store(next)
 			}
 		}
 	})
@@ -105,7 +121,11 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 			var cover http.Handler
 			cover, err = proxyCover(cfg.WWW, decoy.main)
 			if err == nil {
+				if static, ok := cover.(*staticCover); ok {
+					defer static.dir.Close()
+				}
 				proxy = newHTTPSProxy(cover, devices)
+				proxy.policy = options.egress
 			}
 		}
 		if proxy != nil {

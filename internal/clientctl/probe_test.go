@@ -16,6 +16,14 @@ import (
 	"pipe/internal/engine"
 )
 
+func (e *fakeEngine) MeasureRTT(ctx context.Context, tier string) (time.Duration, bool, error) {
+	_, latency, via, err := e.ProbeLatency(ctx, tier, false)
+	if err == nil && latency == 0 {
+		latency = time.Millisecond
+	}
+	return latency, via, err
+}
+
 func TestProfileProbeIPv6(t *testing.T) {
 	for _, tc := range []struct {
 		name                       string
@@ -124,12 +132,20 @@ func TestProfileProbeDeadlinesAndCancellation(t *testing.T) {
 				if tc.duration == 0 {
 					cancel()
 				}
-				routes := (<-done).Routes
+				result := <-done
+				routes := result.Routes
 				if elapsed := time.Since(start); elapsed != tc.duration {
 					t.Fatalf("probe took %v, want %v", elapsed, tc.duration)
 				}
-				if len(routes) != 2 || routes["fast"].OK || routes["stealth"].OK || !instance.closed.Load() {
+				if tc.duration == 0 {
+					if len(routes) != 0 || !result.CompletedAt.IsZero() || result.Error == "" {
+						t.Fatalf("interrupted probe reported completed results: %+v", result)
+					}
+				} else if len(routes) != 2 || routes["fast"].OK || routes["stealth"].OK || result.CompletedAt.IsZero() || result.Error != "" {
 					t.Fatalf("unexpected results after timeout or cancellation: %+v", routes)
+				}
+				if !instance.closed.Load() {
+					t.Fatal("probe engine was not closed")
 				}
 			})
 		})
@@ -138,16 +154,33 @@ func TestProfileProbeDeadlinesAndCancellation(t *testing.T) {
 
 func TestProfileProbeClosesOnStartFailure(t *testing.T) {
 	instance := &fakeEngine{startErr: errors.New("start failed")}
-	routes := testProfile(t.Context(), ProbeOptions{Profile: opts().Profile}, func() bool { return false }, func(context.Context, engine.Options) (probeEngine, error) {
+	result := testProfile(t.Context(), ProbeOptions{Profile: opts().Profile}, func() bool { return false }, func(context.Context, engine.Options) (probeEngine, error) {
 		return instance, nil
-	}, lookupExitCountry).Routes
+	}, lookupExitCountry)
 	if !instance.closed.Load() {
 		t.Fatal("engine was not closed after failed start")
 	}
-	for _, tier := range []string{"fast", "stealth", "rescue"} {
-		if route, ok := routes[tier]; !ok || route.OK || route.Via != "" {
-			t.Fatalf("%s should be marked failed, got %+v", tier, routes)
-		}
+	if len(result.Routes) != 0 || !result.CompletedAt.IsZero() || result.Error == "" {
+		t.Fatalf("engine start failure reported completed results: %+v", result)
+	}
+}
+
+func TestProfileProbeSetupFailureHasNoMeasurements(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts ProbeOptions
+	}{
+		{name: "configuration"},
+		{name: "constructor", opts: ProbeOptions{Profile: opts().Profile}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := testProfile(t.Context(), tc.opts, func() bool { return false }, func(context.Context, engine.Options) (probeEngine, error) {
+				return nil, errors.New("fixture constructor failed")
+			}, lookupExitCountry)
+			if len(result.Routes) != 0 || !result.CompletedAt.IsZero() || result.Error == "" {
+				t.Fatalf("setup failure reported completed results: %+v", result)
+			}
+		})
 	}
 }
 
@@ -216,5 +249,28 @@ func TestProfileExitCountryKeepsTimings(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestMeasureProfileMatchesLiveOptions(t *testing.T) {
+	h := newHarness()
+	h.c.settings.SkipConnectProbe = true
+	settings := opts()
+	settings.Tier = "fast"
+	if err := h.c.Start(settings); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.c.Stop() })
+	probe := ProbeOptions{Profile: settings.Profile, IPv6: settings.IPv6, SkipExitCountry: true}
+	reply, used := h.c.MeasureProfile(t.Context(), probe)
+	if !used || reply.MetricVersion != RTTMetricVersion || reply.CompletedAt.IsZero() || reply.Routes["fast"].Ms != 42 {
+		t.Fatalf("live measurement = %+v, used %t", reply, used)
+	}
+	probe.Profile.FastPort = 8443
+	if _, used := h.c.MeasureProfile(t.Context(), probe); used {
+		t.Fatal("reused engine for a changed profile")
+	}
+	if h.engineCount() != 1 {
+		t.Fatal("live measurement opened another engine")
 	}
 }

@@ -176,6 +176,7 @@ internal fun routeName(tier: String): String = tier.replaceFirstChar { it.upperc
 internal class Model {
     var status = JSONObject()
     var connected = false
+    val blocked get() = status.optBoolean("blocked")
     var connecting = false
     var profiles = Profiles()
     var names: List<String> = emptyList()
@@ -206,6 +207,9 @@ internal interface Actions {
     fun fetchLogs(after: Long)
     fun clearLogs()
     fun openApps()
+    fun checkUpdates(automatic: Boolean = false)
+    fun downloadUpdate()
+    fun installUpdate()
     fun toast(text: String)
 }
 

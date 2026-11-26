@@ -140,6 +140,7 @@ type guardedOutbound struct {
 	adapter.Outbound
 	guard           func(string, M.Socksaddr) error
 	routeCheck      func(context.Context, M.Socksaddr) error
+	serverPolicy    *EgressPolicy
 	restrictPackets bool
 	byName          bool // a proxy tier: send requestedName
 }
@@ -160,16 +161,41 @@ func newServerGuardedOutbound(base adapter.Outbound, guard func(string, M.Socksa
 }
 
 func (o *guardedOutbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage == adapter.StartStateInitialize && o.restrictPackets {
+		// Request transports can replace their context. Capture the policy
+		// from the instance's lifecycle before any inbound starts forwarding.
+		o.serverPolicy = egressPolicy(scope.Context())
+	}
 	if lifecycle, ok := o.Outbound.(adapter.Lifecycle); ok {
 		return lifecycle.Start(stage, scope)
 	}
 	return nil
 }
 
+func (o *guardedOutbound) policyFor(ctx context.Context) *EgressPolicy {
+	if o.serverPolicy != nil {
+		return o.serverPolicy
+	}
+	return egressPolicy(ctx)
+}
+
 func (o *guardedOutbound) InterfaceUpdated(ctx context.Context) {
+	if o.restrictPackets {
+		o.policyFor(ctx).Invalidate()
+	}
 	if listener, ok := o.Outbound.(adapter.InterfaceUpdateListener); ok {
 		listener.InterfaceUpdated(ctx)
 	}
+}
+
+func (o *guardedOutbound) check(network string, destination M.Socksaddr, allows func(netip.Addr) bool) error {
+	if err := o.guard(network, destination); err != nil {
+		return err
+	}
+	if o.restrictPackets && !allows(destination.Addr) {
+		return errPrivateDestination
+	}
+	return nil
 }
 
 func (o *guardedOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -179,17 +205,27 @@ func (o *guardedOutbound) DialContext(ctx context.Context, network string, desti
 			return nil, err
 		}
 	}
-	if err := o.guard(network, destination); err != nil {
+	policy := o.policyFor(ctx)
+	allows := policy.Allows
+	if o.restrictPackets && N.NetworkName(network) == N.NetworkTCP {
+		allows = policy.AllowsFresh
+	}
+	if err := o.check(network, destination, allows); err != nil {
 		return nil, err
+	}
+	if o.restrictPackets {
+		destination = M.SocksaddrFrom(destination.Addr.Unmap(), destination.Port)
 	}
 	return o.Outbound.DialContext(ctx, network, destination)
 }
 
 func (o *guardedOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if err := o.guard(N.NetworkUDP, destination); err != nil {
+	policy := o.policyFor(ctx)
+	if err := o.check(N.NetworkUDP, destination, policy.Allows); err != nil {
 		return nil, err
 	}
 	if o.restrictPackets && destination.IsIP() {
+		destination = M.SocksaddrFrom(destination.Addr.Unmap(), destination.Port)
 		routeCheck := o.routeCheck
 		if routeCheck == nil {
 			routeCheck = checkUDPDestinationRoute
@@ -202,15 +238,20 @@ func (o *guardedOutbound) ListenPacket(ctx context.Context, destination M.Socksa
 	if err != nil || !o.restrictPackets {
 		return conn, err
 	}
-	return &publicPacketConn{PacketConn: conn, guard: o.guard}, nil
+	return &publicPacketConn{PacketConn: conn, guard: o.guard, policy: policy}, nil
 }
 
-func (o *guardedOutbound) allowedAddresses(network string, destination M.Socksaddr, candidates []netip.Addr) ([]netip.Addr, error) {
+func (o *guardedOutbound) allowedAddresses(ctx context.Context, network string, destination M.Socksaddr, candidates []netip.Addr) ([]netip.Addr, error) {
+	policy := o.policyFor(ctx)
+	allows := policy.Allows
+	if o.restrictPackets && N.NetworkName(network) == N.NetworkTCP {
+		allows = policy.freshCheck()
+	}
 	if len(candidates) == 0 && destination.IsIP() {
 		candidates = []netip.Addr{destination.Addr}
 	}
 	if len(candidates) == 0 {
-		if err := o.guard(network, destination); err != nil {
+		if err := o.check(network, destination, allows); err != nil {
 			return nil, err
 		}
 		return nil, errors.New("no destination addresses")
@@ -218,13 +259,13 @@ func (o *guardedOutbound) allowedAddresses(network string, destination M.Socksad
 	allowed := make([]netip.Addr, 0, len(candidates))
 	var rejected error
 	for _, address := range candidates {
-		if err := o.guard(network, M.SocksaddrFrom(address, destination.Port)); err != nil {
+		if err := o.check(network, M.SocksaddrFrom(address, destination.Port), allows); err != nil {
 			if rejected == nil {
 				rejected = err
 			}
 			continue
 		}
-		allowed = append(allowed, address)
+		allowed = append(allowed, address.Unmap())
 	}
 	if len(allowed) == 0 {
 		if rejected != nil {
@@ -236,7 +277,7 @@ func (o *guardedOutbound) allowedAddresses(network string, destination M.Socksad
 }
 
 func (o *guardedParallelOutbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, candidates []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
-	addresses, err := o.allowedAddresses(network, destination, candidates)
+	addresses, err := o.allowedAddresses(ctx, network, destination, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -244,11 +285,97 @@ func (o *guardedParallelOutbound) DialParallelNetwork(ctx context.Context, netwo
 	if !ok {
 		return nil, errors.New("outbound does not support parallel network dialing")
 	}
-	return base.DialParallelNetwork(ctx, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+	if !o.restrictPackets || N.NetworkName(network) != N.NetworkTCP || len(addresses) <= 1 {
+		return base.DialParallelNetwork(ctx, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+	}
+	policy := o.policyFor(ctx)
+	delay := fallbackDelay
+	if delay <= 0 {
+		delay = 300 * time.Millisecond
+	}
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type attemptResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan attemptResult, len(addresses))
+	started := 0
+	launch := func(idx int, addr netip.Addr) {
+		started++
+		go func() {
+			if idx > 0 {
+				if err := o.check(network, M.SocksaddrFrom(addr, destination.Port), policy.AllowsFresh); err != nil {
+					results <- attemptResult{err: err}
+					return
+				}
+			}
+			conn, err := base.DialParallelNetwork(dialCtx, network, destination, []netip.Addr{addr}, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+			results <- attemptResult{conn: conn, err: err}
+		}()
+	}
+	launch(0, addresses[0])
+	nextIdx := 1
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	var failures []error
+	finished := 0
+	for finished < len(addresses) {
+		var tick <-chan time.Time
+		if nextIdx < len(addresses) {
+			tick = timer.C
+		}
+		select {
+		case res := <-results:
+			finished++
+			if res.err == nil {
+				cancel()
+				go func(remaining int) {
+					for i := 0; i < remaining; i++ {
+						if extra := <-results; extra.conn != nil {
+							_ = extra.conn.Close()
+						}
+					}
+				}(started - finished)
+				return res.conn, nil
+			}
+			failures = append(failures, res.err)
+			if nextIdx < len(addresses) {
+				launch(nextIdx, addresses[nextIdx])
+				nextIdx++
+				if nextIdx < len(addresses) {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(delay)
+				}
+			}
+		case <-tick:
+			launch(nextIdx, addresses[nextIdx])
+			nextIdx++
+			if nextIdx < len(addresses) {
+				timer.Reset(delay)
+			}
+		case <-ctx.Done():
+			cancel()
+			go func(remaining int) {
+				for i := 0; i < remaining; i++ {
+					if extra := <-results; extra.conn != nil {
+						_ = extra.conn.Close()
+					}
+				}
+			}(started - finished)
+			return nil, ctx.Err()
+		}
+	}
+	return nil, errors.Join(failures...)
 }
 
 func (o *guardedParallelOutbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, candidates []netip.Addr, _ *C.NetworkStrategy, _ []C.InterfaceType, _ []C.InterfaceType, _ time.Duration) (net.PacketConn, netip.Addr, error) {
-	addresses, err := o.allowedAddresses(N.NetworkUDP, destination, candidates)
+	addresses, err := o.allowedAddresses(ctx, N.NetworkUDP, destination, candidates)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
@@ -274,12 +401,17 @@ func checkUDPDestinationRoute(ctx context.Context, destination M.Socksaddr) erro
 
 type publicPacketConn struct {
 	net.PacketConn
-	guard func(string, M.Socksaddr) error
+	guard  func(string, M.Socksaddr) error
+	policy *EgressPolicy
 }
 
 func (c *publicPacketConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
-	if err := c.guard(N.NetworkUDP, M.SocksaddrFromNet(addr)); err != nil {
+	destination := M.SocksaddrFromNet(addr)
+	if err := c.guard(N.NetworkUDP, destination); err != nil {
 		return 0, err
+	}
+	if !c.policy.Allows(destination.Addr) {
+		return 0, errPrivateDestination
 	}
 	return c.PacketConn.WriteTo(payload, addr)
 }

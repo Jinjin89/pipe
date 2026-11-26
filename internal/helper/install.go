@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"pipe/internal/localfile"
 	"pipe/internal/sysdns"
 )
 
@@ -82,15 +83,85 @@ func systemdQuote(s string) string {
 // env is everything install and remove touch outside the paths, so tests can
 // run them against a temp dir with a fake command runner.
 type env struct {
-	paths  Paths
-	svcctl string // absolute path of launchctl or systemctl; root never searches $PATH
-	exe    func() (string, error)
-	run    func(name string, args ...string) error
-	chown  func(f *os.File) error // makes the file root-owned
+	paths   Paths
+	svcctl  string // absolute path of launchctl or systemctl; root never searches $PATH
+	exe     func() (string, error)
+	run     func(name string, args ...string) error
+	chown   func(f *os.File) error // makes the file root-owned
+	trusted bool
 }
 
 var helperDNSArmedPath = sysdns.ArmedPath
 var restoreHelperDNS = func() error { return sysdns.NewDefault().Restore() }
+
+// The GUI passes the running image's digest as data to an OS-owned shell.
+// Each parent is checked before creating or opening anything below it.
+const stageHelperScript = `
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+source=$1
+digest=$2
+directory=$3
+uid=$4
+platform=$5
+
+protected_dir() {
+    [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] || return 1
+    case "$platform" in
+        darwin)
+            mode=$(stat -f '%Lp' "$1") || return 1
+            perm=$(ls -ld -- "$1" | awk '{print $1}') || return 1
+            case "$perm" in *+) return 1 ;; esac
+            ;;
+        linux) mode=$(stat -c '%a' "$1") || return 1 ;;
+        *) return 1 ;;
+    esac
+    [ "$((0$mode & 022))" -eq 0 ]
+}
+
+protected_dir /
+case "$directory" in /*) ;; *) exit 1 ;; esac
+parent=''
+remaining=${directory#/}
+while [ -n "$remaining" ]; do
+    component=${remaining%%/*}
+    case "$component" in ''|.|..) exit 1 ;; esac
+    parent=$parent/$component
+    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then
+        mkdir -m 0755 "$parent"
+    fi
+    if ! protected_dir "$parent"; then
+        echo "The Pipe Helper directory needs root-only write access." >&2
+        exit 1
+    fi
+    [ "$component" != "$remaining" ] || break
+    remaining=${remaining#*/}
+done
+
+staged=$(mktemp "$directory/pipe-helper-stage.XXXXXXXX")
+trap 'rm -f -- "$staged"' 0
+trap 'exit 1' HUP INT TERM
+chmod 0700 "$staged"
+if [ "$platform" = darwin ]; then
+    chmod -N "$staged" 2>/dev/null || true
+    case "$(ls -ld -- "$staged" | awk '{print $1}')" in *+) exit 1 ;; esac
+fi
+[ -f "$source" ]
+cat < "$source" > "$staged"
+case "$platform" in
+    darwin) actual=$(env -i /usr/bin/shasum -a 256 < "$staged") ;;
+    linux) actual=$(sha256sum < "$staged") ;;
+esac
+if [ "${actual%% *}" != "$digest" ]; then
+    echo "The Pipe executable changed before it could be installed." >&2
+    exit 1
+fi
+chown 0:0 "$staged"
+chmod 0755 "$staged"
+"$staged" helper install --uid "$uid"
+`
 
 func realEnv() (env, error) {
 	p, ok := PathsFor(runtime.GOOS)
@@ -105,8 +176,9 @@ func realEnv() (env, error) {
 		}
 	}
 	return env{
-		paths:  p,
-		svcctl: ctl,
+		trusted: true,
+		paths:   p,
+		svcctl:  ctl,
 		exe: func() (string, error) {
 			exe, err := os.Executable()
 			if err != nil {
@@ -161,18 +233,30 @@ func install(e env, goos string, uid int) error {
 	if err != nil {
 		return err
 	}
-	in, err := os.Open(exe)
+	open := os.Open
+	if e.trusted {
+		open = localfile.OpenTrustedRunningImage
+	}
+	in, err := open(exe)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 	p := e.paths
+	mkdir := func(path string) error { return os.MkdirAll(path, 0755) }
+	if e.trusted {
+		mkdir = localfile.MakeTrustedDirectory
+	}
 	for _, f := range []string{p.Binary, p.Owner, p.Service} {
-		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		if err := mkdir(filepath.Dir(f)); err != nil {
 			return err
 		}
 	}
-	if err := writeRoot(e, p.Binary, 0o755, in); err != nil {
+	if e.trusted {
+		if err := localfile.InstallTrustedExecutable(in, p.Binary); err != nil {
+			return err
+		}
+	} else if err := writeRoot(e, p.Binary, 0o755, in); err != nil {
 		return err
 	}
 	if err := writeRoot(e, p.Owner, 0o644, strings.NewReader(strconv.Itoa(uid)+"\n")); err != nil {

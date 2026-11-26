@@ -5,7 +5,6 @@ package desktop
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -20,13 +19,15 @@ const (
 	profileReplyTimeout = 24 * time.Second
 )
 
+type profileIdentity struct{ name, revision string }
+
 type profileTestTarget struct {
-	name, revision string
-	opts           clientctl.ProbeOptions
-	tun            bool
+	profileIdentity
+	opts clientctl.ProbeOptions
+	tun  bool
 }
 
-func (s *Server) beginProfileTest(r *http.Request) (profileTestTarget, error) {
+func (s *Server) beginProfileTest(r *http.Request, selected bool) (profileTestTarget, error) {
 	parent := r.Context()
 	wait, cancel := context.WithTimeout(parent, profileSlotWait)
 	defer cancel()
@@ -38,9 +39,16 @@ func (s *Server) beginProfileTest(r *http.Request) (profileTestTarget, error) {
 			return profileTestTarget{}, err
 		}
 		var err error
-		name, err = s.storedName(r)
-		if err != nil {
-			return profileTestTarget{}, err
+		if selected {
+			if !running(s.active().Status()) {
+				return profileTestTarget{}, &apiError{status: http.StatusConflict, msg: "Connect first."}
+			}
+			name = s.store.Snapshot().Active
+		} else {
+			name, err = s.storedName(r)
+			if err != nil {
+				return profileTestTarget{}, err
+			}
 		}
 		if _, testing := s.profileTests[name]; testing {
 			err = &apiError{status: http.StatusConflict, msg: "That profile is already being tested."}
@@ -71,8 +79,18 @@ func (s *Server) beginProfileTest(r *http.Request) (profileTestTarget, error) {
 	opts := clientctl.ProbeOptions{
 		Profile: profile, Relay: data.relayFor(name, profile.Host).enabledCode(), IPv6: data.Settings.IPv6,
 	}
-	s.profileTests[name] = struct{}{}
-	return profileTestTarget{name: name, revision: revision, opts: opts, tun: s.getVia() == viaTUN}, nil
+	id := profileIdentity{name, revision}
+	opts.PreferLive = data.Active == name && s.liveProfile == id
+	s.profileTests[name] = false
+	return profileTestTarget{profileIdentity: id, opts: opts, tun: s.getVia() == viaTUN}, nil
+}
+
+// invalidateProfileTest discards a result for a replaced, renamed or deleted
+// profile while its probe finishes. The caller holds s.mu.
+func (s *Server) invalidateProfileTest(name string) {
+	if _, testing := s.profileTests[name]; testing {
+		s.profileTests[name] = true
+	}
 }
 
 type profileLatency struct {
@@ -82,9 +100,12 @@ type profileLatency struct {
 }
 
 type profileTestResponse struct {
-	Routes      map[string]profileLatency `json:"routes"`
-	ExitCountry string                    `json:"exitCountry,omitempty"`
-	Rev         string                    `json:"rev"`
+	Routes        map[string]profileLatency `json:"routes"`
+	ExitCountry   string                    `json:"exitCountry,omitempty"`
+	Rev           string                    `json:"rev"`
+	Profile       string                    `json:"profile"`
+	MetricVersion int                       `json:"metricVersion"`
+	CompletedAt   time.Time                 `json:"completedAt"`
 }
 
 type profileExitKey struct {
@@ -102,7 +123,11 @@ func exitCountryKey(profile link.Profile) profileExitKey {
 }
 
 func (s *Server) testProfile(r *http.Request) (any, error) {
-	target, err := s.beginProfileTest(r)
+	return s.measureProfile(r, false)
+}
+
+func (s *Server) measureProfile(r *http.Request, selected bool) (any, error) {
+	target, err := s.beginProfileTest(r, selected)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +150,15 @@ func (s *Server) testProfile(r *http.Request) (any, error) {
 
 	var result clientctl.ProfileTestResult
 	if !target.tun {
-		result = s.cfg.probeProfile(ctx, opts)
+		used := false
+		if local, ok := s.cfg.Controller.(interface {
+			MeasureProfile(context.Context, clientctl.ProbeOptions) (clientctl.ProfileTestResult, bool)
+		}); ok && opts.PreferLive {
+			result, used = local.MeasureProfile(ctx, opts)
+		}
+		if !used {
+			result = s.cfg.probeProfile(ctx, opts)
+		}
 	} else if helper, ok := s.cfg.Helper.(interface {
 		TestProfileResult(context.Context, clientctl.ProbeOptions) (clientctl.ProfileTestResult, error)
 	}); ok {
@@ -136,22 +169,34 @@ func (s *Server) testProfile(r *http.Request) (any, error) {
 	if canceled := parent.Err(); canceled != nil {
 		return nil, canceled
 	}
-	if err != nil && (!errors.Is(err, context.DeadlineExceeded) || len(result.Routes) == 0) {
+	if err != nil {
 		return nil, err
+	}
+	if result.Error != "" {
+		return nil, &apiError{status: http.StatusServiceUnavailable, msg: result.Error}
 	}
 	tiers := []string{"fast", "stealth"}
 	if opts.Profile.CDN != "" {
 		tiers = append(tiers, "rescue")
 	}
-	reply := profileTestResponse{Rev: target.revision, Routes: make(map[string]profileLatency, len(tiers))}
+	reply := profileTestResponse{
+		Rev: target.revision, Profile: target.name, Routes: make(map[string]profileLatency, len(tiers)),
+		MetricVersion: clientctl.RTTMetricVersion, CompletedAt: result.CompletedAt,
+	}
+	if reply.CompletedAt.IsZero() {
+		reply.CompletedAt = time.Now().UTC()
+	}
 	hasSuccess := false
 	for _, tier := range tiers {
 		probe, measured := result.Routes[tier]
 		if !measured {
 			continue
 		}
-		latency := profileLatency{Ms: probe.Ms, OK: probe.OK}
+		latency := profileLatency{OK: probe.OK}
 		if probe.OK {
+			if result.MetricVersion == clientctl.RTTMetricVersion {
+				latency.Ms = max(0, probe.Ms)
+			}
 			hasSuccess = true
 			if probe.Via == "relay" {
 				latency.Via = probe.Via
@@ -159,16 +204,48 @@ func (s *Server) testProfile(r *http.Request) (any, error) {
 		}
 		reply.Routes[tier] = latency
 	}
+	if len(reply.Routes) == 0 {
+		return nil, &apiError{status: http.StatusConflict, msg: "The profile test was interrupted."}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	current, rev, loadErr := s.profiles.load(target.name)
+	data := s.store.Snapshot()
+	if s.profileTests[target.name] || loadErr != nil || rev != target.revision || data.Settings.IPv6 != opts.IPv6 ||
+		data.relayFor(target.name, current.Host).enabledCode() != opts.Relay {
+		return nil, &apiError{status: http.StatusConflict, msg: "The profile changed during the test."}
+	}
 	if hasSuccess {
 		if country == "" {
 			country = clientctl.NormalizeExitCountry(result.ExitCountry)
 			if country != "" {
-				s.mu.Lock()
 				s.profileCountries[key] = country
-				s.mu.Unlock()
 			}
 		}
 		reply.ExitCountry = country
 	}
+	if err := s.store.Update(func(d *appData) {
+		d.setMeasurement(target.name, savedMeasurement{
+			profileTestResponse: reply, Relay: opts.Relay, IPv6: opts.IPv6, EffectiveIPv6: result.EffectiveIPv6,
+		})
+	}); err != nil {
+		return nil, err
+	}
 	return reply, nil
+}
+
+func (s *Server) completeProfileBatch(r *http.Request) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if err := s.store.Update(func(d *appData) { d.LastProfileBatch = now }); err != nil {
+		return nil, err
+	}
+	return map[string]any{"lastTestedAt": now}, nil
 }

@@ -21,4 +21,8 @@ func openSetupState(string, uint32, bool) (*os.Root, error) {
 	return nil, errors.New("secure server setup state access requires Linux")
 }
 
+func createSetupOutput(string, uint32) (*os.File, func(bool) error, error) {
+	return nil, nil, errors.New("secure enrollment output requires Unix")
+}
+
 func setupFileOwner(os.FileInfo) (uint32, bool) { return 0, false }

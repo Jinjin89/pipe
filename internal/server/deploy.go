@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -173,6 +174,11 @@ func detectMode(httpPort, stealthPort, fastPort uint16,
 }
 
 func (s *Settings) normalizeDeployment() error {
+	blocked, err := normalizeEgressIPs(s.BlockEgressIPs)
+	if err != nil {
+		return err
+	}
+	s.BlockEgressIPs = blocked
 	if !link.ValidHost(s.Domain) {
 		return errors.New("invalid server domain")
 	}
@@ -237,6 +243,19 @@ func (s *Settings) normalizeDeployment() error {
 		return errors.New("server ports must be nonzero")
 	}
 	return nil
+}
+
+func normalizeEgressIPs(input []netip.Addr) ([]netip.Addr, error) {
+	// Preserve an explicitly empty list so setup can remove old entries.
+	addresses := slices.Clone(input)
+	for i, addr := range addresses {
+		if addr.Zone() != "" || !addr.IsGlobalUnicast() {
+			return nil, errors.New("block_egress_ips requires unicast IP addresses")
+		}
+		addresses[i] = addr.Unmap()
+	}
+	slices.SortFunc(addresses, netip.Addr.Compare)
+	return slices.Compact(addresses), nil
 }
 
 func (s Settings) validateSharedState() error {

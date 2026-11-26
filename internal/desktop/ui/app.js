@@ -5,6 +5,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const ICONS = {
   home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
   routing: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M8 5h3a5 5 0 0 1 5 5v0M8 19h3a5 5 0 0 0 5-5v0"/>',
+  chain: '<path d="M10 13a4 4 0 0 0 6 .3l4-4a4 4 0 0 0-6-5.3l-2.3 2.3M14 11a4 4 0 0 0-6-.3l-4 4a4 4 0 0 0 6 5.3l2.3-2.3"/>',
   profiles: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
   logs: '<path d="M5 4h14v16H5z"/><path d="M8 9h8M8 13h8M8 17h5"/>',
   settings: '<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
@@ -27,7 +28,7 @@ const icon = (n) => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || '
 
 const MODES = {
   smart: ['Smart', 'China and local sites go direct, everything else goes through pipe.'],
-  global: ['Global', 'Everything goes through pipe.'],
+  global: ['Global', 'Routes apps using the system proxy through Pipe. Your bypass rules still apply.'],
   direct: ['Direct', 'Pipe is not used. Your normal connection is used.'],
 };
 const TIERS = {
@@ -36,6 +37,13 @@ const TIERS = {
   stealth: ['Stealth', 'REALITY over TCP, looks like a normal website.'],
   rescue: ['Rescue', 'Through Cloudflare, works when the others are blocked.'],
 };
+function modeSummary(mode, via) {
+  if (mode === 'global') {
+    if (via === 'tun' || (!via && S.settings?.tun)) return 'Routes device traffic through Pipe. Your bypass rules still apply.';
+    if (S.settings?.systemProxy === false) return 'Routes apps using the local proxy through Pipe. Your bypass rules still apply.';
+  }
+  return MODES[mode]?.[1] || '';
+}
 const tierName = (t) => (TIERS[t] ? TIERS[t][0] : t === 'direct' ? 'Direct' : t || '');
 
 // ---------- helpers ----------
@@ -74,9 +82,12 @@ function toast(msg) {
 async function copy(text, msg = 'Copied') {
   try { await navigator.clipboard.writeText(text); } catch {
     const ta = h('textarea', { class: 'sr' });
-    try { ta.value = text; document.body.append(ta); ta.select(); document.execCommand('copy'); } finally { ta.value = ''; ta.remove(); }
+    let ok = false;
+    try { ta.value = text; document.body.append(ta); ta.select(); ok = document.execCommand('copy'); } finally { ta.value = ''; ta.remove(); }
+    if (!ok) { toast('Could not copy to clipboard.'); return false; }
   }
   toast(msg);
+  return true;
 }
 function showBanner(msg) {
   const b = $('#banner');
@@ -85,8 +96,26 @@ function showBanner(msg) {
 }
 
 // ---------- API ----------
+const sessionKey = 'pipe.session';
+let sessionToken = '';
+
+function saveSessionToken(token) {
+  sessionToken = token;
+  try {
+    if (token) window.sessionStorage.setItem(sessionKey, token);
+    else window.sessionStorage.removeItem(sessionKey);
+  } catch { /* the browser may block session storage */ }
+}
+
+function restoreSessionToken() {
+  try { return window.sessionStorage.getItem(sessionKey) || ''; }
+  catch { return ''; }
+}
+
 async function api(method, path, body, signal) {
-  const o = { method, credentials: 'same-origin', headers: {}, signal };
+  const bearer = sessionToken;
+  const o = { method, credentials: 'omit', headers: {}, signal };
+  if (bearer) o.headers.Authorization = 'Bearer ' + bearer;
   if (method !== 'GET') o.headers['X-Pipe-CSRF'] = '1';
   if (body !== undefined) { o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(body); }
   const r = await fetch('/api' + path, o);
@@ -94,6 +123,12 @@ async function api(method, path, body, signal) {
   let j = null;
   try { j = await r.json(); } catch { /* no body */ }
   if (!r.ok) {
+    if (bearer === sessionToken && (r.status === 401 || (r.status === 403 && path === '/status'))) {
+      saveSessionToken('');
+      hideSecrets();
+      cancelProfileTests();
+      veil('Open Pipe again from your apps', 'This window is not connected to Pipe any more.');
+    }
     const e = new Error((j && j.error) || 'Something went wrong. Please try again.');
     e.status = r.status; e.index = j && j.index; e.code = j && j.code;
     throw e;
@@ -128,6 +163,10 @@ const confirmSheet = (title, text, label, run) =>
   sheet(title, h('p', { class: 'muted' }, text), [{ label: 'Cancel' }, { label, kind: 'primary', run }]);
 
 // ---------- rendering: status ----------
+function canDisconnect(st) {
+  return !!st && (st.guarded || st.state === 'on' || st.state === 'connecting' || (st.state === 'error' && st.via === 'tun'));
+}
+
 function applyStatus(st) {
   if (!st) return;
   S.status = st;
@@ -135,18 +174,22 @@ function applyStatus(st) {
   const key = on ? 'on' : busy ? 'connecting' : err ? 'error' : 'off';
   const p = $('#power');
   p.dataset.s = key;
-  p.setAttribute('aria-label', on || busy ? 'Disconnect' : 'Connect');
-  p.setAttribute('aria-pressed', String(on));
-  $('#hero-title').textContent = on ? 'Connected' : busy ? 'Connecting…' : err ? 'Could not connect' : 'Not connected';
+  const disconnect = canDisconnect(st);
+  p.setAttribute('aria-label', disconnect ? 'Disconnect' : 'Connect');
+  p.setAttribute('aria-pressed', String(on || !!st.guarded));
+  $('#hero-title').textContent = st.guarded ? 'Network traffic paused' : on ? 'Connected' : busy ? 'Connecting…' : err ? 'Could not connect' : 'Not connected';
   let sub;
-  if (on) {
+  if (st.guarded) sub = 'Disconnect to release TUN.';
+  else if (on) {
     const parts = [st.profile, tierName(st.tier)];
     if (st.relayState === 'via') parts.push(`via ${st.relay}`);
     else if (st.relayState === 'direct') parts.push('relay not reachable, direct');
-    if (st.latencyMs != null) parts.push(`${st.latencyMs} ms`);
+    const measured = st.measurement?.routes?.[st.tier];
+    if (measured?.ms > 0) parts.push(measured.ms + ' ms');
     sub = parts.filter(Boolean).join(' · ');
     if (st.connectedSince) sub += ` · Connected for ${fmtDur(Date.now() - new Date(st.connectedSince))}`;
   } else if (busy) sub = `Reaching ${st.server || st.profile || 'your server'}…`;
+  else if (disconnect) sub = 'Disconnect to release Pipe Helper.';
   else sub = st.profile ? `${st.profile} · Tap the button to connect` : 'Tap the button to connect';
   $('#hero-sub').textContent = sub;
   showBanner(err ? st.lastError || 'Something went wrong while connecting.' : (S.note || ''));
@@ -156,9 +199,10 @@ function applyStatus(st) {
   if (on) {
     const sp = st.systemProxy, addr = st.listen || '127.0.0.1:7890';
     $('#proxy-dot').className = 'dot ' + (sp === 'on' ? 'on' : sp === 'error' ? 'err' : '');
-    const tunMode = st.via === 'tun' || (S.settings && S.settings.tun);
+    const tunMode = st.via === 'tun';
+    $('#copy-proxy').hidden = tunMode;
     $('#tun-badge').hidden = st.via !== 'tun';
-    $('#proxy-text').textContent = tunMode ? `Not needed in TUN mode · ${addr}` : sp === 'on' ? `System proxy on · ${addr}`
+    $('#proxy-text').textContent = tunMode ? 'Pipe Helper is routing this device' : sp === 'on' ? `System proxy on · ${addr}`
       : sp === 'unsupported' ? `Local proxy only: set your apps to ${addr}`
       : sp === 'error' ? `System proxy problem${st.systemProxyNote ? ': ' + st.systemProxyNote : ''} · ${addr}`
       : `System proxy off · ${addr}`;
@@ -170,7 +214,8 @@ function applyStatus(st) {
   const shown = on ? st.tier : st.tierPreference || 'auto';
   pill.textContent = tierName(shown);
   pill.className = 'pill ' + shown;
-  $('#route-ms').textContent = on && st.latencyMs != null ? `${st.latencyMs} ms` : '—';
+  const measured = st.measurement?.routes?.[shown];
+  $('#route-ms').textContent = measured ? routeValue(measured) : '—';
   $('#route-note').textContent = on
     ? (st.tierPreference && st.tierPreference !== 'auto' ? `Pinned to ${tierName(st.tierPreference)}.` : 'Auto: pipe switches routes if one stops working.')
     : 'Pipe picks the best route for you.';
@@ -178,7 +223,7 @@ function applyStatus(st) {
   $('#test-routes2').disabled = !on || S.testing;
   // mode
   $$('#home-mode button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === st.mode)));
-  $('#mode-note').textContent = (MODES[st.mode] || [])[1] || '';
+  $('#mode-note').textContent = modeSummary(st.mode, st.via);
   // traffic
   const d = st.downBytesPerSecond || 0, u = st.upBytesPerSecond || 0;
   $('#t-down').textContent = fmtRate(d); $('#t-up').textContent = fmtRate(u);
@@ -193,6 +238,7 @@ function applyStatus(st) {
     renderPath();
   }
   if (S.page === 'routing') { renderRoutingTiles(); $('#rules-paused').hidden = st.mode !== 'direct'; }
+  if (S.page === 'profiles') renderTestAge($('#profiles-tested-at'), S.profiles?.lastTestedAt);
   updatePowerEnabled();
 }
 
@@ -231,7 +277,8 @@ function renderPath() {
   if (!label) {
     label = { on: 'Connected', connecting: 'Connecting…', error: 'Could not connect' }[st.state] || 'Not connected';
   }
-  if (on && !direct && st.latencyMs != null) label += ` · ${st.latencyMs} ms`;
+  const measured = st.measurement?.routes?.[tier];
+  if (on && !direct && measured?.ok) label += ` · ${routeValue(measured)}`;
   const moving = on && !direct && middle !== 'pending';
   const up = moving ? st.proxyUpBytesPerSecond || 0 : 0;
   const down = moving ? st.proxyDownBytesPerSecond || 0 : 0;
@@ -335,7 +382,7 @@ function removeHelper() {
   });
 }
 function updatePowerEnabled() {
-  const none = S.profiles && S.profiles.profiles.length === 0;
+  const none = S.profiles && S.profiles.profiles.length === 0 && !canDisconnect(S.status);
   $('#home-empty').hidden = !none;
   $('#home-main').hidden = !!none;
 }
@@ -363,10 +410,10 @@ function drawSpark() {
 async function togglePower() {
   const st = S.status;
   if (!st) return;
-  const off = st.state === 'on' || st.state === 'connecting';
+  const off = canDisconnect(st);
   const prev = st;
   S.note = '';
-  applyStatus({ ...st, state: off ? 'off' : 'connecting', lastError: '' });
+  applyStatus({ ...st, state: off ? 'off' : 'connecting', guarded: false, lastError: '' });
   try { applyStatus(await api('POST', off ? '/disconnect' : '/connect', {})); }
   catch (e) {
     applyStatus(prev);
@@ -394,9 +441,8 @@ async function testRoutes() {
   $$('#test-routes,#test-routes2').forEach((b) => { b.disabled = true; b.textContent = 'Testing…'; });
   try {
     const r = await api('POST', '/routes/test');
-    S.status = { ...S.status, routes: (r && r.routes) || {} };
-    toast('Routes tested');
-  } catch (e) { toast(e.status === 409 ? 'Connect first, then test.' : e.message); }
+    if (!publishMeasurement(r)) await loadProfiles();
+  } catch (e) { toast(e.message); }
   S.testing = false;
   $('#test-routes').textContent = 'Test'; $('#test-routes2').textContent = 'Test routes';
   applyStatus(S.status);
@@ -416,7 +462,11 @@ function renderRoutingTiles() {
         h('span', { class: 't-top' }, h('span', { class: 'ic', html: icon(k) }), h('b', {}, MODES[k][0])), h('p', {}, MODES[k][1])));
     }
   }
-  $$('.tile', mt).forEach((t) => t.setAttribute('aria-checked', String(t.dataset.mode === st.mode)));
+  $$('.tile', mt).forEach((t) => {
+    t.setAttribute('aria-checked', String(t.dataset.mode === st.mode));
+    $('p', t).textContent = modeSummary(t.dataset.mode, st.via);
+  });
+  renderTestAge($('#route-tested-at'), st.measurement?.completedAt);
   const tt = $('#tier-tiles');
   const routes = activeProfileRoutes();
   const rescueOk = st.rescueAvailable != null ? st.rescueAvailable : routes ? routes.includes('rescue') : true;
@@ -427,14 +477,18 @@ function renderRoutingTiles() {
     }
   }
   $$('.tile', tt).forEach((t) => {
-    const k = t.dataset.tier, lat = (st.routes || {})[k];
+    const k = t.dataset.tier, lat = st.measurement?.routes?.[k];
     t.setAttribute('aria-checked', String(k === (st.tierPreference || 'auto')));
     const dis = k === 'rescue' && !rescueOk;
     t.disabled = dis;
     $('p', t).textContent = dis ? 'Not available: this profile has no Rescue route.' : TIERS[k][1];
     const pl = $('.pill', t);
     pl.hidden = !lat || k === 'auto';
-    if (lat) { pl.textContent = lat.ok ? `${lat.ms} ms` : 'No answer'; pl.className = 'pill ' + (lat.ok ? 'ok' : 'bad'); }
+    if (lat) {
+      pl.textContent = routeValue(lat);
+      pl.className = 'pill ' + (lat.ok ? 'ok' : 'bad');
+      pl.title = lat.ok && !lat.ms ? 'The server returned one valid reply' : lat.via === 'relay' ? 'via relay' : '';
+    }
   });
 }
 const TYPE_LABEL = { domain: 'Domain', suffix: 'Domain suffix', keyword: 'Keyword', ip: 'IP / CIDR', app: 'App' };
@@ -517,34 +571,46 @@ function hideSecrets() {
   if (st.data) {
     st.data.link = '';
     st.data.proxy = '';
-    st.data.cmd = '';
+    st.data.export = '';
     st.data = null;
   }
   const hadFocus = st.box.contains(document.activeElement);
-  st.box.querySelectorAll('code').forEach((c) => { c.textContent = ''; });
-  const show = secretPlaceholder(st.name, st.box);
-  st.box.replaceChildren(show);
-  if (hadFocus) show.focus({ preventScroll: true });
+  st.box.replaceChildren();
+  st.box.hidden = true;
+  st.btn.textContent = 'Show device link';
+  st.btn.setAttribute('aria-expanded', 'false');
+  if (hadFocus) st.btn.focus({ preventScroll: true });
 }
 
-function secretPlaceholder(name, box) {
-  return h('button', { class: 'btn small', type: 'button', onclick: (event) => revealSecret(name, box, event.currentTarget) }, 'Show device link');
+function deviceLinkControls(name) {
+  const box = h('div', { id: 'device-link-' + name, class: 'dlink-reveal', hidden: true });
+  const toggle = h('button', {
+    class: 'btn small', type: 'button', 'aria-expanded': 'false', 'aria-controls': box.id,
+    onclick: (event) => {
+      const btn = event.currentTarget;
+      if (secretState?.btn === btn) hideSecrets();
+      else revealSecret(name, box, btn);
+    },
+  }, 'Show device link');
+  return h('div', { class: 'dlink' }, toggle, box);
 }
 
-function secretField(label, getValue, toastMsg) {
+function secretField(label, value, copyValue) {
   return h('div', { class: 'dlink-field' },
     h('span', { class: 'muted small-text' }, label),
     h('div', { class: 'code' },
-      h('code', {}, getValue()),
-      h('button', { class: 'btn small', type: 'button', onclick: () => { const v = getValue(); if (v) copy(v, toastMsg); } }, 'Copy')));
+      h('code', {}, value),
+      h('button', { class: 'btn small', type: 'button', onclick: copyValue }, 'Copy')));
 }
 
 async function revealSecret(name, box, btn) {
   hideSecrets();
-  const state = { box, name, abort: new AbortController() };
+  const state = { box, btn, abort: new AbortController() };
   secretState = state;
-  btn.disabled = true;
-  btn.textContent = 'Loading…';
+  btn.textContent = 'Hide device link';
+  btn.setAttribute('aria-expanded', 'true');
+  box.hidden = false;
+  box.replaceChildren(h('p', { class: 'muted small-text', role: 'status' }, 'Loading…'));
   let res;
   try {
     res = await api('POST', `/profiles/${encodeURIComponent(name)}/secret`, undefined, state.abort.signal);
@@ -562,8 +628,9 @@ async function revealSecret(name, box, btn) {
   const data = {
     link: (res && res.link) || '',
     proxy: (res && res.proxy) || '',
-    cmd: (res && res.export) || '',
+    export: (res && res.export) || '',
   };
+  const rev = res?.rev;
   const qrEl = res && res.qr ? parseSVG(res.qr) : null;
   res = null;
 
@@ -583,21 +650,29 @@ async function revealSecret(name, box, btn) {
     qrWrap.append(qrEl);
   }
 
-  const fields = [secretField('Link', () => data.link, 'Device link copied')];
+  const field = (label, format, message) => secretField(label, data[format], async () => {
+    if (secretState !== state || !data[format]) return;
+    try {
+      const result = await api('POST', `/profiles/${encodeURIComponent(name)}/copy`, { format, rev }, state.abort.signal);
+      if (secretState !== state) return;
+      if (result?.fallback) await copy(data[format], `${message} (system clipboard)`);
+      else toast(message);
+    } catch (e) {
+      if (secretState === state) toast(e.message);
+    }
+  });
+  const fields = [field('Link', 'link', 'Device link copied')];
   if (data.proxy) {
     fields.push(
-      secretField('HTTPS proxy', () => data.proxy, 'HTTPS proxy URL copied'),
-      secretField('Terminal command', () => data.cmd, 'Terminal command copied'),
+      field('HTTPS proxy', 'proxy', 'HTTPS proxy URL copied'),
+      field('Terminal command', 'export', 'Terminal command copied'),
     );
   } else {
     fields.push(h('p', { class: 'muted small-text dlink-note' }, 'This link has no HTTPS proxy.'));
   }
 
-  const hideBtn = h('button', { class: 'btn small', type: 'button', onclick: hideSecrets }, 'Hide');
   box.replaceChildren(
-    h('div', { class: 'dlink-head' },
-      h('span', { class: 'dlink-title' }, h('b', {}, 'Device link'), h('span', { class: 'muted small-text' }, 'Hides automatically after 30 s.')),
-      hideBtn),
+    h('p', { class: 'muted small-text' }, 'Hides automatically after 30 s.'),
     h('div', { class: 'dlink-body' },
       qrWrap,
       qrBig,
@@ -608,17 +683,19 @@ async function revealSecret(name, box, btn) {
 }
 
 let profileLoad = 0;
+let profileBatch = null;
+const PROFILE_TIERS = ['fast', 'stealth', 'rescue'];
+
 async function loadProfiles() {
   const request = ++profileLoad;
   try {
     const profiles = await api('GET', '/profiles');
     if (request !== profileLoad) return;
+    if (S.profiles && S.profiles.active !== profiles.active) hideSecrets();
     for (const previous of S.profiles?.profiles || []) {
       const current = profiles.profiles.find((p) => p.name === previous.name);
       const relayChanged = current?.relay?.host !== previous.relay?.host || current?.relay?.on !== previous.relay?.on;
-      if (!current || current.rev !== previous.rev || relayChanged) {
-        clearProfileTest(previous.name, relayChanged ? undefined : current?.rev);
-      }
+      if (!current || current.rev !== previous.rev || relayChanged) clearProfileTest(previous.name);
     }
     S.profiles = profiles;
     renderProfiles();
@@ -627,9 +704,21 @@ async function loadProfiles() {
     renderPath();
   } catch (e) { if (request === profileLoad) toast(e.message); }
 }
-const PROFILE_TIERS = ['fast', 'stealth', 'rescue'];
-const profileResults = new Map();
-let profileBatch = null;
+
+function publishMeasurement(result) {
+  if (!result || !S.profiles) return false;
+  const profile = S.profiles.profiles.find((p) => p.name === result.profile);
+  if (!profile || profile.rev !== result.rev) return false;
+  profileLoad++;
+  profile.measurement = result;
+  renderProfileTest(profile.name);
+  if (S.profiles.active === profile.name && S.status) {
+    statusRead++;
+    S.status = { ...S.status, measurement: result };
+    renderRoutingTiles();
+  }
+  return true;
+}
 
 function countryName(code) {
   if (!code) return '';
@@ -637,66 +726,126 @@ function countryName(code) {
   catch { return code; }
 }
 
+function renderTestAge(node, iso) {
+  const tested = Date.parse(iso);
+  if (!(tested > 0)) {
+    node.textContent = 'Never tested';
+    node.removeAttribute('datetime');
+    node.removeAttribute('title');
+    return;
+  }
+  const min = Math.max(0, Math.floor((Date.now() - tested) / 60000));
+  const age = min === 0 ? 'just now' : min < 60 ? min + ' min ago' : min < 1440
+    ? Math.floor(min / 60) + ' hr ago' : Math.floor(min / 1440) + ' d ago';
+  node.textContent = 'Tested ' + age;
+  node.dateTime = iso;
+  node.title = new Date(tested).toLocaleString();
+}
+
+function routeValue(probe) {
+  return !probe.ok ? 'No reply' : probe.ms > 0 ? probe.ms + ' ms' : 'Reachable';
+}
+
+function renderMetric(cell, tier, probe, configured, testing, fastest) {
+  const name = tierName(tier);
+  let meaning = 'untested';
+  let nodes = [h('span', { class: 'muted' }, '—')];
+  cell.removeAttribute('title');
+  if (!configured) {
+    meaning = 'unavailable';
+    nodes = [h('span', { class: 'muted' }, 'N/A')];
+  } else if (probe?.ok && probe.ms > 0) {
+    const relay = probe.via === 'relay';
+    const quality = probe.ms < 100 ? 'Good' : probe.ms < 250 ? 'OK' : 'Slow';
+    meaning = probe.ms + ' milliseconds, ' + quality + (relay ? ', via relay' : '') + (fastest ? ', fastest measured' : '');
+    nodes = [relay ? h('span', { class: 'ic rtt-relay', html: icon('chain') }) : null,
+      h('span', { class: 'rtt-bars ' + quality.toLowerCase() }, h('i'), h('i'), h('i')),
+      h('span', { class: fastest ? 'rtt fastest' : 'rtt' }, String(probe.ms), h('span', { class: 'rtt-unit' }, 'ms'))];
+  } else if (probe?.ok) {
+    meaning = 'reachable, one reply' + (probe.via === 'relay' ? ', via relay' : '');
+    cell.title = 'The server returned one valid reply';
+    nodes = ['Reachable'];
+  } else if (probe) {
+    meaning = 'no reply';
+    nodes = [h('span', { class: 'rtt-failed' }, '×'), 'No reply'];
+  } else if (testing) {
+    meaning = 'testing';
+    nodes = [h('span', { class: 'profile-placeholder' })];
+  }
+  cell.setAttribute('aria-label', name + ', ' + meaning);
+  cell.replaceChildren(h('span', { class: 'profile-metric-value', 'aria-hidden': 'true' }, nodes));
+}
+
 function renderProfileTest(name) {
-  const row = document.getElementById(`profile-row-${name}`);
+  const row = document.getElementById('profile-row-' + name);
+  const details = document.getElementById('profile-details-' + name);
   const profile = S.profiles?.profiles.find((p) => p.name === name);
   if (!row || !profile) return;
-  const completed = profileResults.get(name);
-  const result = completed?.rev === profile.rev ? completed : undefined;
-  const job = profileBatch?.get(name);
-  const phase = job?.rev === profile.rev ? job?.state : undefined;
-  const pending = ({ queued: 'Queued', testing: 'Testing…' })[phase];
-  const state = $('.profile-state', row);
-  state.textContent = pending || result?.error || '';
-  state.title = pending ? '' : result?.error || '';
-  const country = $('.profile-country', row);
-  country.textContent = country.title = result?.country || '';
+  const result = profile.measurement;
+  const isTesting = profileBatch?.jobs.get(name)?.state === 'testing';
+  const country = result?.exitCountry;
+  const countryText = countryName(country);
+  $('.profile-country', row).replaceChildren(country
+    ? h('span', { class: 'profile-exit-chip', role: 'img', 'aria-label': countryText, title: countryText }, country)
+    : h('span', { class: 'muted', role: 'img', 'aria-label': 'Exit country unknown' }, '—'));
+  $('.profile-exit-detail', details).textContent = countryText || '—';
+  const tested = $('.profile-exact-test', details);
+  tested.textContent = result ? new Date(result.completedAt).toLocaleString() : '—';
+  tested.dateTime = result?.completedAt || '';
+  const numbers = PROFILE_TIERS.map((tier) => result?.routes?.[tier]).filter((r) => r?.ok && r.ms > 0);
+  const min = numbers.length >= 2 ? Math.min(...numbers.map((r) => r.ms)) : 0;
+  const fastest = numbers.filter((r) => r.ms === min).length === 1 ? min : 0;
+  const notes = [];
   $$('.profile-metric', row).forEach((cell, i) => {
     const tier = PROFILE_TIERS[i], probe = result?.routes?.[tier];
-    let value = '—';
-    if (probe?.ok) value = `${probe.ms} ms`;
-    else if (probe?.ok === false) value = 'No reply';
-    else if (!profile.routes?.includes(tier)) value = 'n/a';
-    else if (!result && phase === 'testing') value = '…';
-    cell.classList.toggle('muted', !probe?.ok);
-    cell.replaceChildren(h('span', { class: 'sr' }, tierName(tier) + ' '),
-      probe?.ok && probe.via === 'relay' ? h('small', { class: 'muted profile-via' }, 'via relay ') : '', value);
+    renderMetric(cell, tier, probe, profile.routes?.includes(tier), isTesting, fastest > 0 && probe?.ms === fastest);
+    if (probe?.ok && (probe.via === 'relay' || !probe.ms)) {
+      notes.push(tierName(tier) + (probe.ms ? '' : ' · one valid reply') + (probe.via === 'relay' ? ' · via relay' : ''));
+    }
   });
+  $('.profile-route-notes', details).textContent = notes.join('  /  ');
 }
 
 function updateProfileTestButton() {
   $('#test-profiles').disabled = !!profileBatch || !S.profiles?.profiles.length;
+  renderTestAge($('#profiles-tested-at'), S.profiles?.lastTestedAt);
 }
 
-function clearProfileTest(name, keepRevision) {
-  const job = profileBatch?.get(name);
-  if (job && (!keepRevision || job.rev !== keepRevision)) {
-    job.abort?.abort();
-    profileBatch.delete(name);
-  }
-  if (profileResults.delete(name) || job) renderProfileTest(name);
+function profileProgress(text, error = false) {
+  const status = $('#profile-test-progress');
+  status.textContent = text;
+  status.dataset.error = String(error);
+}
+
+function clearProfileTest(name) {
+  const job = profileBatch?.jobs.get(name);
+  job?.abort?.abort();
+  profileBatch?.jobs.delete(name);
+  const profile = S.profiles?.profiles.find((p) => p.name === name);
+  if (profile) delete profile.measurement;
+  renderProfileTest(name);
 }
 
 function cancelProfileTests() {
   const batch = profileBatch;
   if (!batch) return;
   profileBatch = null;
-  for (const [name, job] of batch) {
+  for (const [name, job] of batch.jobs) {
     job.abort?.abort();
     renderProfileTest(name);
   }
+  profileProgress('Tests canceled.');
   updateProfileTestButton();
 }
 
 async function testAllProfiles() {
   const profiles = S.profiles?.profiles;
   if (profileBatch || !profiles?.length) return;
-  const batch = new Map(profiles.map(({ name, rev }) => [name, { rev, state: 'queued' }]));
+  const jobs = new Map(profiles.map(({ name }) => [name, { state: 'queued' }]));
+  const batch = { jobs, started: 0, completed: 0, error: '' };
   profileBatch = batch;
-  for (const name of batch.keys()) renderProfileTest(name);
+  const queue = jobs.entries();
   updateProfileTestButton();
-  const queue = batch.entries();
-  let refresh;
   const worker = async () => {
     while (profileBatch === batch) {
       const next = queue.next();
@@ -704,32 +853,41 @@ async function testAllProfiles() {
       const [name, job] = next.value;
       job.abort = new AbortController();
       job.state = 'testing';
+      profileProgress('Testing ' + ++batch.started + ' of ' + profiles.length);
       renderProfileTest(name);
-      let result;
       try {
-        const { rev, routes, exitCountry } = await api('POST', `/profiles/${encodeURIComponent(name)}/test`, undefined, job.abort.signal);
-        result = { rev, routes, country: countryName(exitCountry) };
-      } catch (e) { result = { rev: job.rev, error: e.message }; }
-      if (profileBatch !== batch || !batch.has(name)) continue;
-      let profile = S.profiles?.profiles.find((p) => p.name === name);
-      if (profile && result.rev !== profile.rev) {
-        // Keep this reply pending while the list catches up to its revision.
-        job.rev = result.rev;
-        profileResults.delete(name);
-        renderProfileTest(name);
-        refresh ||= loadProfiles().finally(() => { refresh = null; });
-        await refresh;
-        profile = S.profiles?.profiles.find((p) => p.name === name);
+        const result = await api('POST', '/profiles/' + encodeURIComponent(name) + '/test', undefined, job.abort.signal);
+        if (profileBatch !== batch || !jobs.has(name)) continue;
+        if (!publishMeasurement(result)) {
+          await loadProfiles();
+          if (profileBatch !== batch || !jobs.has(name)) continue;
+          if (!publishMeasurement(result)) throw new Error('The profile changed during the test.');
+        }
+        batch.completed++;
+      } catch (e) {
+        if (profileBatch === batch && jobs.has(name)) batch.error = name + ' · ' + e.message;
       }
-      if (profileBatch !== batch || !batch.delete(name)) continue;
-      if (profile && result.rev === profile.rev) profileResults.set(name, result);
+      jobs.delete(name);
       renderProfileTest(name);
     }
   };
-  try { await Promise.all([worker(), worker()]); }
+  try {
+    await Promise.all([worker(), worker()]);
+    if (profileBatch !== batch) return;
+    if (batch.completed === profiles.length && !batch.error) {
+      const finished = await api('POST', '/profiles/test-complete');
+      if (profileBatch === batch && S.profiles) {
+        profileLoad++;
+        S.profiles.lastTestedAt = finished.lastTestedAt;
+      }
+    } else {
+      batch.error ||= 'The test did not finish for every profile.';
+    }
+  } catch (e) { batch.error = e.message; }
   finally {
     if (profileBatch === batch) {
       profileBatch = null;
+      profileProgress(batch.error, !!batch.error);
       updateProfileTestButton();
     }
   }
@@ -780,40 +938,81 @@ function toggleProfileDetails(button) {
   button.focus({ preventScroll: true });
 }
 
+function profileView(p, revision) {
+  const nameID = 'profile-name-' + p.name, detailsID = 'profile-details-' + p.name;
+  const name = h('button', {
+    class: 'profile-name', type: 'button', id: nameID, title: p.name,
+    'aria-expanded': 'false', 'aria-controls': detailsID,
+    onclick: (event) => toggleProfileDetails(event.currentTarget),
+  }, h('span', { class: 'profile-check', 'aria-hidden': 'true' }),
+    h('span', { class: 'profile-label' }, p.name));
+  const row = h('div', { id: 'profile-row-' + p.name, class: 'profile-grid profile-row' },
+    name,
+    h('span', { class: 'profile-country' }),
+    PROFILE_TIERS.map(() => h('span', { class: 'profile-metric', role: 'img' })),
+    h('button', { class: 'btn small ghost profile-use', type: 'button', 'aria-label': 'Use ' + p.name, onclick: () => activate(p.name) }, 'Use'));
+  return h('div', { 'data-profile': p.name, 'data-revision': revision }, row,
+    h('div', { class: 'profile-details', id: detailsID, hidden: true, role: 'region', 'aria-labelledby': nameID },
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'Profile'), h('dd', {}, p.name),
+        h('dt', {}, 'Server'), h('dd', {}, p.server),
+        h('dt', {}, 'Exit'), h('dd', { class: 'profile-exit-detail' }, '—'),
+        h('dt', {}, 'Tested'), h('dd', {}, h('time', { class: 'profile-exact-test' }, '—')),
+        h('dt', {}, 'Key fingerprint'), h('dd', { class: 'fp' }, p.fingerprint || '—')),
+      h('p', { class: 'muted small-text profile-route-notes' }),
+      relayForm(p),
+      h('div', { class: 'profile-actions' }, deviceLinkControls(p.name),
+        h('button', { class: 'btn small', type: 'button', onclick: () => renameSheet(p.name) }, 'Rename'),
+        h('button', { class: 'btn small danger', type: 'button', onclick: () => confirmSheet('Delete “' + p.name + '”?', 'The link is removed from this device. You can add it again later with the same link.', 'Delete', () => delProfile(p.name)) }, 'Delete'))));
+}
+
 function renderProfiles() {
-  hideSecrets();
   const list = $('#profile-list');
   const profiles = S.profiles?.profiles || [];
   list.parentElement.hidden = !profiles.length;
-  list.replaceChildren(...profiles.map((p) => {
-    const active = p.name === S.profiles.active;
-    const nameID = `profile-name-${p.name}`, detailsID = `profile-details-${p.name}`;
-    const name = h('button', {
-      class: 'profile-name', type: 'button', id: nameID, title: p.name,
-      'aria-expanded': 'false', 'aria-controls': detailsID, 'aria-current': active ? 'true' : null,
-      onclick: (event) => toggleProfileDetails(event.currentTarget),
-    }, h('span', { class: 'profile-check', 'aria-hidden': 'true' }, active ? '✓' : ''),
-    h('span', { class: 'profile-label' }, p.name));
-    const row = h('div', { id: `profile-row-${p.name}`, class: 'profile-grid profile-row' },
-      h('div', { class: 'profile-identity' }, name, h('small', { class: 'profile-state muted', role: 'status' })),
-      h('small', { class: 'profile-country muted' }), PROFILE_TIERS.map(() => h('span', { class: 'profile-metric' })),
-      active ? null : h('button', { class: 'btn small ghost', type: 'button', 'aria-label': `Use ${p.name}`, onclick: () => activate(p.name) }, 'Use'));
-    const dlink = h('div', { class: 'dlink' });
-    dlink.append(secretPlaceholder(p.name, dlink));
-    return h('div', {}, row,
-      h('div', { class: 'profile-details', id: detailsID, hidden: true, role: 'region', 'aria-labelledby': nameID },
-        h('dl', { class: 'kv' },
-          h('dt', {}, 'Server'), h('dd', {}, p.server),
-          h('dt', {}, 'Key fingerprint'), h('dd', { class: 'fp' }, p.fingerprint || '—')),
-        relayForm(p),
-        h('div', { class: 'profile-actions' }, dlink,
-          h('button', { class: 'btn small', type: 'button', onclick: () => renameSheet(p.name) }, 'Rename'),
-          h('button', { class: 'btn small danger', type: 'button', onclick: () => confirmSheet(`Delete “${p.name}”?`, 'The link is removed from this device. You can add it again later with the same link.', 'Delete', () => delProfile(p.name)) }, 'Delete'))));
-  }));
-  for (const { name } of profiles) renderProfileTest(name);
+  $('#profiles-empty').hidden = !!profiles.length;
+  const views = new Map([...list.children].map((view) => [view.dataset.profile, view]));
+  for (const [i, p] of profiles.entries()) {
+    const old = views.get(p.name);
+    const revision = JSON.stringify([p.rev, p.relay]);
+    let view = old;
+    if (!view || view.dataset.revision !== revision) {
+      const wasOpen = old && !$('.profile-details', old)?.hidden;
+      const hadFocus = old && old.contains(document.activeElement);
+      if (secretState && old?.contains(secretState.box)) hideSecrets();
+      view = profileView(p, revision);
+      if (wasOpen) {
+        const details = $('.profile-details', view);
+        const btn = $('.profile-name', view);
+        if (details && btn) { details.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+      }
+      if (old) old.replaceWith(view);
+      if (hadFocus) $('.profile-name', view)?.focus();
+    }
+    views.delete(p.name);
+    if (list.children[i] !== view) list.insertBefore(view, list.children[i] || null);
+    const row = $('.profile-row', view);
+    const selected = p.name === S.profiles.active;
+    row.dataset.selected = String(selected);
+    const name = $('.profile-name', row);
+    if (selected) name.setAttribute('aria-current', 'true');
+    else name.removeAttribute('aria-current');
+    $('.profile-check', name).textContent = selected ? '✓' : '';
+    const useBtn = $('.profile-use', row);
+    const useFocused = selected && document.activeElement === useBtn;
+    useBtn.hidden = selected;
+    if (useFocused) name.focus();
+    renderProfileTest(p.name);
+  }
+  for (const view of views.values()) {
+    if (secretState && view.contains(secretState.box)) hideSecrets();
+    view.remove();
+  }
   updateProfileTestButton();
 }
+
 async function activate(name) {
+  hideSecrets();
   try { const st = await api('POST', `/profiles/${encodeURIComponent(name)}/activate`); await loadProfiles(); applyStatus(st); toast(`Using ${name}`); } catch (e) { toast(e.message); return false; }
 }
 async function delProfile(name) {
@@ -846,6 +1045,9 @@ async function startImport(link, field) {
     const kv = h('dl', { class: 'kv' },
       h('dt', {}, 'Name'), h('dd', {}, inp),
       h('dt', {}, 'Server'), h('dd', {}, p.server),
+      p.fast ? [h('dt', {}, 'Fast'), h('dd', {}, p.fast)] : null,
+      p.stealth ? [h('dt', {}, 'Stealth'), h('dd', {}, p.stealth)] : null,
+      p.httpsProxy ? [h('dt', {}, 'HTTPS proxy'), h('dd', {}, p.httpsProxy)] : null,
       p.cdn ? [h('dt', {}, 'CDN'), h('dd', {}, p.cdn)] : null,
       h('dt', {}, 'Routes'), h('dd', {}, (p.routes || []).map(tierName).join(', ')),
       h('dt', {}, 'Key'), h('dd', { class: 'fp' }, p.fingerprint || '—'));
@@ -900,7 +1102,7 @@ async function pollLogs() {
 function renderSettings() {
   const s = S.settings;
   if (!s) return;
-  $$('#page-settings input.sw[data-k]').forEach((i) => { i.checked = !!s[i.dataset.k]; });
+  $$('#page-settings input.sw[data-k]').forEach((i) => { i.checked = i.dataset.k === 'updateAuto' ? s.updateAuto !== false : !!s[i.dataset.k]; });
   $$('.seg[data-k]').forEach((g) => $$('button', g).forEach((b) => b.setAttribute('aria-pressed', String(s[g.dataset.k] === b.dataset.v))));
   if (document.activeElement !== $('#s-port')) $('#s-port').value = s.listenPort;
   const tun = !!s.tun;
@@ -918,8 +1120,63 @@ async function saveSetting(patch) {
   const prev = S.settings;
   S.settings = { ...prev, ...patch };
   renderSettings();
-  try { S.settings = await api('PUT', '/settings', S.settings); renderSettings(); }
+  try {
+    S.settings = await api('PUT', '/settings', S.settings);
+    renderSettings();
+    if (patch.updateAuto === true) checkAutomatically();
+    if (patch.ipv6 !== undefined) await loadProfiles();
+  }
   catch (e) { S.settings = prev; renderSettings(); toast(e.message); }
+}
+
+let updateState, updateRequest = false, updateTimer;
+const updateBusy = () => ['checking', 'downloading'].includes(updateState?.state);
+
+function renderUpdates() {
+  const { installed, state, version, error, artifact } = updateState || {};
+  $('#update-installed').textContent = installed ? `v${installed.replace(/^v/, '')}` : '—';
+  const messages = {
+    checking: 'Checking for updates…',
+    available: `Version ${version} is available.`,
+    current: 'Pipe is up to date.',
+    downloading: `Downloading and verifying version ${version}…`,
+    ready: `Version ${version} is ready. Open the downloaded file to install it.`,
+    error: error || 'Could not update Pipe.',
+  };
+  const status = $('#update-status');
+  const message = messages[state] || '';
+  if (status.textContent !== message) status.textContent = message;
+  status.parentElement.hidden = !message;
+  $('#update-check').disabled = updateRequest || updateBusy();
+  $('#update-download').hidden = state !== 'available' && !(state === 'error' && version);
+  $('#update-download').disabled = updateRequest;
+  $('#update-reveal').hidden = state !== 'ready' || !artifact;
+  $('#update-reveal').disabled = updateRequest;
+}
+
+async function requestUpdates(action, input) {
+  if (!sessionToken || updateRequest) return;
+  clearTimeout(updateTimer);
+  updateRequest = true;
+  renderUpdates();
+  try {
+    const next = await api(action ? 'POST' : 'GET', action ? '/updates/' + action : '/updates', input);
+    if (next) updateState = next;
+  } catch (e) {
+    if (action) toast(e.message);
+  } finally {
+    updateRequest = false;
+    renderUpdates();
+    if (sessionToken && updateBusy() && document.visibilityState === 'visible') {
+      updateTimer = setTimeout(requestUpdates, 1000);
+    }
+  }
+}
+
+function checkAutomatically() {
+  if (!S.settings || document.visibilityState !== 'visible') return;
+  if (S.settings.updateAuto !== false) requestUpdates('check', { automatic: true });
+  else if (!updateState || updateBusy()) requestUpdates();
 }
 async function loadAbout() {
   try {
@@ -941,19 +1198,26 @@ function go(page) {
   if (page === 'routing') loadRouting();
   if (page === 'profiles' || page === 'home') loadProfiles();
   if (page === 'logs') { renderLogs(); pollLogs(); }
-  if (page === 'settings') { renderSettings(); loadAbout(); refreshHelper(); }
+  if (page === 'settings') { renderSettings(); loadAbout(); refreshHelper(); requestUpdates(); }
   if (page === 'home' && document.visibilityState === 'visible') { drawSpark(); renderPath(); }
   $('#main').scrollTop = 0;
 }
+let statusRead = 0, statusPending = false;
 async function tick() {
-  if (document.visibilityState !== 'visible') return;
+  if (!sessionToken || statusPending || document.visibilityState !== 'visible') return;
+  statusPending = true;
+  const read = statusRead;
   try {
-    applyStatus(await api('GET', '/status'));
+    const status = await api('GET', '/status');
+    if (read !== statusRead) return;
+    applyStatus(status);
     if (S.fails >= 3) S.note = '';
     S.fails = 0;
     if (S.page === 'logs') pollLogs();
   } catch (e) {
     if (++S.fails >= 3) { S.note = 'Lost contact with Pipe. Open it again from your apps.'; showBanner(S.note); }
+  } finally {
+    statusPending = false;
   }
 }
 
@@ -977,7 +1241,11 @@ function wire() {
     copy(`export https_proxy=http://${a} http_proxy=http://${a} all_proxy=socks5://${a}`, 'Copied. Paste it in your terminal.');
   });
   $('#quit').addEventListener('click', () => confirmSheet('Quit Pipe?', 'This disconnects and turns off the system proxy.', 'Quit', async () => {
-    try { await api('POST', '/quit'); veil('Pipe has quit', 'You can close this window.'); } catch (e) { toast(e.message); return false; }
+    try {
+      await api('POST', '/quit');
+      saveSessionToken('');
+      veil('Pipe has quit', 'You can close this window.');
+    } catch (e) { toast(e.message); return false; }
   }));
   // import fields
   for (const [ta, btn] of [['#empty-link', '#empty-import'], ['#add-link', '#add-preview']]) {
@@ -1005,6 +1273,9 @@ function wire() {
   // settings
   $$('#page-settings input.sw[data-k]').forEach((i) => i.addEventListener('change', () => saveSetting({ [i.dataset.k]: i.checked })));
   $$('.seg[data-k] button').forEach((b) => b.addEventListener('click', () => saveSetting({ [b.parentElement.dataset.k]: b.dataset.v })));
+  $('#update-check').addEventListener('click', () => requestUpdates('check'));
+  $('#update-download').addEventListener('click', () => requestUpdates('download'));
+  $('#update-reveal').addEventListener('click', () => requestUpdates('reveal', { artifact: updateState.artifact }));
   $('#s-port').addEventListener('change', (e) => {
     const n = +e.target.value;
     if (!Number.isInteger(n) || n < 1024 || n > 65535) { toast('Pick a port between 1024 and 65535.'); e.target.value = S.settings.listenPort; return; }
@@ -1018,7 +1289,7 @@ function wire() {
   const syncVisibility = () => {
     document.documentElement.toggleAttribute('data-window-hidden', document.visibilityState !== 'visible');
     if (document.visibilityState !== 'visible') hideSecrets();
-    else renderPath();
+    else { renderPath(); checkAutomatically(); }
     tick();
   };
   document.documentElement.toggleAttribute('data-window-hidden', document.visibilityState !== 'visible');
@@ -1038,15 +1309,23 @@ async function boot() {
   const m = location.hash.match(/boot=([^&]+)/);
   try {
     if (m) {
-      await api('POST', '/session', { nonce: decodeURIComponent(m[1]) });
       history.replaceState(null, '', '/');
+      const redeemed = await api('POST', '/session', { nonce: decodeURIComponent(m[1]) });
+      if (!redeemed?.token) throw new Error('Could not open the Pipe session.');
+      saveSessionToken(redeemed.token);
+    } else {
+      sessionToken = restoreSessionToken();
     }
-    const [st, , s] = await Promise.all([api('GET', '/status'), loadProfiles(), api('GET', '/settings')]);
+    const st = await api('GET', '/status');
+    const [, s] = await Promise.all([loadProfiles(), api('GET', '/settings')]);
     S.settings = s; applyTheme(s.theme);
     applyStatus(st);
+    checkAutomatically();
   } catch (e) {
-    if (e.status === 401 || e.status === 403 || m) veil('Open Pipe again from your apps', 'This window is not connected to Pipe any more.');
-    else veil('Pipe is not responding', 'Open Pipe again from your apps.');
+    if (e.status === 401 || e.status === 403 || m) {
+      saveSessionToken('');
+      veil('Open Pipe again from your apps', 'This window is not connected to Pipe any more.');
+    } else veil('Pipe is not responding', 'Open Pipe again from your apps.');
     return;
   }
   setInterval(tick, 1000);

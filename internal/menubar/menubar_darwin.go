@@ -368,6 +368,26 @@ func Stop() {
 	purego.SyscallN(dispatchAsyncF, mainQueue, 0, stopCB)
 }
 
+// CancelPendingTermination releases AppKit's logout wait after Quit fails.
+func CancelPendingTermination() {
+	if u := cur.Load(); u != nil && u.pendingTerminate.Load() {
+		enqueueMain(func() {
+			if cur.Load() == u {
+				u.replyToPendingTermination(false)
+			}
+		})
+	}
+}
+
+// replyToPendingTermination runs on the Cocoa main thread.
+func (u *ui) replyToPendingTermination(allow bool) bool {
+	if !u.pendingTerminate.Swap(false) {
+		return false
+	}
+	u.app.Send(sel("replyToApplicationShouldTerminate:"), allow)
+	return true
+}
+
 // stopOnMain runs on the main thread via the main queue.
 func stopOnMain(ctx uintptr) {
 	defer func() { recover() }()
@@ -375,9 +395,7 @@ func stopOnMain(ctx uintptr) {
 	if u == nil {
 		return
 	}
-	if u.pendingTerminate.Swap(false) {
-		// Logout/shutdown asked us to quit and we said "later"; now say yes.
-		u.app.Send(sel("replyToApplicationShouldTerminate:"), true)
+	if u.replyToPendingTermination(true) {
 		return
 	}
 	u.app.Send(sel("stop:"), objc.ID(0))
@@ -413,8 +431,9 @@ func (u *ui) setup() error {
 			if u.act.Quit == nil || stopped.Load() {
 				return 1 // NSTerminateNow
 			}
-			u.pendingTerminate.Store(true)
-			go u.act.Quit()
+			if u.pendingTerminate.CompareAndSwap(false, true) {
+				go u.act.Quit()
+			}
 			return 2 // NSTerminateLater
 		}},
 		{Cmd: sel("menuNeedsUpdate:"), Fn: func(self objc.ID, _ objc.SEL, m objc.ID) {
@@ -426,7 +445,7 @@ func (u *ui) setup() error {
 		}},
 		{Cmd: sel("pipeTick:"), Fn: func(self objc.ID, _ objc.SEL, t objc.ID) { call(u.refresh) }},
 		{Cmd: sel("pipeConnect:"), Fn: func(self objc.ID, _ objc.SEL, it objc.ID) {
-			if s := u.cache.Load(); s != nil && (s.Status == "on" || s.Status == "connecting") {
+			if canDisconnect(u.current().Status) {
 				if u.act.Disconnect != nil {
 					go u.act.Disconnect()
 				}
@@ -523,6 +542,10 @@ func (u *ui) current() State {
 	return State{Status: "off", Title: "Not connected"}
 }
 
+func canDisconnect(status string) bool {
+	return status == "on" || status == "connecting" || status == "paused"
+}
+
 // refresh updates the icon, tooltip and menu title from the cache (main thread).
 func (u *ui) refresh() {
 	s := u.current()
@@ -600,7 +623,7 @@ func (u *ui) rebuildMenu() {
 
 	u.titleItem = add(m, menuTitle(s), "", "", 0, false, false)
 	sep()
-	if s.Status == "on" || s.Status == "connecting" {
+	if canDisconnect(s.Status) {
 		add(m, "Disconnect", "pipeConnect:", "", 1, false, true)
 	} else {
 		add(m, "Connect", "pipeConnect:", "", 1, false, true)

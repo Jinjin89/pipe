@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"testing/synctest"
 
 	"pipe/internal/link"
+	"pipe/internal/localfile"
 
 	"github.com/caddyserver/certmagic"
 )
@@ -71,6 +73,7 @@ func newSetupHarness(t *testing.T, input string) *setupHarness {
 			}
 			return nil
 		},
+		occupiedUDPPorts: func() ([]uint16, error) { return nil, nil },
 		Suffix: func() string {
 			name := fmt.Sprintf("abc%d", suffix)
 			suffix++
@@ -89,6 +92,9 @@ func (h *setupHarness) fakeChild(ctx context.Context, c SetupCommand) error {
 	dir := h.env.path(c.Argv[len(c.Argv)-1])
 	switch c.Argv[2] {
 	case "setup":
+		if c.Argv[3] == EnrollSetupDeviceCommand {
+			return EnrollSetupDevice(h.env.path(c.Argv[4]), c.Argv[5], c.enrollmentFile)
+		}
 		var u setupUpdate
 		if err := json.Unmarshal([]byte(c.Argv[5]), &u); err != nil {
 			return err
@@ -185,7 +191,7 @@ func TestSetupFreshStandalone(t *testing.T) {
 		"root: useradd --system --home-dir /var/lib/pipe --shell /usr/sbin/nologin pipe",
 		"pipe: " + setupBinary + " server setup --apply-setup " + d,
 		"pipe: " + setupBinary + " server install --dir " + d,
-		"pipe: " + setupBinary + " server add phone --dir " + d,
+		"pipe: " + setupBinary + " server setup --enroll-device " + d + " phone",
 		"root: sysctl -p /etc/sysctl.d/90-pipe.conf",
 		"root: systemctl daemon-reload",
 		"root: systemctl enable pipe-hop",
@@ -265,7 +271,7 @@ func TestSetupFreshSharedYes(t *testing.T) {
 	wantCommands(t, h.argvs(), []string{
 		"pipe: " + setupBinary + " server setup --apply-setup " + d,
 		"pipe: " + setupBinary + " server install --dir " + d,
-		"pipe: " + setupBinary + " server add laptop --dir " + d,
+		"pipe: " + setupBinary + " server setup --enroll-device " + d + " laptop",
 		"root: sysctl -p /etc/sysctl.d/90-pipe.conf",
 		"root: systemctl daemon-reload",
 		"root: systemctl enable pipe",
@@ -482,7 +488,7 @@ func TestSetupChecksHopSettingsAfterChildCommits(t *testing.T) {
 		if err := run(ctx, c); err != nil {
 			return err
 		}
-		if c.AsPipe && c.Argv[2] == "setup" {
+		if c.AsPipe && c.Argv[2] == "setup" && c.Argv[3] == ApplySetupUpdateCommand {
 			saved, err := ReadSettings(dir)
 			must(t, err)
 			saved.Ports.Fast = 2444
@@ -551,7 +557,7 @@ func TestSetupDNSKeyFileStagedAndRemoved(t *testing.T) {
 	run := h.env.Run
 	h.env.Run = func(ctx context.Context, c SetupCommand) error {
 		staged, _ := filepath.Glob(filepath.Join(h.env.Root, setupStateDir, ".setup-*"))
-		if c.AsPipe && c.Argv[2] == "setup" {
+		if c.AsPipe && c.Argv[2] == "setup" && c.Argv[3] == ApplySetupUpdateCommand {
 			var update setupUpdate
 			must(t, json.Unmarshal([]byte(c.Argv[5]), &update))
 			seen = update.Proxy.DNSFile
@@ -1265,6 +1271,164 @@ func TestSetupRefusesForeignPorts(t *testing.T) {
 	config.Rescue = &SetupRescue{SNI: "rescue.example", Port: 2096, Cert: "/rescue.pem", Key: "/rescue-key.pem"}
 	if err := h.run(config); err == nil || !strings.Contains(err.Error(), "Rescue TCP port 2096") || len(h.cmds) != 0 {
 		t.Fatalf("new occupied port on rerun: %v, commands %v", err, h.argvs())
+	}
+}
+
+func TestSetupRejectsOccupiedFastHopPortBeforeChanges(t *testing.T) {
+	h := newSetupHarness(t, "")
+	h.env.occupiedUDPPorts = func() ([]uint16, error) { return []uint16{31001}, nil }
+	h.env.probeBinding = func(b setupBinding) error {
+		if b.network == "udp4" && b.port == 31001 {
+			return syscall.EADDRINUSE
+		}
+		return nil
+	}
+	o := setupConfigOptions(t, `{"sni":"origin.example","fast":{"hop":"31000-31002"}}`)
+	if err := h.run(o); err == nil || !strings.Contains(err.Error(), "31001") || len(h.cmds) != 0 {
+		t.Fatalf("unexpected setup result %v with %d changes", err, len(h.cmds))
+	}
+	if _, err := os.Stat(h.env.path(setupBinary)); !os.IsNotExist(err) {
+		t.Fatalf("binary state after refusing the range: %v", err)
+	}
+}
+
+func TestFastHopScopeUsesExternalInterfaceAddresses(t *testing.T) {
+	loop := netip.MustParseAddr("11.0.0.80")
+	local := netip.MustParseAddr("10.0.0.2")
+	ifaces := []SetupInterface{{Loopback: true, Addrs: []netip.Addr{loop}}, {Addrs: []netip.Addr{local}}}
+	addresses, err := fastHopDestinations(ifaces, netip.Addr{})
+	if err != nil || !slices.Equal(addresses, []netip.Addr{local}) {
+		t.Fatalf("hop addresses = %v, error = %v", addresses, err)
+	}
+}
+
+func TestSetupProbesHopPortsInSelectedFamily(t *testing.T) {
+	h := newSetupHarness(t, "")
+	h.env.occupiedUDPPorts = func() ([]uint16, error) { return []uint16{443, 31001, 31003}, nil }
+	var seen []string
+	h.env.probeBinding = func(b setupBinding) error {
+		if b.port >= 31000 && b.port <= 31002 {
+			seen = append(seen, b.network)
+			if b.address != netip.MustParseAddr("203.0.113.7") {
+				t.Fatalf("unexpected hop probe destination %v", b.address)
+			}
+		}
+		return nil
+	}
+	must(t, h.run(setupConfigOptions(t, `{"sni":"origin.example","fast":{"hop":"31000-31002","address":"203.0.113.7"}}`)))
+	if !slices.Equal(seen, []string{"udp4"}) {
+		t.Fatalf("hop preflight probed %v, want one probe for the occupied candidate port and selected address family", seen)
+	}
+}
+
+func TestHopPreflightUsesKernelAddressAndWildcardScope(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the socket table fixture requires Linux")
+	}
+	for _, fixture := range []struct {
+		host    string
+		blocked bool
+	}{{"127.0.0.2", false}, {"127.0.0.1", true}, {"0.0.0.0", true}} {
+		t.Run(fixture.host, func(t *testing.T) {
+			listener, err := net.ListenPacket("udp4", net.JoinHostPort(fixture.host, "0"))
+			must(t, err)
+			defer listener.Close()
+			port := listener.LocalAddr().(*net.UDPAddr).Port
+			destination := netip.MustParseAddr("127.0.0.1")
+			err = checkHopPorts(fmt.Sprintf("%d-%d", port, port+1), 443, []netip.Addr{destination}, occupiedUDPPorts, probeSetupBinding)
+			if fixture.blocked && !errors.Is(err, syscall.EADDRINUSE) || !fixture.blocked && err != nil {
+				t.Fatalf("preflight for %s: %v", fixture.host, err)
+			}
+		})
+	}
+}
+
+func TestSetupPersistsNATIPsForADNSAdvertisedHost(t *testing.T) {
+	h := newSetupHarness(t, "")
+	o := setupConfigOptions(t, `{"sni":"origin.example","block_egress_ips":["11.0.0.81","::ffff:11.0.0.81"]}`)
+	must(t, h.run(o))
+	dir := h.env.path(setupStateDir)
+	check := func() {
+		t.Helper()
+		s, err := ReadSettings(dir)
+		must(t, err)
+		want := []netip.Addr{netip.MustParseAddr("11.0.0.81"), netip.MustParseAddr("203.0.113.7")}
+		if s.Domain != "origin.example" || !slices.Equal(s.BlockEgressIPs, want) {
+			t.Fatalf("saved host and blocked addresses = %s %v", s.Domain, s.BlockEgressIPs)
+		}
+		cli := netip.MustParseAddr("11.0.0.82")
+		policy := newServerEgressPolicy(s, []netip.Addr{cli})
+		if policy.Allows(want[0]) || policy.Allows(cli) || !policy.Allows(netip.MustParseAddr("11.0.0.80")) {
+			t.Fatal("startup policy did not merge saved and command-line addresses")
+		}
+	}
+	check()
+	must(t, h.run(setupConfigOptions(t, `{"sni":"origin.example"}`)))
+	check()
+}
+
+func TestUnattendedSetupDeliversLinkPrivately(t *testing.T) {
+	h := newSetupHarness(t, "")
+	o := setupConfigOptions(t, `{"sni":"origin.example","device":"fixture"}`)
+	o.LinkFile = "/device-fixture.link"
+	path := h.env.path(o.LinkFile)
+	must(t, os.WriteFile(path, []byte("keep"), 0600))
+	if err := h.run(o); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("output collision returned %v", err)
+	}
+	if body, err := os.ReadFile(path); err != nil || string(body) != "keep" {
+		t.Fatal("existing output file was overwritten")
+	}
+	must(t, os.Remove(path))
+	h.cmds = nil
+	if err := h.run(o); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range h.argvs() {
+		if strings.Contains(command, " server add ") {
+			t.Fatal("unattended enrollment used the terminal command")
+		}
+	}
+	if !strings.Contains(h.out.String(), "Device link written to ") || strings.Contains(h.out.String(), "pipe://") {
+		t.Fatal("expected only the link file's path on the console")
+	}
+	body, err := localfile.Read(path, 4096, true)
+	must(t, err)
+	profile, err := link.Parse(strings.TrimSpace(string(body)))
+	if err != nil || profile.Name != "fixture" {
+		t.Fatal("output was not an importable device link")
+	}
+}
+
+func TestEnrollmentFailedDeliveryCanRetry(t *testing.T) {
+	dir := t.TempDir()
+	must(t, Init(dir, "origin.example", ""))
+	path := filepath.Join(dir, "output.link")
+	must(t, os.WriteFile(path, nil, 0600))
+	readonly, err := os.Open(path)
+	must(t, err)
+	if err := EnrollSetupDevice(dir, "fixture", readonly); err == nil {
+		t.Fatal("expected the failed write to abort enrollment")
+	}
+	must(t, readonly.Close())
+	devices, err := ReadDevices(dir)
+	must(t, err)
+	if len(devices) != 0 {
+		t.Fatal("failed delivery enrolled a device")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0600)
+	must(t, err)
+	must(t, EnrollSetupDevice(dir, "fixture", file))
+	must(t, file.Close())
+}
+
+func TestSetupChildEnvironmentDropsParentSecrets(t *testing.T) {
+	t.Setenv("PIPE_TEST_PARENT_SECRET", "unrelated fixture")
+	t.Setenv("PATH", "/fixture-bin")
+	env := setupChildEnvironment(true)
+	want := []string{"HOME=" + setupStateDir, "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", setupInstallEnv + "=1"}
+	if !slices.Equal(env, want) {
+		t.Fatal("the setup child environment differs from its allowlist")
 	}
 }
 

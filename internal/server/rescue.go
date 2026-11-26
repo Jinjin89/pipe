@@ -281,7 +281,7 @@ func removeRescueFiles(dir string, cfg *RescueConfig) error {
 }
 
 func rescueTLSConfig(domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error), originCA *x509.CertPool) *tls.Config {
-	config := strictProxyTLS(domain, getCertificate)
+	config := strictSiteTLS(domain, getCertificate)
 	if originCA != nil {
 		config.ClientAuth = tls.RequireAndVerifyClientCert
 		config.ClientCAs = originCA

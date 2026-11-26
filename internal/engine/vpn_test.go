@@ -11,6 +11,8 @@ import (
 	"slices"
 	"testing"
 
+	"pipe/internal/sysdns"
+
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
@@ -247,7 +249,7 @@ func TestVPNNetworkLANDNSServersUsesDefaultSnapshot(t *testing.T) {
 		"type": "tun", "address": []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
 	}}}
 	state := `{"defaultInterface":"wlan0","interfaces":[
-		{"name":"wlan0","index":7,"dns":["fe80::53%wlan0","fe80::54","192.168.1.1","invalid","172.19.0.1","fdfe:dcba:9876::1","223.5.5.5"]},
+		{"name":"wlan0","index":7,"dns":["fe80::53%wlan0","fe80::54","192.168.1.1","invalid","172.19.0.1","fdfe:dcba:9876::1","` + sysdns.TUNDNSAddress + `"]},
 		{"name":"rmnet0","dns":["10.0.0.1"]}]}`
 	want := []netip.AddrPort{
 		netip.MustParseAddrPort("[fe80::53%7]:53"),

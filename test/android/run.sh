@@ -10,6 +10,8 @@ check=prerequisites
 lab=
 server_pid=
 target_pid=
+direct_pid=
+target_ns_pid=
 emulator_pid=
 request_pid=
 pss_pid=
@@ -62,7 +64,7 @@ PY
       timeout 10 "${device[@]}" logcat -b all -d -v threadtime 2>&1 |
         grep -E 'io\.pipe\.app|avc: +denied' | tail -n 200
     fi
-    for log in "$diagnostic_lab"/{server,avd,emulator,target,switch}.log "$diagnostic_lab"/*.{client,sockets}.log; do
+    for log in "$diagnostic_lab"/{server,avd,emulator,target,direct,clipboard,import,switch}.log "$diagnostic_lab"/*.{client,sockets}.log; do
       if [[ -f $log ]]; then
         printf '\n%s\n' "${log##*/}"
         tail -n 100 "$log"
@@ -95,22 +97,21 @@ check_memory() {
 }
 
 [[ $EUID == 0 ]] || fail 'root is required for the isolated host network namespace'
-[[ -r /dev/kvm && -w /dev/kvm ]] || fail 'KVM is required'
-check_memory
-for tool in ip unshare mount ss timeout python3; do
+for tool in ip unshare nsenter mount ss timeout python3; do
   command -v "$tool" >/dev/null || fail "missing $tool"
 done
 if [[ ${1:-} != --isolated ]]; then
-  # Keep emulator NAT, ADB, and both targets on loopback in a fresh namespace.
-  # The guest reaches the namespace's loopback as 10.0.2.2.
+  [[ $# -eq 0 || ($# -eq 1 && $1 == --fixture-only) ]] || fail 'usage: run.sh [--fixture-only]'
+  # The guest reaches the Pipe server and direct control at 10.0.2.2.
   parent_network=$(readlink /proc/self/ns/net)
   shopt -s execfail
-  exec unshare --net -- "$repo/test/android/run.sh" --isolated "$parent_network" ||
+  exec unshare --net -- "$repo/test/android/run.sh" --isolated "$parent_network" "$@" ||
     fail 'could not start the isolated emulator lab'
 fi
 [[ -n ${2:-} && $(readlink /proc/self/ns/net) != "$2" && ! /proc/self/ns/net -ef /proc/1/ns/net ]] ||
   fail 'the emulator lab requires a separate network namespace'
 trap '[[ $BASHPID != $$ ]] || fail "$check (line $LINENO)"' ERR
+fixture_only=${3:-}
 
 export ANDROID_HOME=${ANDROID_HOME:-/opt/android-sdk}
 export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
@@ -120,6 +121,7 @@ avdmanager=$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager
 image='system-images;android-36;google_apis;x86_64'
 apk=${PIPE_ANDROID_APK:-$repo/android/app/build/outputs/apk/debug/app-x86_64-debug.apk}
 package=io.pipe.app
+clipboard_package=io.pipe.fixture
 activity=$package/.MainActivity
 origin_host=origin.pipe.test
 fast_sni=fast.pipe.test
@@ -132,11 +134,15 @@ guest_ui=/data/local/tmp/pipe-ui.xml
 adb_host=("$adb" -P 5037)
 device=("${adb_host[@]}" -s emulator-5554)
 
-for tool in "$adb" "$emulator" "$avdmanager" "$JAVA_HOME/bin/java"; do
-  [[ -x $tool ]] || fail "missing $tool"
-done
-[[ -d $ANDROID_HOME/system-images/android-36/google_apis/x86_64 ]] || fail "missing emulator image $image"
-[[ -s $apk ]] || fail 'build the x86_64 debug APK first'
+if [[ $fixture_only != --fixture-only ]]; then
+  [[ -r /dev/kvm && -w /dev/kvm ]] || fail 'KVM is required'
+  check_memory
+  for tool in "$adb" "$emulator" "$avdmanager" "$JAVA_HOME/bin/java"; do
+    [[ -x $tool ]] || fail "missing $tool"
+  done
+  [[ -d $ANDROID_HOME/system-images/android-36/google_apis/x86_64 ]] || fail "missing emulator image $image"
+  [[ -s $apk ]] || fail 'build the x86_64 debug APK first'
+fi
 
 stop_pid() {
   local pid=$1 deadline=$((SECONDS + 15))
@@ -167,6 +173,8 @@ cleanup() {
   fi
   stop_pid "$server_pid"
   stop_pid "$target_pid"
+  stop_pid "$direct_pid"
+  stop_pid "$target_ns_pid"
   rm -rf -- "$lab"
 }
 
@@ -181,7 +189,9 @@ export ANDROID_ADB_LOG_PATH="$lab/adb.log"
 export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} -Duser.home=$lab/java"
 mkdir -p "$ANDROID_AVD_HOME" "$lab/java"
 
-if [[ -n ${PIPE_BIN:-} ]]; then
+if [[ $fixture_only == --fixture-only ]]; then
+  pipe=
+elif [[ -n ${PIPE_BIN:-} ]]; then
   pipe=$(realpath -- "$PIPE_BIN")
   [[ -x $pipe ]] || fail 'PIPE_BIN is not executable'
 else
@@ -189,7 +199,7 @@ else
   (
     export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
     export GOFLAGS=-mod=mod GOCACHE=/tmp/pipe-gocache CGO_ENABLED=0
-    go build -buildvcs=false -trimpath -tags with_gvisor,with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0 \
+    go build -p 2 -buildvcs=false -trimpath -tags with_gvisor,with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0 \
       -ldflags '-s -w -checklinkname=0' -o "$pipe" ./cmd/pipe
   )
 fi
@@ -204,18 +214,35 @@ wait_log() {
   return 1
 }
 
-check='isolated Pipe server and HTTP targets'
+check='HTTP origin has an independent network namespace'
 ip link set lo up
-ip addr add "$target_addr/32" dev lo
+unshare --net -- sleep infinity &
+target_ns_pid=$!
+host_network=$(readlink /proc/self/ns/net)
+deadline=$((SECONDS + 5))
+while [[ $(readlink "/proc/$target_ns_pid/ns/net") == "$host_network" ]]; do
+  (( SECONDS < deadline )) || fail "$check (namespace did not start)"
+  sleep .05
+done
+target_ns=(nsenter -t "$target_ns_pid" -n)
+ip link add pipe-host type veth peer name pipe-origin
+ip addr add 10.96.75.1/30 dev pipe-host
+ip link set pipe-host up
+ip link set pipe-origin netns "$target_ns_pid"
+"${target_ns[@]}" ip link set lo up
+"${target_ns[@]}" ip addr add 10.96.75.2/30 dev pipe-origin
+"${target_ns[@]}" ip addr add "$target_addr/32" dev lo
+"${target_ns[@]}" ip link set pipe-origin up
+ip route add "$target_addr/32" via 10.96.75.2 dev pipe-host
+[[ $(ip route get "$target_addr") == *' via 10.96.75.2 dev pipe-host '* ]]
 cat > "$lab/target.py" <<'PY'
 import pathlib
 import subprocess
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-address, target_port, direct_port, work = sys.argv[1:]
+address, target_port, direct_port, work, host_pid = sys.argv[1:]
 work = pathlib.Path(work)
 
 
@@ -242,7 +269,8 @@ class Target(BaseHTTPRequestHandler):
         # Check the peer port of this specific HTTP connection.
         peer_port = self.client_address[1]
         sockets = subprocess.check_output(
-            ["ss", "-Hntp", "sport", "=", f":{peer_port}", "and", "dport", "=", f":{target_port}"],
+            ["nsenter", "-t", host_pid, "-n", "ss", "-Hntp", "sport", "=", f":{peer_port}",
+             "and", "dport", "=", f":{target_port}"],
             text=True,
         )
         pid = (work / "server.pid").read_text().strip()
@@ -269,17 +297,65 @@ def respond(handler, body):
     handler.wfile.write(payload)
 
 
-with ThreadingHTTPServer((address, int(target_port)), Target) as target:
-    with ThreadingHTTPServer(("127.0.0.1", int(direct_port)), Direct) as direct:
-        threading.Thread(target=direct.serve_forever, daemon=True).start()
+if address == "127.0.0.1":
+    with ThreadingHTTPServer((address, int(direct_port)), Direct) as direct:
+        direct.serve_forever()
+else:
+    with ThreadingHTTPServer((address, int(target_port)), Target) as target:
         print("Targets ready", flush=True)
         target.serve_forever()
 PY
 : > "$lab/target.log"
-python3 -u "$lab/target.py" "$target_addr" "$target_port" "$direct_port" "$lab" >> "$lab/target.log" 2>&1 &
+python3 -u "$lab/target.py" 127.0.0.1 "$target_port" "$direct_port" "$lab" "$$" > "$lab/direct.log" 2>&1 &
+direct_pid=$!
+"${target_ns[@]}" python3 -u "$lab/target.py" "$target_addr" "$target_port" "$direct_port" "$lab" "$$" >> "$lab/target.log" 2>&1 &
 target_pid=$!
 wait_log "$target_pid" "$lab/target.log" 'Targets ready' 8
+python3 - "$target_addr" "$target_port" <<'PY'
+import socket
+import sys
 
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3):
+    pass
+PY
+pass "$check"
+
+check='build the clipboard fixture APK'
+build_tools=$(sed -n 's/.*buildToolsVersion = "\([^"]*\)".*/\1/p' android/app/build.gradle.kts)
+sdk_tools=$ANDROID_HOME/build-tools/$build_tools
+android_jar=$ANDROID_HOME/platforms/android-36/android.jar
+clip=$lab/clipboard
+mkdir -p "$clip"/{classes,dex}
+build_clipboard_apk() {
+  "$JAVA_HOME/bin/javac" --release 8 -classpath "$android_jar" -d "$clip/classes" test/android/ClipboardActivity.java
+  "$sdk_tools/d8" --min-api 26 --lib "$android_jar" --output "$clip/dex" \
+    "$clip/classes/io/pipe/fixture/ClipboardActivity.class"
+  cp test/android/ClipboardManifest.xml "$clip/AndroidManifest.xml"
+  "$sdk_tools/aapt" package -f -M "$clip/AndroidManifest.xml" -I "$android_jar" -F "$clip/unsigned.apk"
+  python3 -I - "$clip" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+root = pathlib.Path(sys.argv[1])
+with zipfile.ZipFile(root / "unsigned.apk", "a", compression=zipfile.ZIP_DEFLATED) as apk:
+    apk.write(root / "dex/classes.dex", "classes.dex")
+PY
+  "$sdk_tools/zipalign" -f 4 "$clip/unsigned.apk" "$clip/aligned.apk"
+  printf '%s\n' pipe-clipboard-test > "$clip/password"
+  "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$clip/signer.p12" -storetype PKCS12 -alias fixture \
+    -storepass:file "$clip/password" -keyalg RSA -keysize 2048 -validity 2 -dname 'CN=Pipe Clipboard Fixture' -noprompt
+  "$sdk_tools/apksigner" sign --ks "$clip/signer.p12" --ks-pass "file:$clip/password" \
+    --out "$clip/fixture.apk" "$clip/aligned.apk"
+  "$sdk_tools/apksigner" verify "$clip/fixture.apk"
+}
+build_clipboard_apk > "$lab/clipboard.log" 2>&1
+pass "$check"
+if [[ $fixture_only == --fixture-only ]]; then
+  exit 0
+fi
+
+check='isolated Pipe server'
 # A distinct Fast TLS name makes enrollment carry explicit M3 endpoint details.
 "$pipe" server init --dir "$lab/state" --domain "$origin_host" --fast-sni "$fast_sni" \
   --cdn-domain cdn.pipe.test >/dev/null
@@ -312,10 +388,10 @@ timeout 15 unshare --mount --propagation private -- bash -c '
 ' adb-server "$lab/adb-home" "$HOME" "${adb_host[@]}" start-server >/dev/null
 check_memory
 "$emulator" -avd pipe-e2e -ports 5554,5555 -no-window -no-audio -no-boot-anim \
-  -no-snapshot -gpu swiftshader_indirect -accel on -memory 1536 -cores 2 > "$lab/emulator.log" 2>&1 &
+  -no-snapshot -gpu swiftshader_indirect -accel on -memory 2560 -cores 4 > "$lab/emulator.log" 2>&1 &
 emulator_pid=$!
 timeout 150 "${device[@]}" wait-for-device
-boot_deadline=$((SECONDS + 240))
+boot_deadline=$((SECONDS + 360))
 until [[ $(timeout 5 "${device[@]}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; do
   (( SECONDS < boot_deadline )) && kill -0 "$emulator_pid" 2>/dev/null || fail "$check"
   sleep 2
@@ -333,6 +409,7 @@ pass "$check"
 
 check='install debug APK and grant VPN consent'
 timeout 60 "${device[@]}" install "$apk" > "$lab/install.log"
+timeout 60 "${device[@]}" install "$clip/fixture.apk" >> "$lab/clipboard.log"
 app_uid=$("${device[@]}" shell cmd package list packages -U "$package" | tr -d '\r' |
   awk -v package="package:$package" '$1 == package && $2 ~ /^uid:[0-9]+$/ {sub(/^uid:/, "", $2); print $2}')
 [[ $app_uid =~ ^[0-9]+$ ]] || fail "$check (could not identify the app UID)"
@@ -343,6 +420,11 @@ app_uid=$("${device[@]}" shell cmd package list packages -U "$package" | tr -d '
 "${device[@]}" shell run-as "$package" mkdir -p no_backup
 "${device[@]}" shell -T "run-as $package sh -c 'cat > no_backup/test-ca.pem'" < "$lab/ca/ca.pem"
 printf '10.0.2.2\n' | "${device[@]}" shell -T "run-as $package sh -c 'cat > no_backup/test-address'"
+# Keep this VPN fixture entirely local when the app starts or resumes.
+"${device[@]}" shell run-as "$package" mkdir -p shared_prefs
+printf '%s\n' '<?xml version="1.0" encoding="utf-8"?><map><boolean name="automatic" value="false" /></map>' |
+  "${device[@]}" shell -T "run-as $package sh -c 'cat > shared_prefs/updates.xml'"
+"${device[@]}" shell run-as "$clipboard_package" mkdir -p files
 pass "$check"
 
 ui_node() {
@@ -417,25 +499,42 @@ tap() {
 }
 
 open_profile() {
-  local raw=${1:-$profile}
-  # Pass the temporary link on stdin and keep Android's intent output private.
-  printf "am start -W -a android.intent.action.VIEW -d '%s' -n '%s'\n" "$raw" "$activity" |
-    timeout 20 "${device[@]}" shell -T sh > "$lab/import.log" 2>&1
+  local raw=${1:-$profile} deadline
+  printf '%s' "$raw" |
+    "${device[@]}" shell -T "run-as $clipboard_package sh -c 'cat > files/fixture-link'"
+  timeout 15 "${device[@]}" shell am start -n "$clipboard_package/.ClipboardActivity" > "$lab/import.log" 2>&1
+  deadline=$((SECONDS + 15))
+  while "${device[@]}" shell run-as "$clipboard_package" test -f files/fixture-link; do
+    (( SECONDS < deadline )) || fail "$check (clipboard fixture did not consume the link)"
+    sleep .2
+  done
+  timeout 25 "${device[@]}" shell am start -W -a android.intent.action.MAIN -n "$activity" >> "$lab/import.log" 2>&1
+  tap id tab_settings
+  tap id import_profile
+  tap text Paste
 }
 
-check='confirm deep-link import before saving'
+check='Android does not resolve the retired link scheme'
+resolved=$("${device[@]}" shell cmd package resolve-activity --brief -a android.intent.action.VIEW \
+  -c android.intent.category.BROWSABLE -d 'pipe://fixture.invalid')
+[[ $resolved != *"$package"* ]]
+pass "$check"
+
+check='explicit paste requires confirmation before saving'
+timeout 25 "${device[@]}" shell am start -W -a android.intent.action.MAIN -n "$activity" > "$lab/import.log" 2>&1
+ui_node id tab_settings >/dev/null
 open_profile
 ui_node text 'Confirm profile import' >/dev/null
 ui_node lines "Fast: $origin_host:$https_port (TLS name $fast_sni)
 Stealth: $origin_host:$https_port" >/dev/null
-open_profile
-ui_node text 'Confirm profile import' >/dev/null
+ui_node contains 'HTTPS proxy' >/dev/null
 if "${device[@]}" shell run-as "$package" test -f no_backup/profiles.enc; then
   fail "$check (profile saved before confirmation)"
 fi
 tap text Cancel
 ui_gone text 'Confirm profile import' ||
   fail "$check (an earlier import dialog is still open)"
+tap id tab_home
 ui_node text 'No server imported' >/dev/null
 open_profile
 ui_node text 'Confirm profile import' >/dev/null
@@ -707,6 +806,7 @@ open_profile "$without_cdn"
 tap text Add
 ui_gone text 'Confirm profile import' || fail "$check (the import dialog did not close)"
 ui_node text android-no-cdn >/dev/null
+tap id tab_home
 tap id connect
 ui_node detail '· Fast' >/dev/null
 tun_present

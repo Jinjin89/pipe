@@ -34,6 +34,7 @@ type httpsProxy struct {
 	lookup func(context.Context, string, string) ([]netip.Addr, error)
 	dial   func(context.Context, string, string) (net.Conn, error)
 	now    func() time.Time
+	policy interface{ AllowsFresh(netip.Addr) bool }
 
 	mu       sync.Mutex
 	devices  map[string]*proxyDevice
@@ -56,6 +57,7 @@ func newHTTPSProxy(site http.Handler, devices []Device) *httpsProxy {
 	p := &httpsProxy{
 		site: site, now: time.Now, lookup: net.DefaultResolver.LookupNetIP,
 		dial:     (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		policy:   engine.NewEgressPolicy(),
 		failures: make(map[netip.Addr]proxyFailure),
 	}
 	p.update(devices)
@@ -95,10 +97,7 @@ func (p *httpsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.site.ServeHTTP(w, r)
 		return
 	}
-	// Go exposes the authority as Host but drops :scheme for origin-form
-	// HTTP/2 requests. Proxy credentials signal forwarding for this form.
-	h2Forward := r.ProtoMajor >= 2 && !r.URL.IsAbs() && r.Host != ""
-	if r.Method != http.MethodConnect && !r.URL.IsAbs() && !h2Forward {
+	if r.Method != http.MethodConnect && !r.URL.IsAbs() && r.ProtoMajor < 2 {
 		p.site.ServeHTTP(w, r)
 		return
 	}
@@ -119,10 +118,11 @@ func (p *httpsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.connect(w, r)
 		return
 	}
-	if h2Forward {
-		target := *r.URL
-		target.Scheme, target.Host = "http", r.Host
-		r.URL = &target
+	// Go may expose only the authority and path of an HTTP/2 request. An
+	// authenticated forward needs an explicit origin scheme to select TLS.
+	if !r.URL.IsAbs() {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
 	}
 	p.forward(w, r)
 }
@@ -231,12 +231,19 @@ func (p *httpsProxy) dialPublic(ctx context.Context, network, address string) (n
 			return nil, errors.New("proxy destination DNS lookup failed")
 		}
 	}
+	check := p.policy.AllowsFresh
+	if fresh, ok := p.policy.(interface{ NewFreshCheck() func(netip.Addr) bool }); ok {
+		check = fresh.NewFreshCheck()
+	}
 	for _, ip := range addresses {
-		if !engine.PublicDestination(ip) {
+		if !check(ip) {
 			return nil, errors.New("restricted proxy destination")
 		}
 	}
-	for _, ip := range dialOrder(addresses) {
+	for i, ip := range dialOrder(addresses) {
+		if i > 0 && !p.policy.AllowsFresh(ip) {
+			return nil, errors.New("restricted proxy destination")
+		}
 		// Give each address its own short budget so a black-holed family
 		// (for example broken IPv6 on the server) cannot use up the whole
 		// timeout before the other family is tried.

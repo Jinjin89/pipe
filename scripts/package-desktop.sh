@@ -15,10 +15,9 @@ export GOFLAGS="${GOFLAGS:--mod=mod}" CGO_ENABLED=0
 tags=with_gvisor,with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0
 base_ldflags='-s -w -checklinkname=0'
 version=$(sed -n 's/.*Version = "\(.*\)".*/\1/p' internal/version/version.go)
-dist=$repo/dist
+dist=${PIPE_RELEASE_DIR:-$repo/dist}
 work=$(mktemp -d "${TMPDIR:-/tmp}/pipe-package.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
-rm -rf -- "$dist"
 mkdir -p -- "$dist"
 
 # build GOOS GOARCH OUTPUT [extra ldflags]
@@ -116,6 +115,9 @@ PY
 zip_dir "$work/windows" "$dist/pipe-windows-amd64.zip"
 for arch in arm64 amd64; do
   zip_dir "$work/macos-$arch" "$dist/pipe-macos-$arch.zip"
+  python3 -I scripts/verify-desktop-archive.py "$dist/pipe-macos-$arch.zip" darwin "$arch" "$version"
+  python3 -I scripts/verify-desktop-archive.py "$dist/pipe-linux-$arch.tar.gz" linux "$arch" "$version"
 done
+python3 -I scripts/verify-desktop-archive.py "$dist/pipe-windows-amd64.zip" windows amd64 "$version"
 
 ls -l -- "$dist"

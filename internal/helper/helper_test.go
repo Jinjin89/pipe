@@ -300,7 +300,7 @@ func TestOptionsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in.TUN = true
+	in.TUN, in.TUNOnly = true, true
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("round trip differs:\n%+v\n%+v", in, out)
 	}

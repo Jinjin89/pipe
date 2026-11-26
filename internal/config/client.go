@@ -329,7 +329,10 @@ func clientRouteForOS(options ClientOptions, goos string) engine.Object {
 	firstIP := slices.IndexFunc(options.Rules, func(r Rule) bool { return r.Field == "ip_cidr" })
 	for i, r := range options.Rules {
 		if i == firstIP && options.TUN && options.Profile != nil {
-			rules = append(rules, resolveForIPRules(options)...)
+			// An earlier matching rule has already routed the connection. A
+			// later direct rule cannot authorize this lookup while CIDR routing
+			// is still undecided. Include IPv6-only destinations for the proxy.
+			rules = append(rules, engine.Object{"server": "proxy-doh", "action": "resolve", "strategy": "prefer_ipv4"})
 		}
 		rules = append(rules, engine.Object{r.Field: r.Match, "outbound": r.Action})
 	}
@@ -350,33 +353,6 @@ func clientRouteForOS(options ClientOptions, goos string) engine.Object {
 		"rules": rules, "final": final, "auto_detect_interface": options.TUN || !options.TestAddress.IsValid(),
 		"default_domain_resolver": resolver(domesticDoH, options.IPv6),
 	}
-}
-
-// resolveForIPRules lets user IP rules see real addresses in TUN mode, where
-// names arrive as fake IPs. It runs just before the first IP rule, so earlier
-// rules never cause a lookup. Names Pipe sends direct use the domestic DNS,
-// as their DNS answers always did; every other name is looked up through the
-// tunnel and is never sent to a domestic resolver.
-func resolveForIPRules(options ClientOptions) []engine.Object {
-	var domestic []engine.Object
-	if options.Mode == Smart {
-		domestic = append(domestic, engine.Object{"rule_set": "geosite-cn"})
-	}
-	for _, r := range options.Rules {
-		if r.Action == "direct" && r.Field != "ip_cidr" {
-			domestic = append(domestic, engine.Object{r.Field: r.Match})
-		}
-	}
-	// Both address families, even under the IPv4-only DNS default: the proxy
-	// dials the name itself, so an IPv6-only name must not come back empty here.
-	other := engine.Object{"server": "proxy-doh", "action": "resolve", "strategy": "prefer_ipv4"}
-	if len(domestic) == 0 {
-		return []engine.Object{other}
-	}
-	local := resolver(domesticDoH, options.IPv6)
-	local["type"], local["mode"], local["rules"], local["action"] = "logical", "or", domestic, "resolve"
-	other["type"], other["mode"], other["rules"], other["invert"] = "logical", "or", domestic, true
-	return []engine.Object{local, other}
 }
 
 func clientDNS(options ClientOptions, relay engine.Relay) engine.Object {
@@ -425,8 +401,17 @@ func clientDNS(options ClientOptions, relay engine.Relay) engine.Object {
 			"type": "fakeip", "tag": "fake-ip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18",
 		})
 	}
+	undecidedCIDR := false
 	for _, rule := range options.Rules {
 		if rule.Field == "ip_cidr" {
+			if options.Profile != nil {
+				// DNS has no connection destination to compare to this CIDR.
+				// Fake addresses and hints still take their usual path. Send
+				// every remaining query through the tunnel until routing can
+				// decide, including queries that never return an address.
+				undecidedCIDR = true
+				break
+			}
 			continue
 		}
 		match := engine.Object{rule.Field: rule.Match}
@@ -453,7 +438,9 @@ func clientDNS(options ClientOptions, relay engine.Relay) engine.Object {
 	if useFake {
 		rules = append(rules, fakeIPRule(nil), fakeIPHintRule(nil))
 	}
-	if options.Mode == Smart {
+	if undecidedCIDR {
+		rules = append(rules, engine.Object{"server": "proxy-doh"})
+	} else if options.Mode == Smart {
 		rules = append(rules, engine.Object{"rule_set": "geosite-cn", "server": domesticDoH})
 	}
 	dns := engine.Object{"servers": servers, "rules": rules, "final": final, "reverse_mapping": true}

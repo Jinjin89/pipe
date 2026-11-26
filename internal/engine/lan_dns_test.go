@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"pipe/internal/sysdns"
+
 	"github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
@@ -101,7 +103,7 @@ func (*cancelLANDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketCo
 
 func TestLANDNSForwardsAndRetriesTruncatedUDPOverTCP(t *testing.T) {
 	server := netip.MustParseAddrPort("192.168.1.1:53")
-	tunnel := netip.MustParseAddrPort("223.5.5.5:53")
+	tunnel := netip.AddrPortFrom(netip.MustParseAddr(sysdns.TUNDNSAddress), 53)
 	self := netip.MustParseAddrPort("172.19.0.1:53")
 	selfDNS := netip.MustParseAddrPort("172.19.0.2:53")
 	dialer := &lanTestDialer{truncateUDP: true}
@@ -126,7 +128,7 @@ func TestLANDNSServesFailureWhenNoResolverExists(t *testing.T) {
 	var calls int
 	resolver := newLANDNSWithDialer("lan", func() []netip.AddrPort {
 		calls++
-		return []netip.AddrPort{netip.MustParseAddrPort("223.5.5.5:53"), netip.MustParseAddrPort("172.19.0.1:53")}
+		return []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr(sysdns.TUNDNSAddress), 53), netip.MustParseAddrPort("172.19.0.1:53")}
 	}, []netip.Prefix{netip.MustParsePrefix("172.19.0.0/30")}, &lanTestDialer{})
 	query := new(dns.Msg).SetQuestion("printer.lan.", dns.TypeA)
 	started := time.Now()

@@ -101,11 +101,16 @@ type parallelDialRecorder struct {
 	chosenAddress   netip.Addr
 	peer            net.Conn
 	packetAddresses []M.Socksaddr
+	failFirst       func()
 }
 
 func (d *parallelDialRecorder) DialParallelNetwork(_ context.Context, _ string, _ M.Socksaddr, addresses []netip.Addr, _ *C.NetworkStrategy, _ []C.InterfaceType, _ []C.InterfaceType, _ time.Duration) (net.Conn, error) {
 	d.parallelCalls++
 	d.parallelAddrs = append([]netip.Addr(nil), addresses...)
+	if d.failFirst != nil && d.parallelCalls == 1 {
+		d.failFirst()
+		return nil, errors.New("first candidate failed")
+	}
 	if len(addresses) == 0 {
 		return nil, errors.New("parallel dial received no addresses")
 	}
@@ -126,6 +131,10 @@ func (d *parallelDialRecorder) ListenPacket(_ context.Context, destination M.Soc
 
 type packetConnRecorder struct{ net.PacketConn }
 
+func (*packetConnRecorder) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	return len(payload), nil
+}
+
 func TestGuardedDirectParallelDialFiltersCandidates(t *testing.T) {
 	guardCalls := 0
 	guard := func(_ string, destination M.Socksaddr) error {
@@ -145,7 +154,10 @@ func TestGuardedDirectParallelDialFiltersCandidates(t *testing.T) {
 	}
 	public4 := netip.MustParseAddr("8.8.8.8")
 	public6 := netip.MustParseAddr("2001:4860:4860::8888")
-	conn, err := parallel.DialParallelNetwork(t.Context(), "tcp", M.Socksaddr{Fqdn: "example.com", Port: 443}, []netip.Addr{
+	policy := NewEgressPolicy()
+	policy.interfaces = func() ([]net.Addr, error) { return nil, nil }
+	ctx := WithEgressPolicy(t.Context(), policy)
+	conn, err := parallel.DialParallelNetwork(ctx, "tcp", M.Socksaddr{Fqdn: "example.com", Port: 443}, []netip.Addr{
 		netip.MustParseAddr("10.0.0.1"), public4, public6,
 	}, nil, nil, nil, 0)
 	if err != nil {
@@ -159,11 +171,40 @@ func TestGuardedDirectParallelDialFiltersCandidates(t *testing.T) {
 	if guardCalls != 3 {
 		t.Fatalf("guard checked %d candidates, want all 3", guardCalls)
 	}
-	if base.parallelCalls != 1 || !slices.Equal(base.parallelAddrs, []netip.Addr{public4, public6}) {
+	if base.parallelCalls != 1 || !slices.Equal(base.parallelAddrs, []netip.Addr{public4}) {
 		t.Fatalf("parallel dial got %v in %d calls", base.parallelAddrs, base.parallelCalls)
 	}
 	if base.chosenAddress != public4 {
 		t.Fatalf("connected through %s, want first public candidate %s", base.chosenAddress, public4)
+	}
+}
+
+func TestGuardedDirectParallelDialRechecksDelayedCandidate(t *testing.T) {
+	public4 := netip.MustParseAddr("8.8.8.8")
+	public6 := netip.MustParseAddr("2001:4860:4860::8888")
+	localNow := false
+	policy := NewEgressPolicy()
+	policy.interfaces = func() ([]net.Addr, error) {
+		if localNow {
+			return []net.Addr{&net.IPNet{IP: public6.AsSlice(), Mask: net.CIDRMask(128, 128)}}, nil
+		}
+		return nil, nil
+	}
+	base := &parallelDialRecorder{
+		failFirst: func() { localNow = true },
+	}
+	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
+		return publicDestination(destination)
+	})
+	parallel := wrapped.(interface {
+		DialParallelNetwork(context.Context, string, M.Socksaddr, []netip.Addr, *C.NetworkStrategy, []C.InterfaceType, []C.InterfaceType, time.Duration) (net.Conn, error)
+	})
+	ctx := WithEgressPolicy(t.Context(), policy)
+	if _, err := parallel.DialParallelNetwork(ctx, "tcp", M.Socksaddr{Fqdn: "example.com", Port: 443}, []netip.Addr{public4, public6}, nil, nil, nil, 0); err == nil {
+		t.Fatal("delayed candidate that became local was dialed")
+	}
+	if base.parallelCalls != 1 || !slices.Equal(base.parallelAddrs, []netip.Addr{public4}) {
+		t.Fatalf("delayed local candidate reached dialer: %v (%d calls)", base.parallelAddrs, base.parallelCalls)
 	}
 }
 
@@ -186,6 +227,171 @@ func TestGuardedDirectParallelDialRejectsAllCandidates(t *testing.T) {
 	}
 }
 
+func TestServerEgressRejectsLocalAndConfiguredCandidates(t *testing.T) {
+	base := &parallelDialRecorder{}
+	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
+		return publicDestination(destination)
+	}).(*guardedParallelOutbound)
+	policy := NewEgressPolicy(netip.MustParseAddr("11.2.3.4"))
+	policy.interfaces = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.IPv4(11, 9, 8, 7), Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	ctx := WithEgressPolicy(t.Context(), policy)
+	dst := M.Socksaddr{Fqdn: "fixture.example", Port: 443}
+	blocked := []netip.Addr{netip.MustParseAddr("::ffff:11.2.3.4"), netip.MustParseAddr("64:ff9b::b09:807")}
+	if conn, err := wrapped.DialParallelNetwork(ctx, "tcp", dst, blocked, nil, nil, nil, 0); err == nil {
+		conn.Close()
+		base.peer.Close()
+		t.Fatal("restricted address reached the fixture dialer")
+	}
+	if conn, _, err := wrapped.ListenSerialNetworkPacket(ctx, dst, blocked, nil, nil, nil, 0); err == nil {
+		conn.Close()
+		t.Fatal("restricted address reached the fixture packet socket")
+	}
+	if base.parallelCalls != 0 || len(base.packetAddresses) != 0 {
+		t.Fatal("restricted addresses should never be dialed")
+	}
+}
+
+func TestEgressPolicyCachesInterfaceLookups(t *testing.T) {
+	policy := NewEgressPolicy()
+	loads := 0
+	policy.interfaces = func() ([]net.Addr, error) {
+		loads++
+		return nil, nil
+	}
+	for range 20 {
+		if !policy.Allows(netip.MustParseAddr("11.0.0.80")) {
+			t.Fatal("the fixture's external address was blocked")
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("interface enumerations = %d, want 1", loads)
+	}
+}
+
+func TestServerEgressInterfaceUpdateInvalidatesCache(t *testing.T) {
+	address := netip.MustParseAddr("11.0.0.80")
+	policy := NewEgressPolicy()
+	now := time.Now()
+	policy.now = func() time.Time { return now }
+	var addresses []net.Addr
+	policy.interfaces = func() ([]net.Addr, error) { return addresses, nil }
+	if !policy.Allows(address) {
+		t.Fatal("initial nonlocal address was blocked")
+	}
+	addresses = []net.Addr{&net.IPAddr{IP: address.AsSlice()}}
+	out := &guardedOutbound{Outbound: new(dialRecorder), serverPolicy: policy, restrictPackets: true}
+	out.InterfaceUpdated(t.Context())
+	if policy.Allows(address) {
+		t.Fatal("interface update left the previous address snapshot in use")
+	}
+}
+
+func TestServerEgressFreshTCPKeepsUDPCached(t *testing.T) {
+	address := netip.MustParseAddr("11.0.0.80")
+	destination := M.SocksaddrFrom(address, 80)
+	policy := NewEgressPolicy()
+	now := time.Now()
+	policy.now = func() time.Time { return now }
+	var addresses []net.Addr
+	loads := 0
+	policy.interfaces = func() ([]net.Addr, error) {
+		loads++
+		return addresses, nil
+	}
+	base := new(parallelDialRecorder)
+	out := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
+		return publicDestination(destination)
+	}).(*guardedParallelOutbound)
+	out.routeCheck = func(context.Context, M.Socksaddr) error { return nil }
+	ctx := WithEgressPolicy(t.Context(), policy)
+	packets, err := out.ListenPacket(ctx, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses = []net.Addr{&net.IPAddr{IP: address.AsSlice()}}
+	payload := []byte("datagram")
+	if n, err := packets.WriteTo(payload, destination.UDPAddr()); n != len(payload) || err != nil {
+		t.Fatalf("UDP stopped using the cached snapshot: %d, %v", n, err)
+	}
+	if _, err := out.DialContext(ctx, "tcp", destination); !errors.Is(err, errPrivateDestination) || base.got.IsValid() {
+		t.Fatalf("TCP dial used the cached snapshot: %v", err)
+	}
+	external := netip.MustParseAddr("11.0.0.81")
+	name := M.Socksaddr{Fqdn: "fixture.example", Port: 80}
+	conn, err := out.DialParallelNetwork(ctx, "tcp", name, []netip.Addr{address, external}, nil, nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	base.peer.Close()
+	if !slices.Equal(base.parallelAddrs, []netip.Addr{external}) {
+		t.Fatalf("parallel TCP dial got %v, want %v", base.parallelAddrs, external)
+	}
+	if _, err := packets.WriteTo(payload, destination.UDPAddr()); err != nil || loads != 3 {
+		t.Fatalf("want one interface scan per TCP dial and one for UDP, got %d scans and %v", loads, err)
+	}
+	now = now.Add(egressRefreshInterval)
+	if _, err := packets.WriteTo(payload, destination.UDPAddr()); !errors.Is(err, errPrivateDestination) {
+		t.Fatalf("UDP missed the new address after cache expiry: %v", err)
+	}
+}
+
+func TestServerEgressPolicySurvivesRequestContextReplacement(t *testing.T) {
+	address := netip.MustParseAddr("11.0.0.81")
+	policy := NewEgressPolicy(address)
+	base := new(dialRecorder)
+	out := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
+		return publicDestination(destination)
+	}).(*guardedOutbound)
+	scope := adapter.NewScope(WithEgressPolicy(t.Context(), policy), nil)
+	defer scope.Close()
+	if err := out.Start(adapter.StartStateInitialize, scope); err != nil {
+		t.Fatal(err)
+	}
+	requestPolicy := NewEgressPolicy()
+	requestPolicy.interfaces = func() ([]net.Addr, error) { return nil, nil }
+	request := WithEgressPolicy(t.Context(), requestPolicy)
+	_, err := out.DialContext(request, "tcp", M.SocksaddrFrom(address, 443))
+	if !errors.Is(err, errPrivateDestination) || base.got.IsValid() {
+		t.Fatalf("outbound lost its startup policy when the request context changed: %v", err)
+	}
+}
+
+func TestEgressPolicyRefreshesAndFailsClosed(t *testing.T) {
+	policy := NewEgressPolicy()
+	now := time.Now()
+	policy.now = func() time.Time { return now }
+	destination := netip.MustParseAddr("11.0.0.80")
+	ifAddrs := []net.Addr{}
+	var loadErr error
+	policy.interfaces = func() ([]net.Addr, error) { return ifAddrs, loadErr }
+	if !policy.Allows(destination) {
+		t.Fatal("initial nonlocal address was blocked")
+	}
+	anycast := netip.MustParseAddr("11.0.0.82")
+	ifAddrs = []net.Addr{
+		&net.IPNet{IP: destination.AsSlice(), Mask: net.CIDRMask(32, 32)},
+		&net.IPAddr{IP: anycast.AsSlice()},
+	}
+	now = now.Add(egressRefreshInterval)
+	if policy.Allows(destination) || policy.Allows(anycast) {
+		t.Fatal("refreshed set missed a new interface address")
+	}
+	loadErr = errors.New("interface loader failed")
+	now = now.Add(egressRefreshInterval)
+	external := netip.MustParseAddr("11.0.0.81")
+	if policy.Allows(external) {
+		t.Fatal("a failed refresh allowed forwarding")
+	}
+	loadErr = nil
+	now = now.Add(egressRefreshInterval)
+	if !policy.Allows(external) {
+		t.Fatal("a successful refresh did not restore forwarding")
+	}
+}
+
 func TestGuardedDirectPacketSkipsUnroutableAddress(t *testing.T) {
 	v4 := netip.MustParseAddr("8.8.8.8")
 	v6 := netip.MustParseAddr("2001:4860:4860::8888")
@@ -202,7 +408,10 @@ func TestGuardedDirectPacketSkipsUnroutableAddress(t *testing.T) {
 		}
 		return nil
 	}
-	conn, destination, err := wrapped.ListenSerialNetworkPacket(t.Context(), M.Socksaddr{Fqdn: "example.com", Port: 53}, []netip.Addr{v4, v6}, nil, nil, nil, 0)
+	policy := NewEgressPolicy()
+	policy.interfaces = func() ([]net.Addr, error) { return nil, nil }
+	ctx := WithEgressPolicy(t.Context(), policy)
+	conn, destination, err := wrapped.ListenSerialNetworkPacket(ctx, M.Socksaddr{Fqdn: "example.com", Port: 53}, []netip.Addr{v4, v6}, nil, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

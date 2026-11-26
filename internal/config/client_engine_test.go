@@ -7,7 +7,12 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -137,5 +142,86 @@ func TestGeneratedClientHTTPSFakeIPAndExemptions(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDNSCIDRRuleOrderWithRecordedResolvers(t *testing.T) {
+	seen := make(chan string, 2)
+	fixture := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		var query mDNS.Msg
+		if err != nil || query.Unpack(data) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		seen <- r.URL.Path
+		reply, err := new(mDNS.Msg).SetReply(&query).Pack()
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(reply)
+	}))
+	defer fixture.Close()
+	host, rawPort, err := net.SplitHostPort(fixture.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "home.pipe-test.net"
+	direct := Rule{Field: "domain", Match: name, Action: "direct"}
+	cidr := Rule{Field: "ip_cidr", Match: "192.0.2.0/24", Action: "proxy"}
+	for _, tc := range []struct {
+		rules []Rule
+		want  string
+	}{{[]Rule{direct, cidr}, "/direct"}, {[]Rule{cidr, direct}, "/proxy"}} {
+		t.Run(tc.want, func(t *testing.T) {
+			prefs := Defaults()
+			prefs.TUN, prefs.Rules = true, tc.rules
+			opts, err := BuildClient(ClientOptions{Preferences: prefs, Profile: &link.Profile{Host: "origin.example"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The fixture uses loopback in a namespace without an uplink.
+			opts.Config["route"].(engine.Object)["auto_detect_interface"] = false
+			paths := map[string]string{domesticDoH: "/direct", "proxy-doh": "/proxy"}
+			for _, server := range opts.Config["dns"].(engine.Object)["servers"].([]engine.Object) {
+				if path, ok := paths[server["tag"].(string)]; ok {
+					server["server"], server["server_port"], server["path"] = host, port, path
+					server["tls"] = engine.Object{"enabled": true, "insecure": true}
+					delete(server, "detour")
+				}
+			}
+			ctx := service.ContextWithDefaultRegistry(t.Context())
+			instance, err := engine.New(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			router := service.FromContext[adapter.DNSRouter](ctx)
+			scope := adapter.NewScope(t.Context(), boxlog.NewNOPFactory().NewLogger("dns-order-fixture"))
+			defer scope.Close()
+			if err := router.Start(adapter.StartStateStart, scope); err != nil {
+				t.Fatal(err)
+			}
+			query := new(mDNS.Msg).SetQuestion(name+".", mDNS.TypeTXT)
+			queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if _, err := router.Exchange(queryCtx, query, adapter.DNSQueryOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case path := <-seen:
+				if path != tc.want {
+					t.Fatalf("TXT query reached %s, want %s", path, tc.want)
+				}
+			default:
+				t.Fatal("recording resolver saw no query")
+			}
+		})
 	}
 }

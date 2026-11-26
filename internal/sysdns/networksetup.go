@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 )
 
@@ -23,6 +24,7 @@ type serviceDNS struct {
 type macSnapshot struct {
 	Services []serviceDNS `json:"services"`
 	Global   []string     `json:"global,omitempty"`
+	Resolver string       `json:"resolver,omitempty"`
 }
 
 func (n Networksetup) run(name string, args ...string) (string, error) {
@@ -108,7 +110,7 @@ func (n Networksetup) Capture() (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	saved := macSnapshot{Services: make([]serviceDNS, 0, len(names))}
+	saved := macSnapshot{Services: make([]serviceDNS, 0, len(names)), Resolver: TUNDNSAddress}
 	for _, name := range names {
 		out, err := n.run("/usr/sbin/networksetup", "-getdnsservers", name)
 		if err != nil {
@@ -158,6 +160,8 @@ func (n Networksetup) Extend(raw json.RawMessage) (json.RawMessage, error) {
 	return json.Marshal(saved)
 }
 
+var errDNSServicesChanged = errors.New("network services changed while applying system DNS")
+
 func (n Networksetup) Apply(raw json.RawMessage) error {
 	var saved macSnapshot
 	if err := json.Unmarshal(raw, &saved); err != nil {
@@ -167,16 +171,27 @@ func (n Networksetup) Apply(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	active := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		active[name] = struct{}{}
-	}
+	known := make(map[string]struct{}, len(saved.Services))
 	for _, service := range saved.Services {
-		if _, ok := active[service.Name]; !ok {
-			continue
+		known[service.Name] = struct{}{}
+	}
+	for _, name := range names {
+		if _, ok := known[name]; !ok {
+			return fmt.Errorf("%w: %q", errDNSServicesChanged, name)
 		}
-		if _, err := n.run("/usr/sbin/networksetup", "-setdnsservers", service.Name, TUNDNSAddress); err != nil {
+	}
+	for _, name := range names {
+		if _, err := n.run("/usr/sbin/networksetup", "-setdnsservers", name, TUNDNSAddress); err != nil {
 			return err
+		}
+	}
+	after, err := n.services()
+	if err != nil {
+		return err
+	}
+	for _, name := range after {
+		if !slices.Contains(names, name) {
+			return fmt.Errorf("%w: %q", errDNSServicesChanged, name)
 		}
 	}
 	_ = flushDNS(n.run)
@@ -242,7 +257,11 @@ func (n Networksetup) RestoreIfApplied(raw json.RawMessage) (json.RawMessage, er
 			failures = append(failures, fmt.Errorf("%s: %w", service.Name, parseErr))
 			continue
 		}
-		if automatic || len(servers) != 1 || servers[0] != TUNDNSAddress {
+		if automatic || len(servers) != 1 {
+			continue
+		}
+		// Snapshots from older versions had no resolver marker.
+		if servers[0] != TUNDNSAddress && !(saved.Resolver == "" && servers[0] == "223.5.5.5") {
 			continue
 		}
 		if err := n.restoreService(service); err != nil {

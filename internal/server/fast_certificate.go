@@ -10,10 +10,12 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"time"
 
 	"pipe/internal/link"
+	"pipe/internal/localfile"
 )
 
 const fastCertRotation = 60 * 24 * time.Hour
@@ -95,4 +97,84 @@ func renewFastCertificate(dir string, now time.Time) (*tls.Certificate, error) {
 		}
 	}
 	return settings.fastKeyPair()
+}
+
+// FastCertificateRequest creates a CSR using the same key that existing
+// shared Fast links already pin.
+func FastCertificateRequest(dir string) ([]byte, error) {
+	s, err := ReadSettings(dir)
+	if err != nil {
+		return nil, err
+	}
+	if s.Mode != Shared {
+		return nil, errors.New("the server manages Fast certificates in standalone mode")
+	}
+	pair, err := s.fastKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{s.fastName()}}, pair.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
+}
+
+func chooseFastCertificate(path, name string, pinned, current *tls.Certificate, roots *x509.CertPool, now time.Time) (*tls.Certificate, error) {
+	public, err := readPublicFastCertificate(path, name, pinned, roots, now)
+	if err == nil {
+		return public, nil
+	}
+	if current != nil && verifyPublicFastCertificate(current, pinned, name, roots, now) == nil {
+		return current, err
+	}
+	return pinned, err
+}
+
+func readPublicFastCertificate(path, name string, pinned *tls.Certificate, roots *x509.CertPool, now time.Time) (*tls.Certificate, error) {
+	data, err := localfile.Read(path, localfile.MaxConfigBytes, false)
+	if err != nil {
+		return nil, err
+	}
+	var certificates [][]byte
+	var leaf *x509.Certificate
+	for data = bytes.TrimSpace(data); len(data) != 0; data = bytes.TrimSpace(data) {
+		block, rest := pem.Decode(data)
+		if block == nil || block.Type != "CERTIFICATE" || !bytes.HasPrefix(data, []byte("-----BEGIN CERTIFICATE-----")) {
+			return nil, errors.New("invalid Fast certificate chain PEM")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, errors.New("invalid Fast certificate")
+		}
+		if leaf == nil {
+			leaf = cert
+		}
+		certificates = append(certificates, block.Bytes)
+		data = rest
+	}
+	pair := &tls.Certificate{Certificate: certificates, Leaf: leaf, PrivateKey: pinned.PrivateKey}
+	if err := verifyPublicFastCertificate(pair, pinned, name, roots, now); err != nil {
+		return nil, err
+	}
+	return pair, nil
+}
+
+func verifyPublicFastCertificate(pair, pinned *tls.Certificate, name string, roots *x509.CertPool, now time.Time) error {
+	if pair.Leaf == nil || !bytes.Equal(pair.Leaf.RawSubjectPublicKeyInfo, pinned.Leaf.RawSubjectPublicKeyInfo) {
+		return errors.New("Fast certificate must use the existing pinned key")
+	}
+	if err := checkFastSAN(pair.Leaf, name); err != nil {
+		return err
+	}
+	chain := x509.NewCertPool()
+	for _, der := range pair.Certificate[1:] {
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return err
+		}
+		chain.AddCert(cert)
+	}
+	_, err := pair.Leaf.Verify(x509.VerifyOptions{DNSName: name, Roots: roots, Intermediates: chain, CurrentTime: now})
+	return err
 }

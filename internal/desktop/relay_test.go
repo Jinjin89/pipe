@@ -309,7 +309,7 @@ func profileRelayTestServer(t *testing.T) (*Server, *fakeCtl, *fakeHelper, func(
 	handler := s.Handler()
 	return s, ctl, helperCtl, func(method, path, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, "http://"+serverHost+path, strings.NewReader(body))
-		r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Origin", "http://"+serverHost)
 		r.Header.Set("X-Pipe-CSRF", "1")
 		w := httptest.NewRecorder()

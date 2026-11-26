@@ -10,12 +10,15 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"pipe/internal/engine"
 	"pipe/internal/link"
+	"pipe/internal/sysdns"
+	"pipe/internal/update"
 )
 
 func sampleProfile(t *testing.T) (string, link.Profile) {
@@ -187,7 +190,7 @@ func TestMobileSessionUsesLiveLANDNSServers(t *testing.T) {
 	platform := &fakePlatform{
 		statuses: make(chan string, 32),
 		network: `{"defaultInterface":"wlan0","interfaces":[{"name":"wlan0","dns":[
-			"fe80::53%wlan0","192.168.1.1","invalid","172.19.0.1","223.5.5.5"]}]}`,
+			"fe80::53%wlan0","192.168.1.1","invalid","172.19.0.1","` + sysdns.TUNDNSAddress + `"]}]}`,
 	}
 	var instances []*fakeEngine
 	b := bridge{newEngine: func(_ context.Context, opts engine.Options) (clientEngine, error) {
@@ -273,6 +276,43 @@ func TestTestOptionsAreBuildGated(t *testing.T) {
 			t.Fatal("release build parsed the test block")
 		}
 	}
+}
+
+func TestVPNStartCancelsPreviouslySelectedDirectUpdate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		profile, _ := sampleProfile(t)
+		platform := &fakePlatform{statuses: make(chan string, 16)}
+		b := &bridge{}
+		// An unsupported ABI keeps the fixture offline even on regression.
+		u := b.newUpdates(t.TempDir(), "fixture")
+		defer u.manager.Close()
+		u.CancelDirect()
+		selected, continueCheck := make(chan struct{}), make(chan struct{})
+		resumeCheck := sync.OnceFunc(func() { close(continueCheck) })
+		defer resumeCheck()
+		u.manager.CheckWithRoute(func() update.Route {
+			route := b.updateRoute(false)
+			close(selected)
+			<-continueCheck
+			return route
+		}, false)
+		<-selected
+		b.newEngine = func(_ context.Context, opts engine.Options) (clientEngine, error) {
+			resumeCheck()
+			synctest.Wait()
+			if st := u.manager.Status(); st.State != "error" || st.Error != "The update was cancelled." || st.CheckedAt != nil {
+				t.Errorf("selected direct update survived VPN startup: %+v", st)
+			}
+			return &fakeEngine{options: opts}, nil
+		}
+		if err := b.start(profile, `{}`, platform); err != nil {
+			t.Fatal(err)
+		}
+		defer b.stop()
+		if b.starting {
+			t.Fatal("VPN still reports startup after Start returned")
+		}
+	})
 }
 
 func TestVPNLifecycleWithFakePlatform(t *testing.T) {
@@ -410,8 +450,8 @@ func TestVPNReplacesTunnelBeforeClosingPreviousEngine(t *testing.T) {
 		"start original", "establish original",
 		"start rejected", "close rejected",
 		"start broken", "establish broken", "close broken",
-		"start restored", "establish restored", "close original", "release broken",
-		"start replacement", "establish replacement", "close restored", "release replacement",
+		"start restored", "establish restored", "close original", "release original", "release broken",
+		"start replacement", "establish replacement", "close restored", "release restored",
 	}
 	if !slices.Equal(events, want) || b.active.client.IPv6 || b.active.apps.Mode != "only" ||
 		testStatus(t, b.statusJSON()).Mode != "direct" {
@@ -419,7 +459,7 @@ func TestVPNReplacesTunnelBeforeClosingPreviousEngine(t *testing.T) {
 	}
 }
 
-func TestVPNFailedRollbackReleasesHeldTunnel(t *testing.T) {
+func TestVPNFailedRollbackHoldsTunnelUntilExplicitStop(t *testing.T) {
 	raw, _ := sampleProfile(t)
 	platform := &fakePlatform{statuses: make(chan string, 32)}
 	var opened, released int
@@ -445,7 +485,11 @@ func TestVPNFailedRollbackReleasesHeldTunnel(t *testing.T) {
 				}
 				return nil
 			},
-			onReleaseTun: func() { released++ },
+			onReleaseTun: func() {
+				if attempt == 2 {
+					released++
+				}
+			},
 		}, nil
 	}}
 	defer b.stop()
@@ -454,8 +498,12 @@ func TestVPNFailedRollbackReleasesHeldTunnel(t *testing.T) {
 	}
 	err := b.setMode("global")
 	status := testStatus(t, b.statusJSON())
-	if err == nil || status.Running || status.LastError == "" || opened != 2 || released != 1 {
-		t.Fatalf("failed rollback did not stop and release its TUN: status=%+v, opened=%d, released=%d", status, opened, released)
+	if err == nil || status.Running || !status.Blocked || status.LastError == "" || opened != 2 || released != 0 {
+		t.Fatalf("failed rollback did not retain protection: status=%+v, opened=%d, released=%d", status, opened, released)
+	}
+	b.stop()
+	if released != 1 || testStatus(t, b.statusJSON()).Blocked {
+		t.Fatalf("explicit Stop did not release the retained TUN: %d releases", released)
 	}
 }
 
@@ -595,4 +643,9 @@ func (e *fakeEngine) ProbeLatency(ctx context.Context, tier string, burst bool) 
 	}
 	stalled, err := e.Probe(ctx, tier, burst)
 	return stalled, 7 * time.Millisecond, false, err
+}
+
+func (e *fakeEngine) MeasureRTT(ctx context.Context, tier string) (time.Duration, bool, error) {
+	_, latency, via, err := e.ProbeLatency(ctx, tier, false)
+	return latency, via, err
 }

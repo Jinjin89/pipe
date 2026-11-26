@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.pipe.fixture">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <application android:debuggable="true" android:label="Pipe clipboard fixture">
+        <activity android:name=".ClipboardActivity" android:exported="true" />
+    </application>
+</manifest>

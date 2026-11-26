@@ -5,6 +5,7 @@ go 1.27.4
 require (
 	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6
 	github.com/ebitengine/purego v0.10.0
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/libdns/alidns v1.0.6
 	github.com/libdns/cloudflare v0.2.2
 	github.com/libdns/libdns v1.1.1
@@ -63,7 +64,6 @@ require (
 	github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
-	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/gofrs/uuid/v5 v5.5.1 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect

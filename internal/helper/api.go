@@ -101,4 +101,5 @@ type TestProfileParams struct {
 	Relay           string `json:"relay,omitempty"`
 	IPv6            bool   `json:"ipv6"`
 	SkipExitCountry bool   `json:"skipExitCountry,omitempty"`
+	PreferLive      bool   `json:"preferLive,omitempty"`
 }

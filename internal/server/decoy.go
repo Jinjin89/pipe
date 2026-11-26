@@ -23,46 +23,74 @@ import (
 )
 
 type decoySite struct {
-	main http.Handler
+	main   http.Handler
+	static *staticCover
 	http.Handler
+}
+
+func (s *decoySite) Close() {
+	if s.static != nil {
+		s.static.dir.Close()
+	}
 }
 
 func makeDecoy(settings Settings, options RunOptions, authenticate func(context.Context, string) bool) (*decoySite, error) {
 	var main, rescue http.Handler
+	var static *staticCover
 	www, upstream := options.WWW, options.WebUpstream
 	switch {
 	case www != "" && upstream != "":
 		return nil, errors.New("choose either --www or --web-upstream")
 	case www != "":
-		info, err := os.Stat(www)
+		opened, err := directoryCover(www)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(errors.New("open --www directory"), err)
 		}
-		if !info.IsDir() {
-			return nil, errors.New("--www must point to a directory")
-		}
-		main = http.FileServer(http.Dir(www))
+		main, static = opened, opened
 	case upstream != "":
 		target, err := url.Parse(upstream)
 		if err != nil || target.Host == "" || target.User != nil || target.Fragment != "" ||
 			(target.Scheme != "http" && target.Scheme != "https") {
 			return nil, errors.New("--web-upstream requires an HTTP or HTTPS URL without credentials or a fragment")
 		}
-		main = reverseProxy(target)
+		proxy := reverseProxy(target)
+		rewrite := proxy.Rewrite
+		proxy.Rewrite = func(r *httputil.ProxyRequest) {
+			rewrite(r)
+			r.Out.Header.Del(engine.WebSocketEarlyDataHeader)
+			r.Out.Header.Del("Hysteria-CC-RX")
+			r.Out.Header.Del("Hysteria-Padding")
+		}
+		main = proxy
 	default:
 		page, err := generateCoverSite(settings.RealityPrivateKey, mainCoverLabel)
 		if err != nil {
 			return nil, err
 		}
 		main = page
-		if settings.CDNDomain != "" {
-			page, err := generateCoverSite(settings.RealityPrivateKey, rescueCoverLabel)
-			if err != nil {
-				return nil, err
-			}
-			rescue = page
-		}
 	}
+	if settings.CDNDomain != "" {
+		page, err := generateCoverSite(settings.RealityPrivateKey, rescueCoverLabel)
+		if err != nil {
+			if static != nil {
+				static.dir.Close()
+			}
+			return nil, err
+		}
+		rescue = page
+	}
+	cover := main
+	main = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Failed Fast authentication falls through to this HTTP handler.
+		// Keep its credential and the reserved Rescue path at this origin.
+		if len(r.Header.Values("Hysteria-Auth")) != 0 ||
+			(r.Method == http.MethodPost && r.URL.Path == "/auth" && equalDNS(requestHost(r.Host), "hysteria")) ||
+			(settings.CDNDomain != "" && r.URL.Path == settings.WSPath) {
+			http.NotFound(w, r)
+			return
+		}
+		cover.ServeHTTP(w, r)
+	})
 	serveSite := func(w http.ResponseWriter, r *http.Request) {
 		if rescue != nil && r.TLS != nil && equalDNS(r.TLS.ServerName, settings.CDNDomain) {
 			rescue.ServeHTTP(w, r)
@@ -77,7 +105,7 @@ func makeDecoy(settings Settings, options RunOptions, authenticate func(context.
 				!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
 				(options.CFOriginCA != "" && len(r.TLS.VerifiedChains) == 0) ||
 				authenticate == nil || !authenticate(r.Context(), r.Header.Get(engine.WebSocketEarlyDataHeader)) {
-				serveSite(w, r)
+				http.NotFound(w, r)
 				return
 			}
 			ws.ServeHTTP(w, r)
@@ -85,7 +113,21 @@ func makeDecoy(settings Settings, options RunOptions, authenticate func(context.
 		}
 		serveSite(w, r)
 	})
-	return &decoySite{main: main, Handler: handler}, nil
+	return &decoySite{main: main, static: static, Handler: handler}, nil
+}
+
+type staticCover struct {
+	dir *os.Root
+	http.Handler
+}
+
+// directoryCover confines lookup, including symlinks, to the original root.
+func directoryCover(path string) (*staticCover, error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	return &staticCover{dir: root, Handler: http.FileServerFS(root.FS())}, nil
 }
 
 // webUpstreamWarning explains the cost of a public --web-upstream. Standalone

@@ -3,11 +3,30 @@
 package desktop
 
 import (
+	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
+
+func bootstrapURL(path string) string {
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return (&url.URL{Scheme: "file", Path: path}).String()
+}
+
+func browserBootstrapDir() (string, error) {
+	// Confined Linux browsers can see ordinary files in the user's home.
+	if runtime.GOOS == "linux" {
+		return os.UserHomeDir()
+	}
+	return os.TempDir(), nil
+}
 
 // browserCandidates lists Chromium-family executables in preference order.
 func browserCandidates(goos string, getenv func(string) string) (paths []string, names []string) {
@@ -86,21 +105,44 @@ func startWindow(url, profileDir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// openDefaultBrowser opens url in the user's default browser.
-func openDefaultBrowser(url string) error {
+// openDefaultBrowser reports whether the portal is handling the bootstrap.
+func openDefaultBrowser(path string) (bool, error) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", bootstrapURL(path))
 	case "darwin":
-		cmd = exec.Command("open", url)
+		cmd = exec.Command("open", path)
+	case "linux":
+		if err := openBootstrapPortal(path); err == nil {
+			return true, nil
+		}
+		return false, openLinuxBrowser(path)
 	default:
-		cmd = exec.Command("xdg-open", url)
+		cmd = exec.Command("xdg-open", path)
 	}
 	configureWindowCmd(cmd)
 	if err := cmd.Start(); err != nil {
-		return err
+		return false, err
 	}
 	go cmd.Wait()
+	return false, nil
+}
+
+func openLinuxBrowser(path string) error {
+	cmd := exec.Command("xdg-open", path)
+	if err := cmd.Start(); err != nil {
+		fallback := exec.Command("gio", "open", path)
+		if fallbackErr := fallback.Start(); fallbackErr != nil {
+			return errors.Join(err, fallbackErr)
+		}
+		go fallback.Wait()
+		return nil
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			_ = exec.Command("gio", "open", path).Run()
+		}
+	}()
 	return nil
 }

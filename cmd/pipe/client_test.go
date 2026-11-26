@@ -20,6 +20,7 @@ import (
 	"pipe/internal/config"
 	"pipe/internal/failover"
 	"pipe/internal/link"
+	"pipe/internal/localfile"
 )
 
 func TestRunClientOptions(t *testing.T) {
@@ -32,7 +33,7 @@ func TestRunClientOptions(t *testing.T) {
 	}
 	write := func(name, body string) string {
 		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		if err := localfile.WritePrivate(path, []byte(body)); err != nil {
 			t.Fatal(err)
 		}
 		return path
@@ -49,6 +50,9 @@ func TestRunClientOptions(t *testing.T) {
 		args []string
 		want clientctl.Options
 	}{
+		{"protected link file", []string{"--link-file", filepath.Join(dir, "laptop.link")},
+			clientctl.Options{Profile: profile, Mode: config.Smart, IPv6: true, Tier: failover.Auto,
+				Listen: config.DefaultListen, LogLevel: "warn"}},
 		{"link and flags", []string{"--mode", "global", raw, "--listen", "[::1]:9876", "--system-proxy",
 			"--tier", "rescue", "--relay", "relay.example", "--log", "debug", "--test-ca", dir, "--test-address", "10.20.30.40",
 			"--test-hosts", "EXAMPLE.COM.=::ffff:192.0.2.1", "--test-hosts", "example.net=2001:db8::1"},
@@ -89,6 +93,30 @@ func TestRunClientOptions(t *testing.T) {
 	}
 }
 
+func TestClientReadsLinkFromStdin(t *testing.T) {
+	profile := link.Profile{Host: "origin.example", Name: "laptop", Seed: [32]byte{1}, PublicKey: [32]byte{2}}
+	raw, err := profile.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(path, []byte(raw+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	stdin := os.Stdin
+	os.Stdin = in
+	t.Cleanup(func() { os.Stdin = stdin })
+	got, err := parseClientOptions([]string{"-"})
+	if err != nil || got.Profile != profile {
+		t.Fatalf("stdin link read failed: %v", err)
+	}
+}
+
 func TestRunClientPrintsRelayChanges(t *testing.T) {
 	var stderr bytes.Buffer
 	report := printRelayChanges(&stderr)
@@ -125,6 +153,13 @@ func TestRunClientReportsFlagErrors(t *testing.T) {
 				t.Fatalf("got %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunClientRequiresPathForPrivateACLMigration(t *testing.T) {
+	err := runClient(t.Context(), []string{"--migrate-private"})
+	if err == nil || err.Error() != "--migrate-private requires a file path" {
+		t.Fatalf("migration argument error: %v", err)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"pipe/internal/failover"
 	"pipe/internal/link"
 	"pipe/internal/logring"
+	"pipe/internal/sysdns"
 )
 
 const (
@@ -63,15 +64,14 @@ func (o Options) UsesProxy() bool {
 // Settings configure reporting for the controller's lifetime.
 // Callbacks must not call lifecycle methods on the controller.
 type Settings struct {
-	Logs              *logring.Ring
-	EngineLogOutput   io.Writer
-	OnTier            func(failover.Tier)
-	OnRelayStatus     func(host, state string) // status tick for a configured relay
-	OnTUNIPv6Fallback func()
-	OnFailoverError   func(error)
-	RawErrors         bool // keep underlying engine errors in results and status
-	SkipConnectProbe  bool
-	MaxRules          int // zero leaves the limit to the caller
+	Logs             *logring.Ring
+	EngineLogOutput  io.Writer
+	OnTier           func(failover.Tier)
+	OnRelayStatus    func(host, state string) // status tick for a configured relay
+	OnFailoverError  func(error)
+	RawErrors        bool // keep underlying engine errors in results and status
+	SkipConnectProbe bool
+	MaxRules         int // zero leaves the limit to the caller
 }
 
 type RouteLatency struct {
@@ -82,7 +82,8 @@ type RouteLatency struct {
 }
 
 type Status struct {
-	State           string                  `json:"state"` // off|connecting|on|error
+	State           string                  `json:"state"`             // off|connecting|on|error
+	Guarded         bool                    `json:"guarded,omitempty"` // the drop-only TUN device holds capture
 	Profile         string                  `json:"profile"`
 	Server          string                  `json:"server"` // host only
 	Relay           string                  `json:"relay"`
@@ -92,6 +93,7 @@ type Status struct {
 	Tier            string                  `json:"tier"` // active route: fast|stealth|rescue|direct|""
 	RescueAvailable bool                    `json:"rescueAvailable"`
 	IPv6Available   *bool                   `json:"ipv6Available"` // the network has IPv6; null when off
+	TUNIPv6         bool                    `json:"tunIPv6"`       // the active TUN has IPv6 capture configured
 	LatencyMs       *int64                  `json:"latencyMs"`     // null until measured
 	Routes          map[string]RouteLatency `json:"routes"`
 	Listen          string                  `json:"listen"`
@@ -123,6 +125,11 @@ type Controller struct {
 
 	mu      sync.Mutex // serializes lifecycle operations
 	current *session
+	ready   func() error // readiness callback (e.g. macOS DNS check) retained across rebuilds
+	// The guard is held across a TUN rebuild and can outlive both engines.
+	startTUNGuard func() (io.Closer, error)
+	tunGuard      io.Closer
+	releaseDNS    func()
 	// networkIPv6 reports whether the network offers IPv6 (engine.NetworkIPv6).
 	networkIPv6 func() bool
 	ipv6Seen    int8          // last networkIPv6 result: 0 unknown, 1 yes, -1 no
@@ -149,10 +156,11 @@ func NewWithSettings(settings Settings) *Controller {
 		newEngine: func(ctx context.Context, options engine.Options) (engineAPI, error) {
 			return engine.New(ctx, options)
 		},
-		fakeIP:      &engine.FakeIP{},
-		networkIPv6: engine.NetworkIPv6,
-		ipv6Every:   IPv6WatchInterval,
-		status:      Status{State: StateOff, Routes: map[string]RouteLatency{}},
+		startTUNGuard: startTUNGuard,
+		fakeIP:        &engine.FakeIP{},
+		networkIPv6:   engine.NetworkIPv6,
+		ipv6Every:     IPv6WatchInterval,
+		status:        Status{State: StateOff, Routes: map[string]RouteLatency{}},
 	}
 }
 
@@ -172,7 +180,7 @@ func (c *Controller) SetOnStopped(callback func()) {
 }
 
 func (c *Controller) notifyStopped() {
-	if c.current == nil && c.OnStopped != nil {
+	if c.current == nil && c.tunGuard == nil && c.OnStopped != nil {
 		c.OnStopped()
 	}
 }
@@ -334,15 +342,19 @@ func (c *Controller) StartWithReady(opts Options, ready func() error) error {
 	if err != nil {
 		return err
 	}
+	if err := c.protectReplacement(); err != nil {
+		return err
+	}
 	hadSession := c.current != nil
+	c.ready = ready
 	c.closeCurrent()
 	c.stateMu.Lock()
-	c.status = Status{State: StateOff, Routes: map[string]RouteLatency{}}
+	c.status = Status{State: StateOff, Guarded: c.tunGuard != nil, Routes: map[string]RouteLatency{}}
 	c.stateMu.Unlock()
 	now := time.Now()
 	err = c.launch(opts, &now, 0, 0, "", ready)
-	if err != nil && hadSession {
-		c.notifyStopped()
+	if err != nil && (hadSession || c.tunGuard != nil) {
+		return c.failedRebuild(err, nil)
 	}
 	return err
 }
@@ -358,7 +370,11 @@ func (c *Controller) launch(opts Options, since *time.Time, up, down int64, prev
 	c.status.Mode, c.status.TierPreference = opts.Mode, string(opts.Tier)
 	c.status.Tier, c.status.RescueAvailable = "", opts.Profile.CDN != ""
 	c.status.IPv6Available = nil
+	c.status.TUNIPv6 = false
 	c.status.Listen = opts.Listen
+	if opts.TUN && opts.TUNOnly {
+		c.status.Listen = ""
+	}
 	c.status.LatencyMs, c.status.LastError = nil, ""
 	c.status.Routes = map[string]RouteLatency{}
 	c.stateMu.Unlock()
@@ -373,6 +389,9 @@ func (c *Controller) launch(opts Options, since *time.Time, up, down int64, prev
 			return err
 		}
 	}
+	if err := c.releaseTUNGuard(); err != nil {
+		c.event(logring.Warn, "Could not clean up TUN protection: %s", err)
+	}
 	s.up.Store(up)
 	s.down.Store(down)
 	c.current = s
@@ -385,6 +404,7 @@ func (c *Controller) launch(opts Options, since *time.Time, up, down int64, prev
 	c.status.ConnectedSince = since
 	netIPv6 := s.netIPv6
 	c.status.IPv6Available = &netIPv6
+	c.status.TUNIPv6 = opts.TUN
 	c.stateMu.Unlock()
 	c.reportTier(previousTier, tier)
 	c.resumeAuto(s)
@@ -400,35 +420,20 @@ func (c *Controller) launch(opts Options, since *time.Time, up, down int64, prev
 	return nil
 }
 
-// build starts an engine for opts. The TUN carries IPv6 exactly when the
-// network has it (see config.ClientOptions.TUNIPv6); if the OS refuses the
-// TUN an IPv6 address, Pipe runs IPv4-only rather than not at all.
+// build configures both TUN address families so newly acquired IPv6 cannot
+// bypass an active IPv4 session while the interface monitor catches up.
 func (c *Controller) build(opts Options) (*session, error) {
 	netIPv6 := c.checkIPv6()
-	s, err := c.buildFor(opts, netIPv6, netIPv6)
-	if err != nil && netIPv6 && opts.TUN {
-		if fallback, fallbackErr := c.buildFor(opts, true, false); fallbackErr == nil {
-			// Running without the TUN's IPv6 beats not running; IPv6 to raw
-			// addresses may then bypass Pipe until the next rebuild.
-			c.event(logring.Warn, "The TUN couldn't get an IPv6 address; Pipe uses IPv4, and some IPv6 traffic may bypass Pipe.")
-			if c.settings.OnTUNIPv6Fallback != nil {
-				c.settings.OnTUNIPv6Fallback()
-			}
-			return fallback, nil
-		}
-	}
-	return s, err
+	return c.buildFor(opts, netIPv6)
 }
 
-func (c *Controller) buildFor(opts Options, netIPv6, tunIPv6 bool) (*session, error) {
-	// Pipe itself uses IPv6 only where the network, and in TUN mode the TUN,
-	// can carry it.
-	useIPv6 := opts.IPv6 && netIPv6 && (tunIPv6 || !opts.TUN)
+func (c *Controller) buildFor(opts Options, netIPv6 bool) (*session, error) {
+	useIPv6 := opts.IPv6 && netIPv6
 	client := config.ClientOptions{
 		Preferences: config.Preferences{Mode: opts.Mode, IPv6: useIPv6, Rules: opts.Rules, TUN: opts.TUN},
 		Relay:       opts.Relay,
 		Listen:      opts.Listen, Tier: opts.Tier, LogLevel: opts.LogLevel, SystemProxy: opts.SystemProxy,
-		TUNListen: !opts.TUNOnly, TUNIPv6: tunIPv6,
+		TUNListen: !opts.TUNOnly, TUNIPv6: opts.TUN,
 		TestCAFile: opts.TestCAFile, TestAddress: opts.TestAddress, TestHosts: opts.TestHosts,
 	}
 	if opts.Profile.Host != "" {
@@ -557,7 +562,12 @@ func (c *Controller) followIPv6(s *session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.current == s && c.networkIPv6() != s.netIPv6 {
-		_ = c.replace(s.current())
+		next := s.current()
+		var ready func() error
+		if next.TUN {
+			ready = c.ready
+		}
+		_ = c.replace(next, ready)
 	}
 }
 
@@ -635,14 +645,20 @@ func portOf(listen string) string {
 func (c *Controller) Stop() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.ready = nil
 	if c.current == nil {
 		c.stateMu.Lock()
 		if c.status.State == StateError {
 			c.status.State, c.status.LastError = StateOff, ""
 			c.status.Relay = ""
+			c.status.TUNIPv6 = false
 		}
 		c.stateMu.Unlock()
-		return nil
+		err := c.releaseTUNGuard()
+		if err != nil && !c.settings.RawErrors {
+			return errors.New("Pipe stopped, but TUN protection reported a cleanup error.")
+		}
+		return err
 	}
 	s := c.current
 	c.current = nil
@@ -655,9 +671,10 @@ func (c *Controller) Stop() error {
 	c.status.UpRate, c.status.DownRate = 0, 0
 	c.status.ProxyUpRate, c.status.ProxyDownRate = 0, 0
 	c.status.ConnectedSince, c.status.LatencyMs, c.status.IPv6Available = nil, nil, nil
+	c.status.TUNIPv6 = false
 	c.status.Routes = map[string]RouteLatency{}
 	c.stateMu.Unlock()
-	err := s.close()
+	err := errors.Join(s.close(), c.releaseTUNGuard())
 	c.event(logring.Info, "Disconnected")
 	if err != nil && !c.settings.RawErrors {
 		return errors.New("Pipe stopped, but shutdown reported an error.")
@@ -678,7 +695,11 @@ func (c *Controller) SetMode(mode string) error {
 	}
 	next := c.current.current()
 	next.Mode = mode
-	return c.replace(next)
+	var ready func() error
+	if next.TUN {
+		ready = c.ready
+	}
+	return c.replace(next, ready)
 }
 
 // SetTier switches the route preference. The engine is not rebuilt. When off
@@ -747,11 +768,22 @@ func latencyFor(routes map[string]RouteLatency, tier string) *int64 {
 // Apply re-applies options to the running session: rules, IPv6, listen
 // address, log level, mode and route. Nothing happens when off.
 func (c *Controller) Apply(opts Options) error {
+	return c.ApplyWithReady(opts, nil)
+}
+
+// ApplyWithReady checks readiness before releasing protection on a rebuild or
+// rollback. The callback must not call lifecycle methods.
+func (c *Controller) ApplyWithReady(opts Options, ready func() error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := c.current
 	if s == nil {
 		return nil
+	}
+	if ready == nil && opts.TUN {
+		ready = c.ready
+	} else if ready != nil {
+		c.ready = ready
 	}
 	opts, err := c.normalize(opts)
 	if err != nil {
@@ -764,32 +796,98 @@ func (c *Controller) Apply(opts Options) error {
 		opts.TUN != old.TUN || opts.TUNOnly != old.TUNOnly || opts.SystemProxy != old.SystemProxy ||
 		opts.RulesInDirect != old.RulesInDirect || opts.TestCAFile != old.TestCAFile ||
 		opts.TestAddress != old.TestAddress || !maps.Equal(opts.TestHosts, old.TestHosts) {
-		return c.replace(opts)
+		return c.replace(opts, ready)
 	}
-	return c.setTier(s, opts.Tier)
+	if err := c.setTier(s, opts.Tier); err != nil {
+		return err
+	}
+	if ready != nil {
+		return ready()
+	}
+	return nil
 }
 
 // replace rebuilds the session, keeping the byte totals and connect time. If
 // the new session fails it tries to bring the previous one back.
-func (c *Controller) replace(next Options) error {
+func (c *Controller) replace(next Options, ready func() error) error {
 	previous := c.current
 	prevOpts := previous.current()
+	if err := c.protectReplacement(); err != nil {
+		return err
+	}
 	c.stateMu.Lock()
 	since := c.status.ConnectedSince
 	c.stateMu.Unlock()
 	up, down := previous.up.Load(), previous.down.Load()
 	c.closeCurrent()
 	tier := c.activeTier()
-	err := c.launch(next, since, up, down, tier, nil)
+	err := c.launch(next, since, up, down, tier, ready)
 	if err == nil {
 		return nil
 	}
 	failure := c.Status().LastError
-	if rollback := c.launch(prevOpts, since, up, down, tier, nil); rollback != nil {
+	if rollback := c.launch(prevOpts, since, up, down, tier, ready); rollback != nil {
+		return c.failedRebuild(err, rollback)
+	}
+	c.update(c.current, func(st *Status) { st.LastError = failure })
+	return err
+}
+
+func (c *Controller) protectReplacement() error {
+	if c.current == nil || !c.current.opts.TUN || c.tunGuard != nil {
+		return nil
+	}
+	releaseDNS := sysdns.HoldRestore()
+	guard, err := c.startTUNGuard()
+	if err != nil {
+		releaseDNS()
+		message := "Pipe couldn't protect traffic during the TUN rebuild."
+		if c.settings.RawErrors {
+			err = fmt.Errorf("%s %w", message, err)
+		} else {
+			err = errors.New(message)
+		}
+		c.update(c.current, func(st *Status) { st.LastError = err.Error() })
+		return err
+	}
+	c.tunGuard, c.releaseDNS = guard, releaseDNS
+	c.stateMu.Lock()
+	c.status.Guarded = true
+	c.stateMu.Unlock()
+	return nil
+}
+
+func (c *Controller) releaseTUNGuard() error {
+	if c.tunGuard == nil {
+		return nil
+	}
+	err := c.tunGuard.Close()
+	c.tunGuard = nil
+	c.releaseDNS()
+	c.releaseDNS = nil
+	c.stateMu.Lock()
+	c.status.Guarded = false
+	c.stateMu.Unlock()
+	return err
+}
+
+func (c *Controller) failedRebuild(err, rollback error) error {
+	if c.tunGuard == nil {
 		c.notifyStopped()
 		return err
 	}
-	c.update(c.current, func(st *Status) { st.LastError = failure })
+	message := "Pipe couldn't restore the TUN connection. Network traffic is paused. Reconnect or disconnect to continue."
+	if c.settings.RawErrors {
+		err = fmt.Errorf("%s %w", message, errors.Join(err, rollback))
+	} else {
+		err = errors.New(message)
+	}
+	c.stateMu.Lock()
+	c.status.LastError = err.Error()
+	c.status.UpRate, c.status.DownRate = 0, 0
+	c.status.TUNIPv6 = true
+	c.stateMu.Unlock()
+	c.event(logring.Error, "%s", err)
 	return err
 }
 

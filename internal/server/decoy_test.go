@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -105,8 +104,8 @@ func TestWebServerDiscardsErrorLog(t *testing.T) {
 	}
 }
 
-func TestDecoyServesUpstream404ForUnauthorizedRescue(t *testing.T) {
-	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example", WSPath: "/ws/private"}
+func TestDecoySeparatesRescueFromCustomBackend(t *testing.T) {
+	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example", WSPath: "/ws/private", RealityPrivateKey: testCoverKey(1)}
 	var paths []string
 	original := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = original })
@@ -122,20 +121,71 @@ func TestDecoyServesUpstream404ForUnauthorizedRescue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := func(path string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "https://"+settings.CDNDomain+path, nil)
-		req.Header.Set("Connection", "Upgrade")
-		req.Header.Set("Upgrade", "websocket")
+	request := func(host, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "https://"+host+path, nil)
 		w := httptest.NewRecorder()
 		decoy.ServeHTTP(w, req)
 		return w
 	}
-	ordinary, rescue := request("/missing"), request(settings.WSPath)
-	if ordinary.Code != http.StatusNotFound || rescue.Code != ordinary.Code ||
-		rescue.Body.String() != ordinary.Body.String() || !reflect.DeepEqual(rescue.Header(), ordinary.Header()) ||
-		!slices.Equal(paths, []string{"/missing", settings.WSPath}) {
-		t.Fatalf("expected both paths to use the same upstream 404, got %d %q and %d %q via %v",
-			ordinary.Code, ordinary.Body.String(), rescue.Code, rescue.Body.String(), paths)
+	ordinary := request(settings.Domain, "/missing")
+	rescue := request(settings.CDNDomain, "/")
+	rejected := request(settings.Domain, settings.WSPath)
+	if ordinary.Code != http.StatusNotFound || ordinary.Header().Get("X-Custom-Page") != "missing" ||
+		rescue.Code != http.StatusOK || rejected.Code != http.StatusNotFound ||
+		!slices.Equal(paths, []string{"/missing"}) {
+		t.Fatalf("ordinary status %d, Rescue cover %d, rejected status %d, upstream paths %v",
+			ordinary.Code, rescue.Code, rejected.Code, paths)
+	}
+}
+
+func TestStaticCoversConfineFilesToDocumentRoot(t *testing.T) {
+	parent := t.TempDir()
+	www := filepath.Join(parent, "www")
+	must(t, os.Mkdir(www, 0700))
+	must(t, os.WriteFile(filepath.Join(parent, "outside.txt"), []byte("outside fixture"), 0600))
+	must(t, os.WriteFile(filepath.Join(www, "inside.txt"), []byte("inside fixture"), 0600))
+	if err := os.Symlink("../outside.txt", filepath.Join(www, "alias.txt")); err != nil {
+		t.Skipf("fixture symlinks unavailable: %v", err)
+	}
+	main, err := makeDecoy(Settings{}, RunOptions{WWW: www}, nil)
+	must(t, err)
+	defer main.Close()
+	proxy, err := proxyCover(www, http.NotFoundHandler())
+	must(t, err)
+	defer proxy.(*staticCover).dir.Close()
+	must(t, os.Rename(www, filepath.Join(parent, "original")))
+	must(t, os.Mkdir(www, 0700))
+	must(t, os.WriteFile(filepath.Join(www, "inside.txt"), []byte("replacement fixture"), 0600))
+	for name, handler := range map[string]http.Handler{"main": main, "proxy": proxy} {
+		t.Run(name, func(t *testing.T) {
+			inside, outside := httptest.NewRecorder(), httptest.NewRecorder()
+			handler.ServeHTTP(inside, httptest.NewRequest(http.MethodGet, "/inside.txt", nil))
+			handler.ServeHTTP(outside, httptest.NewRequest(http.MethodGet, "/alias.txt", nil))
+			if inside.Code != http.StatusOK || inside.Body.String() != "inside fixture" || outside.Code < 400 {
+				t.Fatalf("regular file status %d, outside file status %d", inside.Code, outside.Code)
+			}
+		})
+	}
+}
+
+func TestCoverKeepsFastCredentialsLocal(t *testing.T) {
+	var calls int
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	http.DefaultTransport = testDecoyTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ordinary"))}, nil
+	})
+	decoy, err := makeDecoy(Settings{}, RunOptions{WebUpstream: "http://site.example"}, nil)
+	must(t, err)
+	ordinary := httptest.NewRecorder()
+	decoy.main.ServeHTTP(ordinary, httptest.NewRequest(http.MethodGet, "/", nil))
+	credential := httptest.NewRequest(http.MethodGet, "/", nil)
+	credential.Header.Set("Hysteria-Auth", "dummy-fixture")
+	rejected := httptest.NewRecorder()
+	decoy.main.ServeHTTP(rejected, credential)
+	if ordinary.Code != http.StatusOK || rejected.Code != http.StatusNotFound || calls != 1 {
+		t.Fatalf("ordinary status %d, rejected status %d, backend calls %d", ordinary.Code, rejected.Code, calls)
 	}
 }
 
@@ -146,7 +196,7 @@ func (f testDecoyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func TestOriginPullCAIsRequestedOnlyOnCDNSNI(t *testing.T) {
 	settings := Settings{Domain: "origin.example", CDNDomain: "cdn.example"}
 	roots := x509.NewCertPool()
-	origin := strictProxyTLS(settings.Domain, nil)
+	origin := strictSiteTLS(settings.Domain, nil)
 	_, err := origin.GetConfigForClient(&tls.ClientHelloInfo{ServerName: settings.Domain})
 	if err != nil || origin.ClientAuth != tls.NoClientCert {
 		t.Fatalf("origin TLS should retain its normal certificate behavior: %v", err)

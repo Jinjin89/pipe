@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -341,17 +342,79 @@ func (i *Instance) Probe(ctx context.Context, tier string, burst bool) (stalled 
 // ProbeLatency measures from the start of the dial to the end of the probe
 // response. Via is true when a successful probe traveled through a relay.
 func (i *Instance) ProbeLatency(ctx context.Context, tier string, burst bool) (stalled bool, latency time.Duration, via bool, err error) {
-	dialer, found := i.box.Outbound().Outbound(tier)
-	if !found {
-		return false, 0, false, fmt.Errorf("tier %q is unavailable", tier)
-	}
 	start := time.Now()
-	conn, err := dialer.DialContext(context.WithValue(ctx, probeContextKey{}, true), "tcp", M.ParseSocksaddrHostPort(ProbeDomain, 80))
+	conn, err := i.dialProbe(ctx, tier)
 	if err != nil {
 		return false, 0, false, err
 	}
 	stalled, err = probeHTTP(ctx, conn, burst)
 	return stalled, time.Since(start), err == nil && probeViaRelay(conn), err
+}
+
+func (i *Instance) dialProbe(ctx context.Context, tier string) (net.Conn, error) {
+	dialer, found := i.box.Outbound().Outbound(tier)
+	if !found {
+		return nil, fmt.Errorf("tier %q is unavailable", tier)
+	}
+	return dialer.DialContext(context.WithValue(ctx, probeContextKey{}, true), "tcp", M.ParseSocksaddrHostPort(ProbeDomain, 80))
+}
+
+// MeasureRTT measures the median of three round trips on one authenticated
+// stream after a warm-up. A legacy single reply can establish reachability.
+func (i *Instance) MeasureRTT(ctx context.Context, tier string) (time.Duration, bool, error) {
+	conn, err := i.dialProbe(ctx, tier)
+	if err != nil {
+		return 0, false, err
+	}
+	rtt, err := measureProbeRTT(ctx, conn)
+	return rtt, err == nil && probeViaRelay(conn), err
+}
+
+// ProbeContext lets a user-started probe use this engine's outbounds with its
+// own cancellation and deadline.
+func (i *Instance) ProbeContext(ctx context.Context) context.Context {
+	return service.ContextWithRegistry(ctx, service.RegistryFromContext(i.ctx))
+}
+
+func measureProbeRTT(ctx context.Context, conn net.Conn) (time.Duration, error) {
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	input := &io.LimitedReader{R: conn, N: 16 << 10}
+	reader := bufio.NewReader(input)
+	var samples [3]time.Duration
+	for round := range 4 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+ProbeDomain+ProbePath, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Close = round == len(samples)
+		start := time.Now()
+		if err := req.Write(conn); err != nil {
+			return 0, err
+		}
+		res, err := http.ReadResponse(reader, req)
+		if err != nil {
+			return 0, err
+		}
+		body, err := io.ReadAll(io.LimitReader(res.Body, 3))
+		if err != nil || res.StatusCode != http.StatusOK || string(body) != "OK" || input.N == 0 {
+			return 0, fmt.Errorf("invalid latency probe reply")
+		}
+		elapsed := time.Since(start)
+		_ = res.Body.Close()
+		if round == 0 && res.Close {
+			return 0, nil
+		}
+		if round > 0 {
+			samples[round-1] = max(elapsed, time.Nanosecond)
+		}
+	}
+	slices.Sort(samples[:])
+	return samples[1], nil
 }
 
 func probeViaRelay(conn net.Conn) bool {

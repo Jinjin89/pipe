@@ -655,9 +655,8 @@ func TestIPv4OnlyDNSStripsIPv6HintsAndOmitsIPv6Bootstrap(t *testing.T) {
 	}
 }
 
-// In TUN mode user IP rules see real addresses: domestic and direct names
-// via domestic DNS, others through the tunnel, looked up only from the first
-// IP rule on.
+// A route that reaches a CIDR rule needs a tunneled lookup before that rule
+// can decide whether the connection goes direct.
 func TestTUNResolvesNamesForIPRules(t *testing.T) {
 	for _, ipRule := range []bool{false, true} {
 		prefs := Defaults()
@@ -691,14 +690,39 @@ func TestTUNResolvesNamesForIPRules(t *testing.T) {
 			}
 			continue
 		}
-		if len(resolves) != 2 || resolveAt < firstAt {
+		if len(resolves) != 1 || resolveAt < firstAt {
 			t.Fatalf("resolve rules %v at %d, first user rule at %d", resolves, resolveAt, firstAt)
 		}
-		domestic := []engine.Object{{"rule_set": "geosite-cn"}, {"domain_suffix": "home.example"}}
-		if resolves[0]["server"] != domesticDoH || !reflect.DeepEqual(resolves[0]["rules"], domestic) || resolves[0]["invert"] != nil ||
-			resolves[1]["server"] != "proxy-doh" || !reflect.DeepEqual(resolves[1]["rules"], domestic) || resolves[1]["invert"] != true ||
-			resolves[1]["strategy"] != "prefer_ipv4" {
+		if resolves[0]["server"] != "proxy-doh" || resolves[0]["rules"] != nil || resolves[0]["strategy"] != "prefer_ipv4" {
 			t.Fatalf("resolve rules %v", resolves)
 		}
+	}
+}
+
+func TestDNSResolverFollowsCIDRRuleOrder(t *testing.T) {
+	direct := Rule{Field: "domain_suffix", Match: "home.example", Action: "direct"}
+	cidr := Rule{Field: "ip_cidr", Match: "192.0.2.0/24", Action: "proxy"}
+	for _, tc := range []struct {
+		rules []Rule
+		want  string
+	}{
+		{[]Rule{direct, cidr}, domesticDoH},
+		{[]Rule{cidr, direct}, "proxy-doh"},
+	} {
+		prefs := Defaults()
+		prefs.TUN, prefs.Rules = true, tc.rules
+		dns := clientDNS(ClientOptions{Preferences: prefs, Profile: &link.Profile{Host: "origin.example"}}, engine.Relay{})
+		for _, rule := range dns["rules"].([]engine.Object) {
+			// A TXT query can match the named rule or a catch-all server.
+			switch rule["server"] {
+			case domesticDoH, "proxy-doh":
+				if rule["server"] != tc.want {
+					t.Fatalf("rules %v picked %s for TXT, want %s", tc.rules, rule["server"], tc.want)
+				}
+				goto next
+			}
+		}
+		t.Fatalf("rules %v had no eligible resolver", tc.rules)
+	next:
 	}
 }

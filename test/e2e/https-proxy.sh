@@ -21,7 +21,30 @@ check_https_proxy() {
   [[ $body == 'pipe HTTPS target' ]]
   body=$(https_curl "$main_proxy" --proxy "$main_proxy" --fail "http://$target_addr:$target_port/")
   [[ $body == 'pipe e2e target' ]]
+  body=$(https_curl "$main_proxy" --proxy "$main_proxy" --fail \
+    --request-target "https://$target_addr:$tls_target_port/" "http://$target_addr:$target_port/")
+  [[ $body == 'pipe HTTPS target' ]]
   pass "$check"
+
+  if curl --help all | grep -F -- '--proxy-http2' >/dev/null && curl --version | grep -w HTTP2 >/dev/null; then
+    check='HTTPS forward proxy falls back to HTTP/1.1 when curl offers proxy HTTP/2'
+    actual=$(https_curl "$main_proxy" --proxy-http2 --proxy "$main_proxy" --fail \
+      --output "$work_dir/proxy-negotiated" --write-out '%{http_version}' "http://$target_addr:$target_port/")
+    [[ $actual == 1.1 && $(cat "$work_dir/proxy-negotiated") == 'pipe e2e target' ]]
+    body=$(https_curl "$main_proxy" --proxy-http2 --fail "https://$target_addr:$tls_target_port/")
+    [[ $body == 'pipe HTTPS target' ]]
+    pass "$check"
+  fi
+
+  if [[ $scenario != relay ]]; then
+    check='HTTPS proxy enforces the persisted NAT egress block at startup'
+    body=$(ip netns exec "$server_ns" curl --noproxy '*' --silent --show-error --fail --max-time 4 "http://$blocked_addr:$target_port/")
+    [[ $body == 'pipe e2e target' ]]
+    status=$(https_curl "$main_proxy" --proxy "$main_proxy" --output /dev/null --write-out '%{http_code}' \
+      "http://$blocked_addr:$target_port/")
+    [[ $status == 502 ]]
+    pass "$check"
+  fi
 
   check='HTTPS proxy rejects CONNECT to loopback and private addresses'
   for address in 127.0.0.1 "$server_addr"; do

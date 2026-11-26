@@ -307,15 +307,15 @@ func TestStrictProxySNIRejectsHandshakesBeforeSelectingCertificate(t *testing.T)
 			serverDone := make(chan error, 1)
 			go func() { serverDone <- server.HandshakeContext(ctx) }()
 			client := tls.Client(wire, &tls.Config{
-				RootCAs: roots, ServerName: name, NextProtos: []string{"h2"}, InsecureSkipVerify: !want,
+				RootCAs: roots, ServerName: name, NextProtos: []string{"h2", "http/1.1"}, InsecureSkipVerify: !want,
 			})
 			err := client.HandshakeContext(ctx)
 			serverErr := <-serverDone
 			if (err == nil) != want || (serverErr == nil) != want || certSelected != want {
 				t.Fatalf("unexpected strict-SNI result for %q: client %v, server %v", name, err, serverErr)
 			}
-			if want && client.ConnectionState().NegotiatedProtocol != "h2" {
-				t.Fatal("the proxy did not negotiate HTTP/2")
+			if want && client.ConnectionState().NegotiatedProtocol != "http/1.1" {
+				t.Fatal("the proxy did not negotiate HTTP/1.1")
 			}
 		})
 	}

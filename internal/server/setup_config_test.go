@@ -289,3 +289,21 @@ func TestSetupPrivilegedInputsRequireTrustedPath(t *testing.T) {
 		t.Fatalf("service-owned config parent error = %v, want %q", err, want)
 	}
 }
+
+func TestSetupRefusesUnrelatedInputOwner(t *testing.T) {
+	if os.Geteuid() != 0 || runtime.GOOS != "linux" {
+		t.Skip("fixture needs Linux root to set an unrelated owner")
+	}
+	path := filepath.Join(t.TempDir(), "settings.json")
+	must(t, os.WriteFile(path, []byte(`{"sni":"fixture.example"}`), 0600))
+	const operator = 65530
+	must(t, os.Chown(path, operator, operator))
+	t.Setenv("SUDO_UID", "0")
+	if _, err := readSetupOperatorFile(path, 990, maxSetupConfigBytes, true); err == nil {
+		t.Fatal("accepted input owned by an unrelated account")
+	}
+	t.Setenv("SUDO_UID", "65530")
+	if _, err := readSetupOperatorFile(path, 990, maxSetupConfigBytes, true); err != nil {
+		t.Fatalf("trusted operator input: %v", err)
+	}
+}

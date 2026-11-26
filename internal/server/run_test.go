@@ -306,7 +306,11 @@ func TestDecoyCoverSelection(t *testing.T) {
 		req.TLS.ServerName = sni
 		w := httptest.NewRecorder()
 		override.ServeHTTP(w, req)
-		if w.Code != http.StatusOK || w.Body.String() != "custom cover" {
+		want := "custom cover"
+		if sni == cdn {
+			want = string(rescue)
+		}
+		if w.Code != http.StatusOK || w.Body.String() != want {
 			t.Fatalf("custom cover failed for %s", sni)
 		}
 	}

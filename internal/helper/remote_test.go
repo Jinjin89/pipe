@@ -5,15 +5,19 @@ package helper
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,7 +27,175 @@ import (
 
 func newRemote(sock string, version string, logs *logring.Ring) *Remote {
 	r := NewRemote(RemoteOptions{Socket: sock, Version: version, Exe: "/Apps/Pipe", Logs: logs})
+	r.trustedPath = func(path string) (string, error) { return path, nil }
 	return r
+}
+
+func TestRemoteRefusesInstallerWhenRunningImageCannotBeRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pipe-fixture")
+	if err := os.WriteFile(path, []byte("fixture"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRemote(RemoteOptions{Socket: "fixture", Exe: path})
+	r.goos = "linux"
+	r.openImage = func(string) (*os.File, error) { return nil, os.ErrPermission }
+	r.lookPath = func(string) (string, error) { return "fixture", nil }
+	called := false
+	r.run = func(string, ...string) ([]byte, error) {
+		called = true
+		return nil, nil
+	}
+	if err := r.elevate(false); err == nil || called {
+		t.Fatalf("unsafe installer reached the elevation hook: %v", err)
+	}
+}
+
+func TestRemotePortableInstallerPassesRunningDigestToOSStager(t *testing.T) {
+	if _, supported := PathsFor(runtime.GOOS); !supported {
+		t.Skip("portable Helper installation uses Unix executable permissions")
+	}
+	for _, platform := range []string{"darwin", "linux"} {
+		t.Run(platform, func(t *testing.T) {
+			dir, perm := "home/alex/pipe", os.FileMode(0700)
+			if platform == "darwin" {
+				dir, perm = "Applications/Pipe.app/Contents/MacOS", 0775
+			}
+			base := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(base, dir), perm); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(base, dir, "Pipe's binary")
+			contents := []byte("unit test running image")
+			if err := os.WriteFile(path, contents, 0755); err != nil {
+				t.Fatal(err)
+			}
+			r := NewRemote(RemoteOptions{Socket: "fixture", Exe: path})
+			r.goos = platform
+			r.openImage = os.Open
+			r.lookPath = func(string) (string, error) { return "fixture", nil }
+			called := false
+			r.run = func(name string, args ...string) ([]byte, error) {
+				called = true
+				paths, _ := PathsFor(platform)
+				want := []string{"-c", stageHelperScript, "pipe-helper", path, fmt.Sprintf("%x", sha256.Sum256(contents)),
+					filepath.Dir(paths.Binary), strconv.Itoa(os.Getuid()), platform}
+				if len(args) < len(want) || !reflect.DeepEqual(args[len(args)-len(want):], want) {
+					t.Errorf("stager did not receive the running image and digest (launcher %s)", name)
+				}
+				if platform == "darwin" && (name != "osascript" || !strings.Contains(strings.Join(args, "\n"), `set commandLine to "/bin/sh"`)) ||
+					platform == "linux" && (name != "pkexec" || args[0] != "/bin/sh") {
+					t.Errorf("unexpected launcher %s", name)
+				}
+				return nil, nil
+			}
+			if err := r.elevate(false); err != nil || !called {
+				t.Fatalf("portable installation did not reach staging: %v", err)
+			}
+		})
+	}
+}
+
+func TestPortableDigestSurvivesMacImagePathReplacement(t *testing.T) {
+	if _, supported := PathsFor(runtime.GOOS); !supported {
+		t.Skip("portable Helper installation uses Unix executable permissions")
+	}
+	path := filepath.Join(t.TempDir(), "Pipe")
+	original := []byte("early image fixture")
+	if err := os.WriteFile(path, original, 0755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRemote(RemoteOptions{Socket: "fixture", Exe: path})
+	r.goos = "darwin"
+	r.darwinDigest = pinHelperDigest(path, os.Open)
+	if err := os.Rename(path, path+"-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement fixture"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gotPath, digest, err := r.installImage()
+	if gotPath != path || digest != fmt.Sprintf("%x", sha256.Sum256(original)) || err != nil {
+		t.Fatalf("installer did not use the early open image: %v", err)
+	}
+}
+
+func TestStagedHelperVerifiesTheRootOwnedCopyBeforeExecution(t *testing.T) {
+	if os.Geteuid() != 0 || (runtime.GOOS != "linux" && runtime.GOOS != "darwin") {
+		t.Skip("shell fixture requires a protected directory owned by root")
+	}
+	dir, err := os.MkdirTemp(".", ".helper-stage-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const fixture = "#!/bin/sh\nprintf '%s\\n' \"$*\"\n"
+	for _, name := range []string{"verified bytes", "path replaced before copy", "changed bytes during copy"} {
+		t.Run(name, func(t *testing.T) {
+			source := filepath.Join(t.TempDir(), "portable")
+			if err := os.WriteFile(source, []byte(fixture), 0755); err != nil {
+				t.Fatal(err)
+			}
+			digest := fmt.Sprintf("%x", sha256.Sum256([]byte(fixture)))
+			script := stageHelperScript
+			switch name {
+			case "path replaced before copy":
+				replacement := source + "-new"
+				if err := os.WriteFile(replacement, []byte("different bytes"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(replacement, source); err != nil {
+					t.Fatal(err)
+				}
+			case "changed bytes during copy":
+				const copyImage = `cat < "$source" > "$staged"`
+				script = strings.Replace(script, copyImage, copyImage+` && printf '\nchanged bytes\n' >> "$staged"`, 1)
+			}
+			out, err := exec.Command("/bin/sh", "-c", script, "pipe-helper", source, digest, dir, "501", runtime.GOOS).CombinedOutput()
+			if name == "verified bytes" {
+				if err != nil || strings.TrimSpace(string(out)) != "helper install --uid 501" {
+					t.Fatalf("verified image did not run: %v, %s", err, out)
+				}
+			} else if err == nil || !strings.Contains(string(out), "changed before it could be installed") {
+				t.Fatalf("altered image was not rejected by the digest check: %v, %s", err, out)
+			}
+			if entries, err := os.ReadDir(dir); len(entries) != 0 || err != nil {
+				t.Fatalf("staged copies left behind: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestRemoteRemovalValidatesInstalledHelperEvenWithPortableGUI(t *testing.T) {
+	for _, platform := range []string{"darwin", "linux"} {
+		t.Run(platform, func(t *testing.T) {
+			r := NewRemote(RemoteOptions{Socket: "fixture", Exe: filepath.Join(t.TempDir(), "portable GUI")})
+			r.goos = platform
+			paths, _ := PathsFor(platform)
+			r.trustedPath = func(path string) (string, error) {
+				if path != paths.Binary {
+					t.Errorf("validated %q, want installed helper %q", path, paths.Binary)
+					return "", os.ErrPermission
+				}
+				return path, nil
+			}
+			r.lookPath = func(string) (string, error) { return "fixture", nil }
+			r.openImage = func(string) (*os.File, error) { t.Fatal("opened GUI image for removal"); return nil, nil }
+			r.run = func(name string, args ...string) ([]byte, error) {
+				wantName, wantArgs := elevateCommand(platform, paths.Binary, os.Getuid(), true)
+				if name != wantName || !reflect.DeepEqual(args, wantArgs) {
+					t.Error("removal did not use the protected helper")
+				}
+				return nil, nil
+			}
+			if err := r.elevate(true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestRemoteInfoStates(t *testing.T) {
@@ -64,6 +236,36 @@ func TestRemoteInfoCache(t *testing.T) {
 	r.dropInfo()
 	if r.Info().State != StateOK {
 		t.Fatal("cache not dropped")
+	}
+}
+
+func TestRemoteDistinguishesSocketDialErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		err         error
+	}{
+		{"socket absent", StateMissing, syscall.ENOENT},
+		{"dial timeout", StateError, context.DeadlineExceeded},
+		{"permission denied", StateError, syscall.EACCES},
+		{"operation not permitted", StateError, syscall.EPERM},
+		{"connection refused", StateError, syscall.ECONNREFUSED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRemote("helper.sock", "1", nil)
+			r.dialContext = func(context.Context, string, string) (net.Conn, error) {
+				return nil, &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", tc.err)}
+			}
+			r.info, r.infoAt = Info{State: StateOK}, time.Now()
+			if err := r.Stop(); (err == nil) != (tc.state == StateMissing) {
+				t.Fatalf("Stop result for %s: %v", tc.state, err)
+			}
+			if !r.infoAt.IsZero() {
+				t.Fatal("Stop left the old Helper info cached")
+			}
+			if info := r.Info(); info.State != tc.state {
+				t.Fatalf("got Helper state %+v, want %s", info, tc.state)
+			}
+		})
 	}
 }
 

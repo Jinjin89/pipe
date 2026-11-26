@@ -18,12 +18,15 @@ import (
 	"strconv"
 	"strings"
 
+	"pipe/internal/localfile"
+
 	"golang.org/x/sys/unix"
 )
 
 const (
 	unitName     = "pipe-relay.service"
 	unitPath     = "/etc/systemd/system/" + unitName
+	bootBinary   = "/usr/local/libexec/pipe-relay"
 	sysctlPath   = "/etc/sysctl.d/90-pipe-relay.conf"
 	conntrackMax = "net.netfilter.nf_conntrack_max"
 )
@@ -156,6 +159,18 @@ func (s relaySystem) change(ctx context.Context, path string, next state, old, e
 		if _, err := readOwnedFile(unitPath); err != nil {
 			return err
 		}
+		image, err := localfile.OpenTrustedRunningImage(executable)
+		if err != nil {
+			return fmt.Errorf("start relay setup from a root-owned, protected Pipe executable: %w", err)
+		}
+		defer image.Close()
+		if err := localfile.MakeTrustedDirectory(filepath.Dir(unitPath)); err != nil {
+			return err
+		}
+		if err := localfile.InstallTrustedExecutable(image, bootBinary); err != nil {
+			return err
+		}
+		executable = bootBinary
 	}
 	if err := writeManagedFile(path, text); err != nil {
 		return err

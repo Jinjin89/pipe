@@ -36,6 +36,7 @@ type linkSummary struct {
 	KeyFingerprint  string `json:"keyFingerprint"`
 	FastEndpoint    string `json:"fastEndpoint,omitempty"`
 	StealthEndpoint string `json:"stealthEndpoint,omitempty"`
+	ProxyAuthority  string `json:"proxyAuthority,omitempty"`
 }
 
 func ParseLink(raw string) (string, error) {
@@ -51,6 +52,7 @@ func ParseLink(raw string) (string, error) {
 	summary := linkSummary{
 		Name: profile.Name, Domain: domain, CDN: profile.CDNEndpoint(),
 		KeyFingerprint: "SHA-256 " + hex.EncodeToString(fingerprint[:]),
+		ProxyAuthority: profile.HTTPSProxy,
 	}
 	if profile.FastPort != 0 || profile.StealthPort != 0 || profile.FastSNI != "" || profile.RealitySNI != "" ||
 		profile.FastPin != "" || profile.FastHop != "" {
@@ -62,7 +64,10 @@ func ParseLink(raw string) (string, error) {
 }
 
 func describeEndpoint(host string, port uint16, name string) string {
-	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	address := host
+	if port != link.DefaultPort {
+		address = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
 	if !strings.EqualFold(host, name) {
 		address += " (TLS name " + name + ")"
 	}
@@ -107,6 +112,6 @@ func Logs(after int64) string {
 
 func ClearLogs() { logs.Clear() }
 
-// TestRoutes probes each available route once (12 s at most) and returns a
+// TestRoutes measures each available route (12 s at most) and returns a
 // JSON map of route to {ms, ok, at}. Results also appear in Status.
 func TestRoutes() string { return client.testRoutes() }

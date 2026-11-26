@@ -137,9 +137,11 @@ func enableProxy(ctx context.Context, dir string, opts ProxyEnableOptions, setup
 // the caller changes the active listener configuration.
 func prepareProxyCertificate(ctx context.Context, dir string, cfg, previous *httpsProxyListenerConfig, secretSource string, opts ProxyEnableOptions, setup proxySetup) ([]byte, error) {
 	if cfg.WWW != "" {
-		if _, err := proxyCover(cfg.WWW, nil); err != nil {
+		cover, err := proxyCover(cfg.WWW, nil)
+		if err != nil {
 			return nil, err
 		}
+		cover.(*staticCover).dir.Close()
 	}
 	if err := checkProxyDNS(ctx, cfg.Domain, setup, opts.Warn); err != nil {
 		return nil, err

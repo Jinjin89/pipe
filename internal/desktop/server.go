@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -16,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"pipe/internal/clientctl"
 	"pipe/internal/config"
@@ -25,6 +25,7 @@ import (
 	"pipe/internal/link"
 	"pipe/internal/logring"
 	"pipe/internal/sysproxy"
+	"pipe/internal/webview"
 )
 
 // Config wires the server to its collaborators.
@@ -43,7 +44,8 @@ type Config struct {
 	OnShow      func() // called for a valid /internal/show
 	OnQuit      func() // called after /api/quit has answered
 
-	probeProfile func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult
+	probeProfile  func(context.Context, clientctl.ProbeOptions) clientctl.ProfileTestResult
+	copySensitive func(string) error
 }
 
 // Server is the local HTTP API and static UI.
@@ -52,17 +54,21 @@ type Server struct {
 	store    *Store
 	profiles *Profiles
 	sess     *sessions
+	updates  *desktopUpdates
 	host     atomic.Value // "127.0.0.1:PORT"
 
-	mu       sync.Mutex // serializes connect/disconnect and proxy state
-	proxyOn  bool
-	proxyErr string
-	via      atomic.Value // "", "proxy" or "tun": which controller owns the session; written under mu
-	changes  chan struct{}
+	mu           sync.Mutex // serializes connect/disconnect and proxy state
+	closed       bool
+	proxyOn      bool
+	proxyErr     string
+	proxyRestore proxyRestoreAction
+	via          atomic.Value // "", "proxy" or "tun": which controller owns the session; written under mu
+	changes      chan struct{}
 
-	profileTests     map[string]struct{}       // saved names with a probe in flight, under mu
+	profileTests     map[string]bool           // saved names with probes in flight, true for invalidated results, under mu
 	profileTestDone  chan struct{}             // closed and replaced when a probe releases its slot, under mu
 	profileCountries map[profileExitKey]string // session cache under mu
+	liveProfile      profileIdentity           // under mu
 }
 
 func NewServer(cfg Config) *Server {
@@ -72,6 +78,9 @@ func NewServer(cfg Config) *Server {
 	if cfg.probeProfile == nil {
 		cfg.probeProfile = clientctl.TestProfile
 	}
+	if cfg.copySensitive == nil {
+		cfg.copySensitive = webview.CopySensitive
+	}
 	profiles := NewProfiles(cfg.ProfilesDir)
 	s := &Server{
 		cfg:      cfg,
@@ -80,13 +89,15 @@ func NewServer(cfg Config) *Server {
 		sess:     newSessions(),
 		changes:  make(chan struct{}, 1),
 
-		profileTests:     make(map[string]struct{}),
+		profileTests:     make(map[string]bool),
 		profileTestDone:  make(chan struct{}),
 		profileCountries: make(map[profileExitKey]string),
 	}
+	s.updates = newDesktopUpdates(s)
 	s.host.Store("")
 	if cfg.Helper != nil {
 		cfg.Helper.OnChange(s.notify)
+		s.reattachTUNLocked()
 	}
 	return s
 }
@@ -104,10 +115,21 @@ func (s *Server) ShowSecret() string { return s.cfg.ShowSecret }
 // Settings returns the saved settings.
 func (s *Server) Settings() Settings { return s.store.Snapshot().Settings }
 
-// StateIsOff reports whether nothing is connected or connecting.
+// StateIsOff reports whether the app can exit when its window closes.
 func (s *Server) StateIsOff() bool {
-	st := s.active().Status().State
-	return st != "on" && st != "connecting"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proxyRestore != proxyRestoreNone {
+		return false
+	}
+	if _, reattached := s.reattachTUNLocked(); reattached {
+		return false
+	}
+	st := s.active().Status()
+	if s.getVia() == viaTUN && s.cfg.Helper != nil {
+		return tunStopped(st)
+	}
+	return !running(st)
 }
 
 // Changes fires (coalesced) after every state transition: connect,
@@ -127,8 +149,54 @@ const (
 	viaTUN   = "tun"
 )
 
-func (s *Server) getVia() string  { v, _ := s.via.Load().(string); return v }
-func (s *Server) setVia(v string) { s.via.Store(v) }
+type proxyRestoreAction int
+
+const (
+	proxyRestoreNone proxyRestoreAction = iota
+	proxyRestoreOnly
+	proxyRestoreAndDisconnect
+)
+
+func (s *Server) getVia() string { v, _ := s.via.Load().(string); return v }
+func (s *Server) setVia(v string) {
+	s.via.Store(v)
+	if v == "" {
+		s.liveProfile = profileIdentity{}
+	}
+}
+
+func tunStopped(st clientctl.Status) bool { return st.State == clientctl.StateOff && !st.Guarded }
+
+func (s *Server) holdHelperSession(st clientctl.Status) {
+	if st.Guarded || running(st) {
+		if h, ok := s.cfg.Helper.(interface{ HoldSession() }); ok {
+			h.HoldSession()
+		}
+	}
+}
+
+// reattachTUNLocked checks for a session left by a previous app instance.
+func (s *Server) reattachTUNLocked() (clientctl.Status, bool) {
+	h := s.cfg.Helper
+	if s.closed || s.getVia() != "" || h == nil {
+		return clientctl.Status{}, false
+	}
+	st := h.Status()
+	if tunStopped(st) {
+		return st, false
+	}
+	if !st.Guarded && !running(st) {
+		// An installed Helper with indeterminate status can still own capture.
+		switch h.Info().State {
+		case helper.StateOK, helper.StateOutdated, helper.StateError:
+		default:
+			return st, false
+		}
+	}
+	s.setVia(viaTUN)
+	s.holdHelperSession(st)
+	return st, true
+}
 
 // active is the controller that owns the current session: Pipe Helper while
 // the session runs through TUN, otherwise the local one (§8.5).
@@ -176,6 +244,7 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("POST /api/session", s.handleSession)
 	mux.HandleFunc("POST /internal/show", s.handleShow)
+	api("POST", "/api/session/end", s.endSession)
 	api("GET", "/api/status", func(*http.Request) (any, error) { return s.status(), nil })
 	api("POST", "/api/connect", func(*http.Request) (any, error) { return s.connect() })
 	api("POST", "/api/disconnect", func(*http.Request) (any, error) { return s.disconnect() })
@@ -183,6 +252,7 @@ func (s *Server) Handler() http.Handler {
 	api("PUT", "/api/tier", s.putTier)
 	api("POST", "/api/routes/test", s.testRoutes)
 	api("GET", "/api/profiles", func(*http.Request) (any, error) { return s.listProfiles(), nil })
+	api("POST", "/api/profiles/test-complete", s.completeProfileBatch)
 	api("POST", "/api/profiles/preview", s.previewProfile)
 	api("POST", "/api/profiles", s.addProfile)
 	api("PATCH", "/api/profiles/{name}", s.renameProfile)
@@ -191,10 +261,15 @@ func (s *Server) Handler() http.Handler {
 	api("POST", "/api/profiles/{name}/activate", s.activateProfile)
 	api("POST", "/api/profiles/{name}/test", s.testProfile)
 	api("POST", "/api/profiles/{name}/secret", s.profileSecret)
+	api("POST", "/api/profiles/{name}/copy", s.copyProfileSecret)
 	api("GET", "/api/routing", func(*http.Request) (any, error) { return s.routing(), nil })
 	api("PUT", "/api/routing", s.putRouting)
 	api("GET", "/api/settings", func(*http.Request) (any, error) { return s.store.Snapshot().Settings, nil })
 	api("PUT", "/api/settings", s.putSettings)
+	api("GET", "/api/updates", s.updateStatus)
+	api("POST", "/api/updates/check", s.checkUpdate)
+	api("POST", "/api/updates/download", s.downloadUpdate)
+	api("POST", "/api/updates/reveal", s.revealUpdate)
 	api("GET", "/api/logs", s.getLogs)
 	api("DELETE", "/api/logs", func(*http.Request) (any, error) { s.cfg.Logs.Clear(); return nil, nil })
 	api("GET", "/api/helper", func(*http.Request) (any, error) { return s.helperInfo(), nil })
@@ -202,6 +277,10 @@ func (s *Server) Handler() http.Handler {
 	api("POST", "/api/helper/remove", func(*http.Request) (any, error) { return s.removeHelper() })
 	api("GET", "/api/about", func(*http.Request) (any, error) { return s.about(), nil })
 	mux.HandleFunc("POST /api/quit", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.Close(); err != nil {
+			writeError(w, err)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -270,11 +349,9 @@ func sameOrigin(r *http.Request, origin string) bool {
 	return got == origin
 }
 
-// authorize checks the cookie (401), then origin and CSRF rules (403). It
-// returns 0 when the call is allowed.
+// authorize checks the bearer (401) and origin and CSRF rules (403).
 func (s *Server) authorize(r *http.Request, origin string) int {
-	c, err := r.Cookie(cookieName)
-	if err != nil || !s.sess.Valid(c.Value) {
+	if !s.sess.ValidBearer(r) {
 		return http.StatusUnauthorized
 	}
 	if !sameOrigin(r, origin) {
@@ -285,6 +362,7 @@ func (s *Server) authorize(r *http.Request, origin string) int {
 			return http.StatusForbidden
 		}
 	}
+	s.updateWindowSession(r, false)
 	return 0
 }
 
@@ -301,8 +379,30 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{status: http.StatusUnauthorized, msg: "Open Pipe again from your apps."})
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+}
+
+func (s *Server) endSession(r *http.Request) (any, error) {
+	s.updateWindowSession(r, true)
+	return nil, nil
+}
+
+// updateWindowSession records activity or revokes the bearer after the request
+// has passed both authentication and the origin checks.
+func (s *Server) updateWindowSession(r *http.Request, end bool) {
+	_, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	s.sess.mu.Lock()
+	defer s.sess.mu.Unlock()
+	until := s.sess.now().Add(sessionTTL)
+	for i, session := range s.sess.tokens {
+		if subtle.ConstantTimeCompare([]byte(session.value), []byte(token)) == 1 {
+			if end {
+				s.sess.tokens[i] = sessionToken{}
+			} else {
+				s.sess.tokens[i].until = until
+			}
+		}
+	}
 }
 
 func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
@@ -375,10 +475,11 @@ func readJSON(r *http.Request, v any, limit ...int64) error {
 // StatusResponse is the desktop-wrapped status (§2.4, §8.5).
 type StatusResponse struct {
 	clientctl.Status
-	SystemProxy     string      `json:"systemProxy"`
-	SystemProxyNote string      `json:"systemProxyNote"`
-	Via             string      `json:"via"`    // proxy|tun while a session runs, else ""
-	Helper          helper.Info `json:"helper"` // always set; unsupported when Config.Helper is nil
+	SystemProxy     string               `json:"systemProxy"`
+	SystemProxyNote string               `json:"systemProxyNote"`
+	Via             string               `json:"via"`    // proxy|tun while a session runs, else ""
+	Helper          helper.Info          `json:"helper"` // always set; unsupported when Config.Helper is nil
+	Measurement     *profileTestResponse `json:"measurement,omitempty"`
 }
 
 func (s *Server) status() StatusResponse {
@@ -388,33 +489,48 @@ func (s *Server) status() StatusResponse {
 }
 
 func (s *Server) statusLocked() StatusResponse {
-	st := s.active().Status()
+	switch s.proxyRestore {
+	case proxyRestoreOnly:
+		_ = s.clearProxyLocked()
+	case proxyRestoreAndDisconnect:
+		_ = s.Shutdown()
+	}
+	st, reattached := s.reattachTUNLocked()
+	if !reattached {
+		st = s.active().Status()
+	}
 	via := s.getVia()
-	if !running(st) {
-		if via != "" {
+	if via == viaTUN {
+		// A failed status RPC leaves the Helper's session indeterminate.
+		if s.cfg.Helper == nil || tunStopped(st) {
+			s.setVia("")
+			via = ""
+		} else if !reattached {
+			s.holdHelperSession(st)
+		}
+	} else if !running(st) && s.proxyRestore == proxyRestoreNone && (via != "" || s.proxyOn) {
+		if !s.proxyOn || s.clearProxyLocked() == nil {
 			s.setVia("")
 			via = ""
 		}
-		if s.proxyOn {
-			s.clearProxyLocked()
-		}
 	}
-	if saved := s.store.Snapshot(); st.Mode == "" || st.TierPreference == "" {
+	savedMode, savedTier, savedPort, measurement := s.store.StatusFields(s.profiles)
+	if st.Mode == "" || st.TierPreference == "" {
 		// While off the controller has no choice yet; show the saved ones.
 		if st.Mode == "" {
-			st.Mode = saved.Mode
+			st.Mode = savedMode
 		}
 		if st.TierPreference == "" {
-			st.TierPreference = saved.Tier
+			st.TierPreference = savedTier
 		}
 	}
 	if st.Routes == nil {
 		st.Routes = map[string]clientctl.RouteLatency{}
 	}
-	resp := StatusResponse{Status: st, SystemProxy: "off", Via: via, Helper: s.helperInfo()}
+	resp := StatusResponse{Status: st, SystemProxy: "off", Via: via, Helper: s.helperInfo(), Measurement: measurement}
 	listen := st.Listen
 	if listen == "" {
-		listen = fmt.Sprintf("127.0.0.1:%d", s.store.Snapshot().Settings.ListenPort)
+		listen = fmt.Sprintf("127.0.0.1:%d", savedPort)
 	}
 	switch {
 	case via == viaTUN:
@@ -430,11 +546,11 @@ func (s *Server) statusLocked() StatusResponse {
 	return resp
 }
 
-func (s *Server) options(name string) (clientctl.Options, error) {
+func (s *Server) options(name string) (clientctl.Options, string, error) {
 	data := s.store.Snapshot()
-	profile, err := s.profiles.Load(name)
+	profile, rev, err := s.profiles.load(name)
 	if err != nil {
-		return clientctl.Options{}, bad("Add your server first.")
+		return clientctl.Options{}, "", bad("Add your server first.")
 	}
 	opts := clientctl.Options{
 		Profile: profile, Mode: data.Mode, Tier: failover.Tier(data.Tier),
@@ -444,11 +560,11 @@ func (s *Server) options(name string) (clientctl.Options, error) {
 	for i, r := range data.Rules {
 		rule, err := s.parseRule(r)
 		if err != nil {
-			return opts, &apiError{status: 400, msg: err.Error(), index: &i}
+			return opts, "", &apiError{status: 400, msg: err.Error(), index: &i}
 		}
 		opts.Rules = append(opts.Rules, rule)
 	}
-	return opts, nil
+	return opts, rev, nil
 }
 
 func logLevel(st Settings) string {
@@ -499,11 +615,15 @@ func (s *Server) connect() (any, error) {
 // connectLocked starts the saved profile through Pipe Helper (TUN) or the
 // local controller, stopping the other one first. s.mu is held.
 func (s *Server) connectLocked() (any, error) {
+	if s.closed {
+		return nil, errors.New("Pipe is quitting")
+	}
+	s.reattachTUNLocked()
 	data := s.store.Snapshot()
 	if data.Active == "" {
 		return nil, bad("Add your server first.")
 	}
-	opts, err := s.options(data.Active)
+	opts, rev, err := s.options(data.Active)
 	if err != nil {
 		return nil, err
 	}
@@ -514,28 +634,49 @@ func (s *Server) connectLocked() (any, error) {
 		if err := s.needHelper(); err != nil {
 			return nil, err
 		}
-		_ = s.cfg.Controller.Stop()
-		s.clearProxyLocked()
-		s.setVia("")
+		if s.getVia() != viaTUN {
+			if err := s.clearProxyLocked(); err != nil {
+				return nil, err
+			}
+			if err := s.cfg.Controller.Stop(); err != nil {
+				return nil, err
+			}
+			s.setVia("")
+		}
 		opts.TUN = true
+		s.setVia(viaTUN)
+		s.updates.CancelDirect()
 		if err := s.cfg.Helper.Start(opts); err != nil {
+			st := s.cfg.Helper.Status()
+			if tunStopped(st) {
+				s.setVia("")
+			} else {
+				s.holdHelperSession(st)
+			}
 			if errors.Is(err, helper.ErrOutdated) {
 				return nil, err
 			}
 			return nil, &apiError{status: http.StatusBadGateway, msg: friendly(err)}
 		}
-		s.setVia(viaTUN)
+		s.liveProfile = profileIdentity{data.Active, rev}
 		return s.statusLocked(), nil
 	}
-	if s.getVia() == viaTUN && s.cfg.Helper != nil {
-		_ = s.cfg.Helper.Stop()
+	if s.proxyRestore != proxyRestoreNone {
+		if err := s.clearProxyLocked(); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.stopHelperLocked(); err != nil {
+		return nil, err
 	}
 	s.setVia("")
 	opts.TUN = false
+	s.updates.CancelDirect()
 	if err := s.cfg.Controller.Start(opts); err != nil {
 		return nil, &apiError{status: http.StatusBadGateway, msg: friendly(err)}
 	}
 	s.setVia(viaProxy)
+	s.liveProfile = profileIdentity{data.Active, rev}
 	if data.Settings.SystemProxy {
 		s.setProxyLocked(data.Settings.ListenPort)
 	}
@@ -572,12 +713,38 @@ func (s *Server) setProxyLocked(port int) {
 	}
 }
 
-func (s *Server) clearProxyLocked() {
+func (s *Server) clearProxyLocked() error {
 	if err := s.cfg.Proxy.Clear(); err != nil {
-		s.proxyErr = "Couldn't restore the system proxy: " + err.Error()
-		return
+		if s.proxyRestore == proxyRestoreNone {
+			s.proxyRestore = proxyRestoreOnly
+		}
+		err = fmt.Errorf("couldn't restore the system proxy: %w", err)
+		s.proxyErr = friendly(err)
+		return err
 	}
 	s.proxyOn, s.proxyErr = false, ""
+	s.proxyRestore = proxyRestoreNone
+	return nil
+}
+
+func (s *Server) stopHelperLocked() error {
+	if s.getVia() != viaTUN {
+		return nil
+	}
+	if h := s.cfg.Helper; h != nil {
+		if err := h.Stop(); err != nil {
+			return fmt.Errorf("couldn't stop Pipe Helper: %w", err)
+		}
+		// An externally removed Helper can no longer send an Off status.
+		if !tunStopped(h.Status()) {
+			state := h.Info().State
+			if state != helper.StateMissing && state != helper.StateUnsupported {
+				return errors.New("couldn't confirm that Pipe Helper stopped")
+			}
+		}
+	}
+	s.setVia("")
+	return nil
 }
 
 func (s *Server) disconnect() (any, error) {
@@ -594,28 +761,41 @@ func (s *Server) disconnect() (any, error) {
 // restores the system proxy. The caller holds s.mu or is the only user
 // (process exit).
 func (s *Server) Shutdown() error {
-	var err error
-	if h := s.cfg.Helper; h != nil && s.getVia() == viaTUN { // the helper's lease reaps any other session
-		err = h.Stop()
+	s.reattachTUNLocked()
+	if err := s.clearProxyLocked(); err != nil {
+		s.proxyRestore = proxyRestoreAndDisconnect
+		return err
 	}
-	if e := s.cfg.Controller.Stop(); err == nil {
-		err = e
+	if err := s.stopHelperLocked(); err != nil {
+		return err
 	}
-	s.clearProxyLocked()
+	if err := s.cfg.Controller.Stop(); err != nil {
+		return err
+	}
 	s.setVia("")
-	return err
+	return nil
 }
 
 // Close is Shutdown for callers that don't hold the lock.
 func (s *Server) Close() error {
+	defer s.notify()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Shutdown()
+	if s.closed {
+		return nil
+	}
+	if err := s.Shutdown(); err != nil {
+		return err
+	}
+	s.closed = true
+	s.sess.close()
+	s.updates.Close()
+	return nil
 }
 
 // ConnectIfConfigured connects at launch when the user asked for it.
 func (s *Server) ConnectIfConfigured() error {
-	if !s.store.Snapshot().Settings.ConnectOnLaunch {
+	if s.getVia() == viaTUN || !s.store.Snapshot().Settings.ConnectOnLaunch {
 		return nil
 	}
 	_, err := s.connect()
@@ -703,26 +883,23 @@ func (s *Server) setTier(tier string) (any, error) {
 }
 
 func (s *Server) testRoutes(r *http.Request) (any, error) {
-	ctl := s.active()
-	if !running(ctl.Status()) {
-		return nil, &apiError{status: http.StatusConflict, msg: "Connect first"}
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	routes := ctl.TestRoutes(ctx)
-	if routes == nil {
-		routes = map[string]clientctl.RouteLatency{}
-	}
-	return map[string]any{"routes": routes}, nil
+	return s.measureProfile(r, true)
 }
 
 func (s *Server) listProfiles() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data := s.store.Snapshot()
 	profiles := s.profiles.List()
 	for i := range profiles {
 		profiles[i].Relay = data.relayFor(profiles[i].Name, profiles[i].Server)
+		profiles[i].Measurement = data.measurementFor(profiles[i])
 	}
-	return map[string]any{"active": data.Active, "profiles": profiles}
+	result := map[string]any{"active": data.Active, "profiles": profiles}
+	if !data.LastProfileBatch.IsZero() {
+		result["lastTestedAt"] = data.LastProfileBatch
+	}
+	return result
 }
 
 func (s *Server) previewProfile(r *http.Request) (any, error) {
@@ -736,8 +913,18 @@ func (s *Server) previewProfile(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, bad(err.Error())
 	}
-	return map[string]any{"name": info.Name, "server": info.Server, "cdn": profile.CDNEndpoint(), "routes": info.Routes,
-		"fingerprint": info.Fingerprint, "exists": s.profiles.Exists(info.Name)}, nil
+	result := map[string]any{"name": info.Name, "server": info.Server, "cdn": profile.CDNEndpoint(), "routes": info.Routes,
+		"fingerprint": info.Fingerprint, "exists": s.profiles.Exists(info.Name)}
+	if profile.HTTPSProxy != "" {
+		result["httpsProxy"] = profile.HTTPSProxy
+	}
+	if port := profile.FastEndpointPort(); port != link.DefaultPort {
+		result["fast"] = net.JoinHostPort(profile.Host, strconv.Itoa(int(port)))
+	}
+	if port := profile.StealthEndpointPort(); port != link.DefaultPort {
+		result["stealth"] = net.JoinHostPort(profile.Host, strconv.Itoa(int(port)))
+	}
+	return result, nil
 }
 
 func (s *Server) addProfile(r *http.Request) (any, error) {
@@ -780,9 +967,13 @@ func (s *Server) addProfile(r *http.Request) (any, error) {
 		}
 		return nil, err
 	}
+	s.invalidateProfileTest(name)
 	err = s.store.Update(func(d *appData) {
 		info.Relay = d.relayFor(info.Name, profile.Host)
 		d.setRelay(info.Name, info.Relay)
+		if d.Measurements[info.Name].Rev != info.Rev {
+			delete(d.Measurements, info.Name)
+		}
 		if d.Active == "" {
 			d.Active = info.Name
 		}
@@ -814,6 +1005,9 @@ func (s *Server) renameProfile(r *http.Request) (any, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.store.Err(); err != nil {
+		return nil, err
+	}
 	from, err := s.storedName(r)
 	if err != nil {
 		return nil, err
@@ -827,16 +1021,28 @@ func (s *Server) renameProfile(r *http.Request) (any, error) {
 	case err != nil:
 		return nil, err
 	}
+	if from != to {
+		s.invalidateProfileTest(from)
+	}
 	err = s.store.Update(func(d *appData) {
 		info.Relay = d.relayFor(from, info.Server)
 		if from != to {
 			d.setRelay(to, info.Relay)
 			delete(d.Relays, from)
+			if measurement, ok := d.Measurements[from]; ok {
+				measurement.Profile = to
+				d.setMeasurement(to, measurement)
+				delete(d.Measurements, from)
+			}
 		}
+		info.Measurement = d.measurementFor(info)
 		if d.Active == from {
 			d.Active = to
 		}
 	})
+	if err == nil && s.liveProfile.name == from {
+		s.liveProfile.name = to
+	}
 	return info, err
 }
 
@@ -844,6 +1050,9 @@ func (s *Server) deleteProfile(r *http.Request) (any, error) {
 	defer s.notify()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.store.Err(); err != nil {
+		return nil, err
+	}
 	name, err := s.storedName(r)
 	if err != nil {
 		return nil, err
@@ -856,8 +1065,10 @@ func (s *Server) deleteProfile(r *http.Request) (any, error) {
 	if err := s.profiles.Delete(name); err != nil {
 		return nil, err
 	}
+	s.invalidateProfileTest(name)
 	return nil, s.store.Update(func(d *appData) {
 		delete(d.Relays, name)
+		delete(d.Measurements, name)
 		if d.Active == name {
 			d.Active = ""
 			if left := s.profiles.List(); len(left) > 0 {
@@ -882,14 +1093,15 @@ func (s *Server) activateProfile(r *http.Request) (any, error) {
 		if !running(s.active().Status()) {
 			return nil
 		}
-		opts, err := s.options(name)
+		opts, rev, err := s.options(name)
 		if err == nil {
 			err = s.active().Start(opts)
 		}
 		if err != nil {
-			s.clearProxyLocked()
+			return errors.Join(err, s.clearProxyLocked())
 		}
-		return err
+		s.liveProfile = profileIdentity{name, rev}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -902,18 +1114,24 @@ type profileSecretResponse struct {
 	QR     string `json:"qr"`
 	Proxy  string `json:"proxy"`
 	Export string `json:"export"`
+	Rev    string `json:"rev"`
+}
+
+func (s *Server) secretProfile(r *http.Request) (link.Profile, string, error) {
+	name, err := s.storedName(r)
+	if err != nil {
+		return link.Profile{}, "", err
+	}
+	profile, rev, err := s.profiles.load(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return link.Profile{}, "", errNoProfile
+	}
+	return profile, rev, err
 }
 
 func (s *Server) profileSecret(r *http.Request) (any, error) {
-	name, err := s.storedName(r)
+	profile, rev, err := s.secretProfile(r)
 	if err != nil {
-		return nil, err
-	}
-	profile, err := s.profiles.Load(name)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, errNoProfile
-		}
 		return nil, err
 	}
 	raw, err := profile.Encode()
@@ -922,10 +1140,46 @@ func (s *Server) profileSecret(r *http.Request) (any, error) {
 	}
 	proxy, _ := link.ProxyURL(profile)
 	return profileSecretResponse{
-		Link:  raw,
-		QR:    link.QRSVG(raw),
-		Proxy: proxy, Export: link.ProxyExport(proxy),
+		Link: raw, QR: link.QRSVG(raw), Proxy: proxy, Export: link.ProxyExport(proxy), Rev: rev,
 	}, nil
+}
+
+func (s *Server) copyProfileSecret(r *http.Request) (any, error) {
+	var body struct{ Format, Rev string }
+	if err := readJSON(r, &body, 1024); err != nil {
+		return nil, err
+	}
+	profile, rev, err := s.secretProfile(r)
+	if err != nil {
+		return nil, err
+	}
+	if rev != body.Rev {
+		return nil, &apiError{status: http.StatusConflict, msg: "The profile changed. Open its device link again."}
+	}
+	var value string
+	switch body.Format {
+	case "link":
+		value, err = profile.Encode()
+	case "proxy", "export":
+		value, _ = link.ProxyURL(profile)
+		if body.Format == "export" {
+			value = link.ProxyExport(value)
+		}
+	default:
+		return nil, bad("Choose a device link, HTTPS proxy, or terminal command.")
+	}
+	if err != nil || value == "" {
+		return nil, bad("That value is unavailable for this profile.")
+	}
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	if err := s.cfg.copySensitive(value); errors.Is(err, webview.ErrUnsupported) {
+		return map[string]bool{"fallback": true}, nil
+	} else if err != nil {
+		return nil, errors.New("Couldn't copy the value to the clipboard.")
+	}
+	return nil, nil
 }
 
 type routingBody struct {
@@ -978,13 +1232,14 @@ func (s *Server) applyLiveLocked(modeAndTier bool) error {
 		return nil
 	}
 	data := s.store.Snapshot()
-	opts, err := s.options(data.Active)
+	opts, rev, err := s.options(data.Active)
 	if err != nil {
 		return err
 	}
 	if err := ctl.Apply(opts); err != nil {
 		return err
 	}
+	s.liveProfile = profileIdentity{data.Active, rev}
 	if modeAndTier {
 		if err := ctl.SetMode(data.Mode); err != nil {
 			return err
@@ -1008,6 +1263,8 @@ func (s *Server) putSettings(r *http.Request) (any, error) {
 // and the in-process setters).
 func (s *Server) updateSettings(next Settings) (any, error) {
 	defer s.notify()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	before := s.store.Snapshot().Settings
 	switch {
 	case next.ListenPort < 1024 || next.ListenPort > 65535:
@@ -1032,20 +1289,26 @@ func (s *Server) updateSettings(next Settings) (any, error) {
 			return nil, fmt.Errorf("couldn't change start at login: %w", err)
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	wasRunning := running(s.active().Status())
-	switched := next.TUN != before.TUN && wasRunning
-	err := s.transact(func(d *appData) { d.Settings = next }, func() error {
+	status := s.active().Status()
+	ownedTUN := s.getVia() == viaTUN && !tunStopped(status)
+	switched := next.TUN != before.TUN && (running(status) || ownedTUN)
+	var err error
+	clearedOldProxy := false
+	if !switched && s.getVia() == viaProxy && before.ListenPort != next.ListenPort && (s.proxyOn || s.cfg.Proxy.Armed()) {
+		// Restore the OS proxy before Apply can close the old listener.
+		err = s.clearProxyLocked()
+		clearedOldProxy = err == nil
+	}
+	apply := func() error {
+		if switched {
+			// Reconnect through the other path (also arms or clears the proxy).
+			_, err := s.connectLocked()
+			return err
+		}
 		// Re-checked under the lock: a concurrent disconnect can't be
 		// followed by re-arming the proxy.
 		if !running(s.active().Status()) {
 			return nil
-		}
-		if next.TUN != before.TUN {
-			// Reconnect through the other path (also arms or clears the proxy).
-			_, err := s.connectLocked()
-			return err
 		}
 		if err := s.applyLiveLocked(false); err != nil {
 			return err
@@ -1055,14 +1318,23 @@ func (s *Server) updateSettings(next Settings) (any, error) {
 		}
 		switch {
 		case !next.SystemProxy:
-			s.clearProxyLocked()
+			return s.clearProxyLocked()
 		case !before.SystemProxy || before.ListenPort != next.ListenPort || !s.proxyOn:
 			s.setProxyLocked(next.ListenPort)
 		}
 		return nil
-	})
+	}
+	if err == nil {
+		err = s.transact(func(d *appData) { d.Settings = next }, apply)
+	}
 	if err != nil {
-		if switched && !running(s.active().Status()) {
+		if clearedOldProxy && before.SystemProxy && s.getVia() == viaProxy {
+			st := s.cfg.Controller.Status()
+			if running(st) && st.Listen == fmt.Sprintf("127.0.0.1:%d", before.ListenPort) {
+				s.setProxyLocked(before.ListenPort)
+			}
+		}
+		if switched && s.getVia() == "" && !running(s.active().Status()) {
 			_, _ = s.connectLocked() // the saved settings are the old ones again
 		}
 		if next.StartAtLogin != before.StartAtLogin && s.cfg.Autostart != nil {

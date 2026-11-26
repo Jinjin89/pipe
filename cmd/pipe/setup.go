@@ -13,6 +13,14 @@ import (
 )
 
 func runServerSetup(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == server.EnrollSetupDeviceCommand {
+		if len(args) != 3 {
+			return errors.New("invalid setup enrollment")
+		}
+		file := os.NewFile(3, "device enrollment file")
+		defer file.Close()
+		return server.EnrollSetupDevice(args[1], args[2], file)
+	}
 	if len(args) > 0 && args[0] == server.ApplySetupUpdateCommand {
 		if len(args) != 3 {
 			return errors.New("invalid setup update")
@@ -43,6 +51,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	fs.BoolVar(&flags.Yes, "yes", false, "do not ask questions; use flags and defaults")
 	fs.StringVar(&flags.Dir, "dir", "/var/lib/pipe", "server state directory")
 	fs.StringVar(&flags.IP, "ip", "", "IP address for device links (default: the SNI name)")
+	registerEgressIPFlag(fs, &flags.BlockEgressIPs)
 	fs.StringVar(&flags.SNI, "sni", "", "server DNS-only name for Fast, Stealth and the HTTPS proxy")
 	fs.StringVar(&cert.DNS, "dns", "", "certificate DNS provider (cloudflare or alidns)")
 	fs.StringVar(&cert.TokenFile, "dns-token-file", "", "owner-only Cloudflare API token file")
@@ -51,6 +60,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	fs.StringVar(&cert.Key, "key", "", "TLS private key file (readable only by user pipe)")
 	registerPortFlag(fs, &flags.Fast.Port, "fast-port", "Fast UDP port (default 443)")
 	fs.StringVar(&flags.Fast.Hop, "fast-hop", "", "optional Fast UDP hopping range, for example 20000-40000")
+	fs.StringVar(&flags.Fast.Address, "fast-hop-address", "", "local IP address for Fast hopping on a multi-address host")
 	registerPortFlag(fs, &flags.Stealth.Port, "stealth-port", "Stealth TCP port (default 443 standalone, 8443 shared)")
 	registerPortFlag(fs, &proxy.Port, "proxy-port", "HTTPS proxy TCP port (default 443 standalone, 9443 shared)")
 	fs.BoolVar(&flags.NoProxy, "no-proxy", false, "disable the HTTPS proxy and shared Stealth")
@@ -59,6 +69,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	fs.StringVar(&rescue.Cert, "rescue-cert", "", "shared Rescue certificate chain file")
 	fs.StringVar(&rescue.Key, "rescue-key", "", "shared Rescue owner-only private key file")
 	fs.StringVar(&flags.Device, "device", "", "device name to add (default phone on a fresh install)")
+	fs.StringVar(&flags.LinkFile, "device-link-file", "", "new owner-only file for the unattended device link")
 	var configPath string
 	var template bool
 	fs.BoolVar(&template, "template", false, "print the JSON setup template for this host")
@@ -80,7 +91,10 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 			return o, false, err
 		}
 	}
-	o.Dir, o.Yes, o.NoProxy = flags.Dir, o.Yes || flags.Yes, flags.NoProxy
+	o.Dir, o.Yes, o.NoProxy, o.LinkFile = flags.Dir, o.Yes || flags.Yes, flags.NoProxy, flags.LinkFile
+	if flags.BlockEgressIPs != nil {
+		o.BlockEgressIPs = flags.BlockEgressIPs
+	}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	for _, f := range []struct {
@@ -90,6 +104,7 @@ func parseSetupOptions(args []string) (server.SetupOptions, bool, error) {
 	}{
 		{"ip", &o.IP, flags.IP}, {"sni", &o.SNI, flags.SNI},
 		{"device", &o.Device, flags.Device}, {"fast-hop", &o.Fast.Hop, flags.Fast.Hop},
+		{"fast-hop-address", &o.Fast.Address, flags.Fast.Address},
 	} {
 		if set[f.name] {
 			*f.dst = f.src

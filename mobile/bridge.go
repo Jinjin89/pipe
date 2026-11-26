@@ -19,12 +19,14 @@ import (
 	"pipe/internal/engine"
 	"pipe/internal/failover"
 	"pipe/internal/logring"
+	"pipe/internal/update"
 )
 
 type clientEngine interface {
 	Start() error
 	Close() error
 	ProbeLatency(context.Context, string, bool) (bool, time.Duration, bool, error)
+	MeasureRTT(context.Context, string) (time.Duration, bool, error)
 	SelectTier(string) error
 	RelayState(string) string
 	VPNOnline() bool
@@ -37,6 +39,7 @@ func createEngine(ctx context.Context, options engine.Options) (clientEngine, er
 
 type vpnStatus struct {
 	Running         bool                    `json:"running"`
+	Blocked         bool                    `json:"blocked,omitempty"`
 	Mode            string                  `json:"mode"`
 	Tier            string                  `json:"tier"`
 	TierPreference  string                  `json:"tierPreference"`
@@ -51,19 +54,24 @@ type vpnStatus struct {
 	LastError       string                  `json:"lastError"`
 	LatencyMs       *int64                  `json:"latencyMs"`
 	Routes          map[string]routeLatency `json:"routes"`
+	MeasurementAt   *time.Time              `json:"measurementAt,omitempty"`
 	ConnectedSince  int64                   `json:"connectedSince"` // unix milliseconds, 0 when off
 }
 
 type routeLatency struct {
-	Ms int64     `json:"ms"`
-	OK bool      `json:"ok"`
-	At time.Time `json:"at"`
+	Ms  int64     `json:"ms"`
+	OK  bool      `json:"ok"`
+	At  time.Time `json:"at"`
+	Via string    `json:"via,omitempty"`
 }
 
 type bridge struct {
 	mu        sync.Mutex
 	active    *session
+	starting  bool
+	updates   []*update.Manager
 	newEngine func(context.Context, engine.Options) (clientEngine, error)
+	guard     func() // owns the current Android VPN descriptor independent of the engine
 
 	stateMu sync.Mutex
 	state   vpnStatus
@@ -75,11 +83,12 @@ type bridge struct {
 
 type session struct {
 	settings
-	platform Platform
-	engine   clientEngine
-	fakeIP   *engine.FakeIP
-	ctx      context.Context
-	cancel   context.CancelFunc
+	platform      Platform
+	engine        clientEngine
+	ctx           context.Context
+	cancel        context.CancelFunc
+	networkCtx    context.Context
+	cancelNetwork context.CancelFunc
 
 	up, down   atomic.Int64
 	wake       chan struct{}
@@ -116,7 +125,12 @@ func (b *bridge) start(profile, prefsJSON string, platform Platform) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.active != nil {
+	b.starting = true
+	defer func() { b.starting = false }()
+	for _, manager := range b.updates {
+		manager.CancelDirect()
+	}
+	if b.active != nil || b.guard != nil {
 		return errors.New("VPN is already running")
 	}
 	if runtime.GOOS == "android" {
@@ -127,15 +141,25 @@ func (b *bridge) start(profile, prefsJSON string, platform Platform) error {
 		b.fakeIP = &engine.FakeIP{}
 	}
 	netIPv6 := engine.VPNNetworkIPv6(platform.NetworkState())
-	s, err := b.buildSession(next, platform, b.fakeIP, nil, netIPv6)
+	s, release, err := b.buildGuarded(next, platform, netIPv6)
 	if err != nil {
+		if release != nil {
+			release()
+		}
 		return b.startError(err.Error())
 	}
-	b.activate(s)
+	b.activate(s, release)
 	return nil
 }
 
-func (b *bridge) buildSession(next settings, platform Platform, fakeIP *engine.FakeIP, holdTun func(func()), netIPv6 bool) (*session, error) {
+func (b *bridge) buildGuarded(next settings, platform Platform, netIPv6 bool) (s *session, release func(), err error) {
+	s, err = b.buildSession(next, platform, func(closeTun func()) {
+		release = closeTun
+	}, netIPv6)
+	return
+}
+
+func (b *bridge) buildSession(next settings, platform Platform, holdTun func(func()), netIPv6 bool) (*session, error) {
 	client := networkClientOptions(next.client, netIPv6)
 	var engineConfig engine.Object
 	client.LANDNSServers = func() []netip.AddrPort {
@@ -151,11 +175,12 @@ func (b *bridge) buildSession(next settings, platform Platform, fakeIP *engine.F
 	engineConfig = compiled.Config
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &session{
-		settings: next, platform: platform, fakeIP: fakeIP, ctx: ctx, cancel: cancel,
+		settings: next, platform: platform, ctx: ctx, cancel: cancel,
 		wake: make(chan struct{}, 1), netIPv6: netIPv6,
 	}
 	compiled.LogWriter = logs.Writer()
-	compiled.FakeIP = fakeIP
+	s.networkCtx, s.cancelNetwork = context.WithCancel(ctx)
+	compiled.FakeIP = b.fakeIP
 	compiled.VPN = &engine.VPNOptions{
 		Platform: platform, PerApp: next.apps.Mode, Packages: next.apps.Packages, HoldTun: holdTun,
 		CountBytes: func(up, down int64) {
@@ -196,12 +221,17 @@ func (b *bridge) buildSession(next settings, platform Platform, fakeIP *engine.F
 	return s, nil
 }
 
-func (b *bridge) activate(s *session) {
+func (b *bridge) activate(s *session, guard func()) {
 	connectedSince := time.Now().UnixMilli()
+	routes := map[string]routeLatency{}
+	var measuredAt *time.Time
 	if previous := b.active; previous != nil {
 		b.stateMu.Lock()
 		if b.state.Running && b.state.ConnectedSince != 0 {
 			connectedSince = b.state.ConnectedSince
+		}
+		if previous.client.Relay == s.client.Relay && previous.client.IPv6 == s.client.IPv6 && previous.netIPv6 == s.netIPv6 {
+			routes, measuredAt = b.state.Routes, b.state.MeasurementAt
 		}
 		b.stateMu.Unlock()
 		_ = previous.close()
@@ -210,14 +240,16 @@ func (b *bridge) activate(s *session) {
 		}
 	}
 	b.active = s
+	b.replaceGuard(guard)
 	tier := displayedTier(s.client.Mode, s.client.Tier)
 	b.stateMu.Lock()
 	b.owner = s
 	b.state = vpnStatus{
 		Running: true, Mode: s.client.Mode, Tier: tier,
 		TierPreference: string(s.client.Tier), RescueAvailable: s.client.Profile.CDN != "",
-		Server: s.client.Profile.Name, Routes: map[string]routeLatency{},
-		Relay: s.relayHost, RelayState: s.engine.RelayState(tier),
+		Server: s.client.Profile.Name, Routes: routes, MeasurementAt: measuredAt,
+		LatencyMs: routeMs(routes, tier),
+		Relay:     s.relayHost, RelayState: s.engine.RelayState(tier),
 		ConnectedSince: connectedSince,
 	}
 	b.stateMu.Unlock()
@@ -237,16 +269,11 @@ func (b *bridge) activate(s *session) {
 	}
 }
 
-// connectProbe measures the active tier once after connecting.
+// connectProbe checks the active tier once after connecting.
 func (b *bridge) connectProbe(s *session, instance clientEngine, tier string) {
 	ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
 	defer cancel()
-	stalled, latency, _, err := instance.ProbeLatency(ctx, tier, false)
-	if s.ctx.Err() != nil {
-		return
-	}
-	// The next one-second report publishes the result.
-	b.recordRoute(s, tier, latency, err == nil && !stalled)
+	_, _, _, _ = instance.ProbeLatency(ctx, tier, false)
 }
 
 func displayedTier(mode string, tier failover.Tier) string {
@@ -273,26 +300,47 @@ func (b *bridge) stop() {
 }
 
 func (b *bridge) stopLocked() {
+	b.endSession(nil, "")
+}
+
+func (b *bridge) replaceGuard(next func()) {
+	previous := b.guard
+	b.guard = next
+	if previous != nil {
+		previous()
+	}
+}
+
+func (b *bridge) endSession(guard func(), reason string) {
 	s := b.active
-	if s == nil {
+	if s == nil && b.guard == nil {
 		return
 	}
 	b.active = nil
-	err := s.close()
+	var err error
+	if s != nil {
+		err = s.close()
+	}
+	b.replaceGuard(guard)
 	b.stateMu.Lock()
 	b.owner = nil
-	b.state.Running = false
+	b.state.Running, b.state.Blocked = false, guard != nil
 	b.state.Tier = ""
 	b.state.Relay, b.state.RelayState = "", ""
 	b.state.LatencyMs, b.state.ConnectedSince = nil, 0
-	b.state.Routes = map[string]routeLatency{}
-	b.state.UpBytes, b.state.DownBytes = s.up.Load(), s.down.Load()
+	b.state.Routes, b.state.MeasurementAt = map[string]routeLatency{}, nil
+	if s != nil {
+		b.state.UpBytes, b.state.DownBytes = s.up.Load(), s.down.Load()
+	}
 	b.state.UpRate, b.state.DownRate = 0, 0
-	if err != nil {
+	b.state.LastError = reason
+	if err != nil && reason == "" {
 		b.state.LastError = "VPN shutdown reported an error"
 	}
 	b.stateMu.Unlock()
-	s.platform.OnStatus(b.statusJSON())
+	if s != nil {
+		s.platform.OnStatus(b.statusJSON())
+	}
 	logs.Add(logring.Info, "pipe", "Disconnected")
 }
 
@@ -393,29 +441,28 @@ func (b *bridge) replace(previous *session, next settings) error {
 }
 
 func (b *bridge) replaceForNetwork(previous *session, next settings, netIPv6 bool) error {
-	var releaseTun func()
-	replacement, err := b.buildSession(next, previous.platform, previous.fakeIP, func(release func()) {
-		releaseTun = release
-	}, netIPv6)
-	if releaseTun != nil {
-		defer releaseTun()
+	replacement, guard, err := b.buildGuarded(next, previous.platform, netIPv6)
+	if err == nil {
+		b.activate(replacement, guard)
+		return nil
 	}
-	if err != nil {
-		if releaseTun != nil {
-			// Keep Android's active TUN open during rollback, even though
-			// the failed engine has already shut down.
-			restored, restoreErr := b.buildSession(previous.settings, previous.platform, previous.fakeIP, nil, previous.netIPv6)
-			if restoreErr == nil {
-				b.activate(restored)
-			} else {
-				b.stopLocked()
-				return b.startError(err.Error())
-			}
-		}
+	if guard == nil {
 		return err
 	}
-	b.activate(replacement)
-	return nil
+	// The most recently established interface owns Android's routes.
+	// Retain it across a failed engine start, including a failed rollback.
+	restored, rollbackGuard, restoreErr := b.buildGuarded(previous.settings, previous.platform, previous.netIPv6)
+	if restoreErr == nil {
+		b.activate(restored, rollbackGuard)
+		guard()
+	} else {
+		if rollbackGuard != nil {
+			guard()
+			guard = rollbackGuard
+		}
+		b.endSession(guard, err.Error())
+	}
+	return err
 }
 
 func (b *bridge) networkChanged(reset bool) {
@@ -434,9 +481,15 @@ func (b *bridge) networkChanged(reset bool) {
 			return
 		}
 		s.online.Store(online)
+		if reset || !online {
+			s.cancelNetwork()
+		}
 		if !online {
 			s.pauseAuto()
 			return
+		}
+		if s.networkCtx.Err() != nil {
+			s.networkCtx, s.cancelNetwork = context.WithCancel(s.ctx)
 		}
 		if reset && s.client.Relay != "" {
 			b.refreshRelayState(s)
@@ -461,10 +514,7 @@ func (b *bridge) enableAuto(s *session) error {
 		Tiers:          failover.Available(s.client.Profile.CDN != ""),
 		ExtraProbeTime: extraProbeTime,
 		Probe: func(ctx context.Context, tier failover.Tier, burst bool) (bool, error) {
-			stalled, latency, _, err := s.engine.ProbeLatency(ctx, string(tier), burst)
-			if !burst {
-				b.recordRoute(s, string(tier), latency, err == nil && !stalled)
-			}
+			stalled, _, _, err := s.engine.ProbeLatency(ctx, string(tier), burst)
 			return stalled, err
 		},
 		Select: func(tier failover.Tier) error {
@@ -538,30 +588,14 @@ func (b *bridge) update(s *session, update func(*vpnStatus)) {
 }
 
 func routeMs(routes map[string]routeLatency, tier string) *int64 {
-	if r, ok := routes[tier]; ok && r.OK {
+	if r, ok := routes[tier]; ok && r.OK && r.Ms > 0 {
 		ms := r.Ms
 		return &ms
 	}
 	return nil
 }
 
-func (b *bridge) recordRoute(s *session, tier string, latency time.Duration, ok bool) {
-	entry := routeLatency{At: time.Now(), OK: ok}
-	if ok {
-		entry.Ms = max(latency.Milliseconds(), 1)
-	}
-	b.update(s, func(status *vpnStatus) {
-		if status.Routes == nil {
-			status.Routes = map[string]routeLatency{}
-		}
-		status.Routes[tier] = entry
-		if tier == status.Tier {
-			status.LatencyMs = routeMs(status.Routes, tier)
-		}
-	})
-}
-
-// testRoutes probes each available route once, in parallel, for at most 12 s.
+// testRoutes measures the application RTT of each available route in parallel.
 func (b *bridge) testRoutes() string {
 	b.mu.Lock()
 	s := b.active
@@ -575,6 +609,11 @@ func (b *bridge) testRoutes() string {
 		defer s.work.Done()
 		ctx, cancel := context.WithTimeout(s.ctx, 12*time.Second)
 		defer cancel()
+		if e, ok := instance.(interface {
+			ProbeContext(context.Context) context.Context
+		}); ok {
+			ctx = e.ProbeContext(ctx)
+		}
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 		for _, tier := range failover.Available(s.client.Profile.CDN != "") {
@@ -583,12 +622,13 @@ func (b *bridge) testRoutes() string {
 				defer wg.Done()
 				probeCtx, stop := context.WithTimeout(ctx, 8*time.Second)
 				defer stop()
-				stalled, latency, _, err := instance.ProbeLatency(probeCtx, string(tier), false)
-				ok := err == nil && !stalled
-				b.recordRoute(s, string(tier), latency, ok)
-				entry := routeLatency{At: time.Now(), OK: ok}
-				if ok {
-					entry.Ms = max(latency.Milliseconds(), 1)
+				rtt, via, err := instance.MeasureRTT(probeCtx, string(tier))
+				entry := routeLatency{At: time.Now(), OK: err == nil && probeCtx.Err() == nil}
+				if entry.OK && rtt > 0 {
+					entry.Ms = max(rtt.Round(time.Millisecond).Milliseconds(), 1)
+				}
+				if entry.OK && via {
+					entry.Via = "relay"
 				}
 				mu.Lock()
 				result[string(tier)] = entry
@@ -596,7 +636,17 @@ func (b *bridge) testRoutes() string {
 			}()
 		}
 		wg.Wait()
-		s.notify()
+		if s.ctx.Err() == nil {
+			at := time.Now()
+			b.update(s, func(status *vpnStatus) {
+				status.Routes = result
+				status.MeasurementAt = &at
+				status.LatencyMs = routeMs(result, status.Tier)
+			})
+			s.notify()
+		} else {
+			result = map[string]routeLatency{}
+		}
 	}
 	body, _ := json.Marshal(result)
 	return string(body)

@@ -20,6 +20,8 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A second termination signal uses the default handler during shutdown.
+	context.AfterFunc(ctx, stop)
 	if err := run(ctx, os.Args[1:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintln(os.Stderr, "pipe:", err)
 		os.Exit(1)

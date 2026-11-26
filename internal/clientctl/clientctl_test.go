@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +27,7 @@ import (
 	"pipe/internal/failover"
 	"pipe/internal/link"
 	"pipe/internal/logring"
+	"pipe/internal/sysdns"
 )
 
 type fakeEngine struct {
@@ -106,6 +110,7 @@ type harness struct {
 func newHarness() *harness {
 	h := &harness{logs: logring.New(100)}
 	h.c = New(h.logs)
+	h.c.startTUNGuard = func() (io.Closer, error) { return testGuard(func() error { return nil }), nil }
 	h.c.newEngine = func(_ context.Context, o engine.Options) (engineAPI, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -711,6 +716,202 @@ func TestOnStoppedRunsWhenReplaceAndRollbackFail(t *testing.T) {
 	}
 }
 
+type testGuard func() error
+
+func (f testGuard) Close() error { return f() }
+
+type guardDNS struct {
+	sysdns.Backend
+	server string
+}
+
+func (d *guardDNS) Capture() (json.RawMessage, error) { return json.Marshal(d.server) }
+
+func (d *guardDNS) Extend(saved json.RawMessage) (json.RawMessage, error) { return saved, nil }
+
+func (d *guardDNS) Apply(json.RawMessage) error {
+	d.server = sysdns.TUNDNSAddress
+	return nil
+}
+
+func (d *guardDNS) Restore(snapshot json.RawMessage) (json.RawMessage, error) {
+	return nil, json.Unmarshal(snapshot, &d.server)
+}
+
+func TestTUNReplacementKeepsCaptureAndDNSUntilReadyOrStop(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fail int
+	}{
+		{"replacement starts", 0},
+		{"rollback starts", 1},
+		{"explicit stop after failed rollback", 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness()
+			dns := &guardDNS{server: "192.168.1.1"}
+			manager := sysdns.New(dns, filepath.Join(t.TempDir(), "dns.armed"))
+			defer manager.Restore()
+			defer h.c.Stop()
+			o := opts()
+			o.TUN = true
+			if err := h.c.StartWithReady(o, manager.Set); err != nil {
+				t.Fatal(err)
+			}
+
+			guarded, released, stopped := false, false, false
+			h.c.SetOnStopped(func() { stopped = true })
+			h.c.startTUNGuard = func() (io.Closer, error) {
+				if h.engine(0).closed.Load() {
+					t.Error("old capture closed before the guard was installed")
+				}
+				guarded = true
+				return testGuard(func() error {
+					if test.fail < 2 && !h.engine(test.fail+1).started.Load() {
+						t.Error("guard released before capture resumed")
+					}
+					if err := manager.Restore(); !errors.Is(err, sysdns.ErrTUNProtected) {
+						t.Errorf("DNS restore during guard cleanup returned %v", err)
+					}
+					guarded, released = false, true
+					return nil
+				}), nil
+			}
+			var starts int
+			h.next = func(e *fakeEngine) {
+				if !guarded || !h.engines[0].closed.Load() {
+					t.Error("engine rebuild began without a guard covering the old capture")
+				}
+				if err := manager.Restore(); !errors.Is(err, sysdns.ErrTUNProtected) {
+					t.Errorf("DNS restore during rebuild returned %v", err)
+				}
+				starts++
+				if starts <= test.fail {
+					e.startErr = errors.New("test engine could not start")
+				}
+			}
+			err := h.c.SetMode(config.Global)
+			if (err != nil) != (test.fail != 0) {
+				t.Errorf("rebuild error = %v", err)
+			}
+			if test.fail == 2 {
+				status := h.c.Status()
+				if released || stopped || !guarded || status.State != StateError || !status.Guarded ||
+					!strings.Contains(status.LastError, "Network traffic is paused") {
+					t.Errorf("failed rollback lost protection or error state: %v", status)
+				}
+				if err := manager.Restore(); !errors.Is(err, sysdns.ErrTUNProtected) {
+					t.Errorf("failed rollback allowed DNS restoration: %v", err)
+				}
+			} else if !released || guarded || h.c.Status().State != StateOn || h.c.Status().Guarded {
+				t.Error("working capture did not replace the guard")
+			}
+			if dns.server != "172.19.0.2" {
+				t.Errorf("system DNS during rebuild = %q", dns.server)
+			}
+			if err := h.c.Stop(); err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.Restore(); err != nil {
+				t.Fatal(err)
+			}
+			if guarded || !released || dns.server != "192.168.1.1" || h.c.Status().TUNIPv6 || h.c.Status().Guarded {
+				t.Errorf("Stop did not release the guard and restore the original resolver")
+			}
+		})
+	}
+}
+
+func TestTUNApplyDNSFailureKeepsGuardUntilReady(t *testing.T) {
+	h := newHarness()
+	o := opts()
+	o.TUN = true
+	if err := h.c.Start(o); err != nil {
+		t.Fatal(err)
+	}
+	defer h.c.Stop()
+	o.Mode = config.Global
+	var attempts int
+	err := h.c.ApplyWithReady(o, func() error {
+		attempts++
+		if !h.c.Status().Guarded {
+			t.Error("DNS readiness ran after releasing the guard")
+		}
+		return errors.New("DNS setup failed")
+	})
+	if st := h.c.Status(); err == nil || attempts != 2 || !st.Guarded || st.State != StateError {
+		t.Fatalf("failed DNS on apply and rollback: attempts=%d status=%+v error=%v", attempts, st, err)
+	}
+	if err := h.c.StartWithReady(o, func() error {
+		if !h.c.Status().Guarded {
+			t.Error("fresh connection released the guard before readiness")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if st := h.c.Status(); st.Guarded || st.State != StateOn {
+		t.Fatalf("successful connection left the guard holding capture: %+v", st)
+	}
+}
+
+func TestUnchangedTUNApplyKeepsEngineOnDNSFailure(t *testing.T) {
+	h := newHarness()
+	o := opts()
+	o.TUN = true
+	if err := h.c.Start(o); err != nil {
+		t.Fatal(err)
+	}
+	defer h.c.Stop()
+	dnsErr := errors.New("fixture DNS reapply failed")
+	if err := h.c.ApplyWithReady(o, func() error { return dnsErr }); !errors.Is(err, dnsErr) {
+		t.Fatalf("unchanged Apply returned %v", err)
+	}
+	if st := h.c.Status(); st.State != StateOn || st.Guarded || h.engineCount() != 1 || h.engine(0).closed.Load() {
+		t.Fatalf("failed reapply changed the active engine: %+v", st)
+	}
+}
+
+func TestTUNRebuildKeepsLiveEngineWhenGuardCannotStart(t *testing.T) {
+	h := newHarness()
+	o := opts()
+	o.TUN = true
+	if err := h.c.Start(o); err != nil {
+		t.Fatal(err)
+	}
+	defer h.c.Stop()
+	h.c.startTUNGuard = func() (io.Closer, error) { return nil, errors.New("no guard routes available") }
+	if err := h.c.SetMode(config.Global); err == nil {
+		t.Fatal("rebuilt without a guard")
+	}
+	if h.engine(0).closed.Load() || h.engineCount() != 1 || h.c.Status().State != StateOn {
+		t.Fatal("guard failure closed working capture")
+	}
+}
+
+func TestTUNGuardCapturesBothFamiliesWithMoreSpecificRoutes(t *testing.T) {
+	options, err := guardTUNOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		addresses []string
+		routes    []netip.Prefix
+	}{
+		{[]string{"192.0.2.1", sysdns.TUNDNSAddress}, options.Inet4RouteAddress},
+		{[]string{"2001:db8::1", "fdfe:dcba:9876::2"}, options.Inet6RouteAddress},
+	} {
+		for _, raw := range test.addresses {
+			addr := netip.MustParseAddr(raw)
+			if !slices.ContainsFunc(test.routes, func(route netip.Prefix) bool {
+				return route.Bits() > 0 && route.Contains(addr)
+			}) {
+				t.Errorf("guard has no specific route covering %s", addr)
+			}
+		}
+	}
+}
+
 func TestSetTierIsLive(t *testing.T) {
 	h := newHarness()
 	if err := h.c.Start(opts()); err != nil {
@@ -1008,8 +1209,8 @@ func TestIPv6FollowsTheNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer h.c.Stop()
-	if h.engineCount() != 1 || tunHasIPv6(h.engine(0)) || engineHasIPv6(h.engine(0)) {
-		t.Fatal("an IPv4-only network must get an IPv4-only engine from the start")
+	if h.engineCount() != 1 || !tunHasIPv6(h.engine(0)) || engineHasIPv6(h.engine(0)) {
+		t.Fatal("TUN must capture IPv6 before the physical network gains it")
 	}
 	if st := h.c.Status(); st.IPv6Available == nil || *st.IPv6Available {
 		t.Fatalf("status %+v", st)
@@ -1070,13 +1271,9 @@ func TestIPv6PeriodicCheck(t *testing.T) {
 	}
 }
 
-// If the OS refuses the TUN an IPv6 address, Pipe runs IPv4-only and doesn't
-// keep rebuilding.
-func TestTUNWithoutIPv6Fallback(t *testing.T) {
+func TestTUNRefusesUnprotectedIPv6Fallback(t *testing.T) {
 	h := newHarness()
 	h.c.networkIPv6, h.c.ipv6Every = func() bool { return true }, 10*time.Millisecond
-	var fallbackCalls atomic.Int32
-	h.c.settings.OnTUNIPv6Fallback = func() { fallbackCalls.Add(1) }
 	h.next = func(e *fakeEngine) {
 		if tunHasIPv6(e) {
 			e.startErr = errors.New("add IPv6 address: permission denied")
@@ -1084,20 +1281,9 @@ func TestTUNWithoutIPv6Fallback(t *testing.T) {
 	}
 	o := opts()
 	o.TUN = true
-	if err := h.c.Start(o); err != nil {
-		t.Fatal(err)
-	}
-	defer h.c.Stop()
-	time.Sleep(60 * time.Millisecond)
-	last := h.engine(h.engineCount() - 1)
-	if h.engineCount() != 2 || tunHasIPv6(last) || engineHasIPv6(last) || h.c.Status().State != StateOn {
-		t.Fatalf("fallback: %d engines, status %+v", h.engineCount(), h.c.Status())
-	}
-	if !strings.Contains(h.messages(), "The TUN couldn't get an IPv6 address; Pipe uses IPv4, and some IPv6 traffic may bypass Pipe.") {
-		t.Fatal(h.messages())
-	}
-	if got := fallbackCalls.Load(); got != 1 {
-		t.Fatalf("fallback notification count %d", got)
+	if err := h.c.Start(o); err == nil || h.engineCount() != 1 || h.c.Status().State == StateOn {
+		h.c.Stop()
+		t.Fatalf("IPv6 capture failure result: %v, %d engines", err, h.engineCount())
 	}
 }
 

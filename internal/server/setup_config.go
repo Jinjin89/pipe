@@ -25,14 +25,15 @@ const maxSetupConfigBytes = 64 << 10
 
 // SetupConfig is the operator's setup JSON. Certificate values are file paths.
 type SetupConfig struct {
-	IP      string            `json:"ip,omitempty"`
-	SNI     string            `json:"sni"`
-	Cert    *SetupCertificate `json:"cert,omitempty"`
-	Fast    SetupFast         `json:"fast,omitzero"`
-	Stealth SetupPort         `json:"stealth,omitzero"`
-	Proxy   *SetupPort        `json:"proxy,omitempty"`
-	Rescue  *SetupRescue      `json:"rescue,omitempty"`
-	Device  string            `json:"device,omitempty"`
+	IP             string            `json:"ip,omitempty"`
+	BlockEgressIPs []netip.Addr      `json:"block_egress_ips,omitempty"`
+	SNI            string            `json:"sni"`
+	Cert           *SetupCertificate `json:"cert,omitempty"`
+	Fast           SetupFast         `json:"fast,omitzero"`
+	Stealth        SetupPort         `json:"stealth,omitzero"`
+	Proxy          *SetupPort        `json:"proxy,omitempty"`
+	Rescue         *SetupRescue      `json:"rescue,omitempty"`
+	Device         string            `json:"device,omitempty"`
 }
 
 type SetupCertificate struct {
@@ -44,8 +45,9 @@ type SetupCertificate struct {
 }
 
 type SetupFast struct {
-	Port uint16 `json:"port,omitempty"`
-	Hop  string `json:"hop,omitempty"`
+	Port    uint16 `json:"port,omitempty"`
+	Hop     string `json:"hop,omitempty"`
+	Address string `json:"address,omitempty"`
 }
 
 type SetupPort struct {
@@ -200,7 +202,7 @@ func savedSetupSNI(s Settings) string {
 
 func (env SetupEnv) savedSetupConfig(s Settings, example SetupConfig) SetupConfig {
 	cfg := SetupConfig{SNI: savedSetupSNI(s), Fast: env.savedSetupFast(s),
-		Stealth: SetupPort{Port: s.stealthPort()}}
+		Stealth: SetupPort{Port: s.stealthPort()}, BlockEgressIPs: s.BlockEgressIPs}
 	if ip, err := netip.ParseAddr(s.Domain); err == nil {
 		cfg.IP = ip.String()
 	}
