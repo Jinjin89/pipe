@@ -148,13 +148,6 @@ func webUpstreamWarning(upstream string) string {
 	return "--web-upstream " + host + " is not a loopback or private address. Unauthenticated visitors will be proxied to that site with this server's bandwidth"
 }
 
-func serveProbe(w http.ResponseWriter, r *http.Request) {
-	status, body := engine.ProbeResponse(r)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(status)
-	w.Write([]byte(body))
-}
-
 func loadCFOriginCA(path string) (*x509.CertPool, error) {
 	data, err := localfile.Read(path, localfile.MaxConfigBytes, false)
 	if err != nil {

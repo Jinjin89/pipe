@@ -21,11 +21,11 @@ import (
 
 	"pipe/internal/engine"
 	"pipe/internal/link"
+	"pipe/internal/overload"
 )
 
 const (
 	proxyIdleTimeout  = 60 * time.Second
-	proxyDeviceLimit  = 16
 	proxyFailureLimit = 4096
 )
 
@@ -35,6 +35,7 @@ type httpsProxy struct {
 	dial   func(context.Context, string, string) (net.Conn, error)
 	now    func() time.Time
 	policy interface{ AllowsFresh(netip.Addr) bool }
+	guard  *overload.Guard
 
 	mu       sync.Mutex
 	devices  map[string]*proxyDevice
@@ -104,15 +105,32 @@ func (p *httpsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	peer, _ := netip.ParseAddrPort(r.RemoteAddr)
 	name, password := proxyCredentials(header)
 	ctx, finish, accepted := p.acquire(r.Context(), peer.Addr(), name, password)
-	switch {
-	case !accepted:
+	if !accepted {
 		p.site.ServeHTTP(w, r)
 		return
-	case finish == nil:
+	}
+	var lease *overload.Lease
+	defer func() {
+		finish()
+		lease.Release()
+	}()
+	var err error
+	if p.guard != nil {
+		lease, err = p.guard.Acquire(ctx, overload.ClassFlow)
+	}
+	if err != nil || ctx.Err() != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, overload.ErrOverloaded) {
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(p.guard.RetryAfter().Seconds()))))
+		}
 		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
-	defer finish()
+	if lease != nil {
+		ctx = overload.WithLease(ctx, lease)
+	}
 	r = r.WithContext(ctx)
 	if r.Method == http.MethodConnect {
 		p.connect(w, r)
@@ -171,9 +189,6 @@ func (p *httpsProxy) acquire(ctx context.Context, peer netip.Addr, name, passwor
 		return nil, nil, false
 	}
 	delete(p.failures, peer)
-	if len(device.active) >= proxyDeviceLimit {
-		return nil, nil, true
-	}
 	device.serial++
 	id := device.serial
 	ctx, cancel := context.WithCancel(ctx)
@@ -212,7 +227,15 @@ func (p *httpsProxy) recordFailure(peer netip.Addr, now time.Time, entry proxyFa
 	p.failures[peer] = entry
 }
 
-func (p *httpsProxy) dialPublic(ctx context.Context, network, address string) (net.Conn, error) {
+func (p *httpsProxy) dialPublic(ctx context.Context, network, address string) (conn net.Conn, err error) {
+	defer func() {
+		if lease := overload.LeaseFromContext(ctx); lease != nil {
+			lease.DialDone(conn != nil && err == nil)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil, errors.New("proxy requires TCP")
 	}
@@ -228,6 +251,9 @@ func (p *httpsProxy) dialPublic(ctx context.Context, network, address string) (n
 	if err != nil {
 		addresses, err = p.lookup(ctx, "ip", host)
 		if err != nil || len(addresses) == 0 {
+			if p.guard != nil {
+				p.guard.ObserveError(err)
+			}
 			return nil, errors.New("proxy destination DNS lookup failed")
 		}
 	}
@@ -248,10 +274,17 @@ func (p *httpsProxy) dialPublic(ctx context.Context, network, address string) (n
 		// (for example broken IPv6 on the server) cannot use up the whole
 		// timeout before the other family is tried.
 		attempt, stop := context.WithTimeout(ctx, proxyDialAttempt)
-		conn, err := p.dial(attempt, network, net.JoinHostPort(ip.Unmap().String(), port))
+		if err := attempt.Err(); err != nil {
+			stop()
+			return nil, err
+		}
+		conn, err = p.dial(attempt, network, net.JoinHostPort(ip.Unmap().String(), port))
 		stop()
 		if err == nil {
 			return conn, nil
+		}
+		if p.guard != nil {
+			p.guard.ObserveError(err)
 		}
 		if ctx.Err() != nil {
 			break
@@ -457,8 +490,10 @@ func (p *httpsProxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn, err := p.dialPublic(ctx, network, address)
+		DialContext: func(_ context.Context, network, address string) (net.Conn, error) {
+			// The transport may keep a dial alive past the HTTP request's
+			// cancellation. Bind it to this credential's request instead.
+			conn, err := p.dialPublic(r.Context(), network, address)
 			if err != nil {
 				return nil, err
 			}

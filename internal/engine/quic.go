@@ -18,8 +18,12 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-func registerQUIC(in *inbound.Registry, out *outbound.Registry, reloads map[string]*reloadableInbound, options Options, relay *relayState) {
-	registerInbound(in, reloads, options.Server, C.TypeHysteria2, hysteria2.NewInbound)
+func registerQUIC(in *inbound.Registry, out *outbound.Registry, reloads map[string]*reloadableInbound, options Options, relay *relayState, sessions ...*deviceSessions) {
+	var admission *deviceSessions
+	if len(sessions) != 0 {
+		admission = sessions[0]
+	}
+	registerInbound(in, reloads, admission, C.TypeHysteria2, hysteria2.NewInbound)
 	outbound.Register(out, C.TypeHysteria2,
 		func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, opts option.Hysteria2OutboundOptions) (adapter.Outbound, error) {
 			base, err := newFastOutbound(ctx, router, logger, tag, opts, relay)

@@ -8,5 +8,5 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 )
 
-func registerQUIC(*inbound.Registry, *outbound.Registry, map[string]*reloadableInbound, Options, *relayState) {
+func registerQUIC(*inbound.Registry, *outbound.Registry, map[string]*reloadableInbound, Options, *relayState, ...*deviceSessions) {
 }

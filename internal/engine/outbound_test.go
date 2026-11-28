@@ -5,15 +5,23 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"slices"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"pipe/internal/overload"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 type dialRecorder struct {
@@ -131,6 +139,8 @@ func (d *parallelDialRecorder) ListenPacket(_ context.Context, destination M.Soc
 
 type packetConnRecorder struct{ net.PacketConn }
 
+func (*packetConnRecorder) Close() error { return nil }
+
 func (*packetConnRecorder) WriteTo(payload []byte, _ net.Addr) (int, error) {
 	return len(payload), nil
 }
@@ -145,7 +155,7 @@ func TestGuardedDirectParallelDialFiltersCandidates(t *testing.T) {
 		return nil
 	}
 	base := &parallelDialRecorder{}
-	wrapped := newServerGuardedOutbound(base, guard)
+	wrapped := newServerGuardedOutbound(base, guard, nil)
 	parallel, ok := wrapped.(interface {
 		DialParallelNetwork(context.Context, string, M.Socksaddr, []netip.Addr, *C.NetworkStrategy, []C.InterfaceType, []C.InterfaceType, time.Duration) (net.Conn, error)
 	})
@@ -195,7 +205,7 @@ func TestGuardedDirectParallelDialRechecksDelayedCandidate(t *testing.T) {
 	}
 	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	})
+	}, nil)
 	parallel := wrapped.(interface {
 		DialParallelNetwork(context.Context, string, M.Socksaddr, []netip.Addr, *C.NetworkStrategy, []C.InterfaceType, []C.InterfaceType, time.Duration) (net.Conn, error)
 	})
@@ -212,7 +222,7 @@ func TestGuardedDirectParallelDialRejectsAllCandidates(t *testing.T) {
 	base := &parallelDialRecorder{}
 	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	})
+	}, nil)
 	parallel := wrapped.(interface {
 		DialParallelNetwork(context.Context, string, M.Socksaddr, []netip.Addr, *C.NetworkStrategy, []C.InterfaceType, []C.InterfaceType, time.Duration) (net.Conn, error)
 	})
@@ -231,7 +241,7 @@ func TestServerEgressRejectsLocalAndConfiguredCandidates(t *testing.T) {
 	base := &parallelDialRecorder{}
 	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	}).(*guardedParallelOutbound)
+	}, nil).(*guardedParallelOutbound)
 	policy := NewEgressPolicy(netip.MustParseAddr("11.2.3.4"))
 	policy.interfaces = func() ([]net.Addr, error) {
 		return []net.Addr{&net.IPNet{IP: net.IPv4(11, 9, 8, 7), Mask: net.CIDRMask(24, 32)}}, nil
@@ -303,7 +313,7 @@ func TestServerEgressFreshTCPKeepsUDPCached(t *testing.T) {
 	base := new(parallelDialRecorder)
 	out := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	}).(*guardedParallelOutbound)
+	}, nil).(*guardedParallelOutbound)
 	out.routeCheck = func(context.Context, M.Socksaddr) error { return nil }
 	ctx := WithEgressPolicy(t.Context(), policy)
 	packets, err := out.ListenPacket(ctx, destination)
@@ -344,7 +354,7 @@ func TestServerEgressPolicySurvivesRequestContextReplacement(t *testing.T) {
 	base := new(dialRecorder)
 	out := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	}).(*guardedOutbound)
+	}, nil).(*guardedOutbound)
 	scope := adapter.NewScope(WithEgressPolicy(t.Context(), policy), nil)
 	defer scope.Close()
 	if err := out.Start(adapter.StartStateInitialize, scope); err != nil {
@@ -400,7 +410,7 @@ func TestGuardedDirectPacketSkipsUnroutableAddress(t *testing.T) {
 	base := &parallelDialRecorder{}
 	wrapped := newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 		return publicDestination(destination)
-	}).(*guardedParallelOutbound)
+	}, nil).(*guardedParallelOutbound)
 	wrapped.routeCheck = func(_ context.Context, destination M.Socksaddr) error {
 		routeChecks = append(routeChecks, destination.Addr)
 		if destination.Addr == v4 {
@@ -423,6 +433,498 @@ func TestGuardedDirectPacketSkipsUnroutableAddress(t *testing.T) {
 	}
 	if len(base.packetAddresses) != 1 || base.packetAddresses[0].Addr != v6 {
 		t.Fatalf("packet socket destinations were %v, want only %v", base.packetAddresses, v6)
+	}
+}
+
+type overloadOutboundRecorder struct {
+	parallelDialRecorder
+	dial    func(netip.Addr) error
+	newConn func(netip.Addr) net.Conn
+	listen  func(netip.Addr) error
+}
+
+func (d *overloadOutboundRecorder) DialContext(_ context.Context, _ string, dest M.Socksaddr) (net.Conn, error) {
+	if err := d.dial(dest.Addr); err != nil {
+		return nil, err
+	}
+	if d.newConn != nil {
+		return d.newConn(dest.Addr), nil
+	}
+	conn, peer := net.Pipe()
+	_ = peer.Close()
+	return conn, nil
+}
+
+func (d *overloadOutboundRecorder) DialParallelNetwork(ctx context.Context, network string, dest M.Socksaddr, addresses []netip.Addr, _ *C.NetworkStrategy, _ []C.InterfaceType, _ []C.InterfaceType, _ time.Duration) (net.Conn, error) {
+	return d.DialContext(ctx, network, M.SocksaddrFrom(addresses[0], dest.Port))
+}
+
+func (d *overloadOutboundRecorder) ListenPacket(_ context.Context, dest M.Socksaddr) (net.PacketConn, error) {
+	if err := d.listen(dest.Addr); err != nil {
+		return nil, err
+	}
+	return &packetConnRecorder{}, nil
+}
+
+func admissionDialContext(t *testing.T, guard *overload.Guard) context.Context {
+	t.Helper()
+	lease, err := guard.Acquire(t.Context(), overload.ClassFlow)
+	requireSessionOK(t, err)
+	t.Cleanup(lease.Release)
+	policy := NewEgressPolicy()
+	policy.interfaces = func() ([]net.Addr, error) { return nil, nil }
+	return WithEgressPolicy(overload.WithLease(t.Context(), lease), policy)
+}
+
+func TestOutboundAdmissionReservationRetiresOnReturn(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		call func(*guardedParallelOutbound, context.Context, M.Socksaddr) (io.Closer, error)
+	}{
+		{"direct dial", func(o *guardedParallelOutbound, ctx context.Context, dest M.Socksaddr) (io.Closer, error) {
+			return o.DialContext(ctx, "tcp", dest)
+		}},
+		{"parallel dial", func(o *guardedParallelOutbound, ctx context.Context, dest M.Socksaddr) (io.Closer, error) {
+			return o.DialParallelNetwork(ctx, "tcp", dest, []netip.Addr{dest.Addr}, nil, nil, nil, 0)
+		}},
+		{"direct packet listen", func(o *guardedParallelOutbound, ctx context.Context, dest M.Socksaddr) (io.Closer, error) {
+			return o.ListenPacket(ctx, dest)
+		}},
+		{"serial packet listen", func(o *guardedParallelOutbound, ctx context.Context, dest M.Socksaddr) (io.Closer, error) {
+			conn, _, err := o.ListenSerialNetworkPacket(ctx, dest, []netip.Addr{dest.Addr}, nil, nil, nil, 0)
+			return conn, err
+		}},
+	} {
+		for _, outcome := range []struct {
+			name      string
+			err       error
+			emergency bool
+		}{
+			{"success", nil, false},
+			{"dial failure", errors.New("fixture failure"), false},
+			{"FD exhaustion", &net.OpError{Op: "socket", Err: syscall.EMFILE}, true},
+		} {
+			t.Run(operation.name+"/"+outcome.name, func(t *testing.T) {
+				g := overload.New(overload.Options{})
+				defer g.Close()
+				g.RecordSample(overload.Snapshot{OpenFDs: 83, MaxFDs: 100})
+				ctx := admissionDialContext(t, g)
+				attempt := func(netip.Addr) error {
+					if d := g.Diagnostics(); d.PendingDials != 1 {
+						t.Errorf("attempt did not retain its dial reservation: %+v", d)
+					}
+					return outcome.err
+				}
+				base := &overloadOutboundRecorder{dial: attempt, listen: attempt}
+				out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+				out.routeCheck = func(context.Context, M.Socksaddr) error { return nil }
+				conn, err := operation.call(out, ctx, M.SocksaddrFrom(netip.MustParseAddr("8.8.4.4"), 53))
+				if conn != nil {
+					defer conn.Close()
+				}
+				if !errors.Is(err, outcome.err) {
+					t.Fatalf("dial returned %v, want %v", err, outcome.err)
+				}
+				var wantUnmeasured int64
+				if outcome.err == nil {
+					wantUnmeasured = 1
+				}
+				if d := g.Diagnostics(); d.PendingDials != 0 || d.ActiveFlows != 1 || d.UnmeasuredFDs != wantUnmeasured || d.Emergency != outcome.emergency {
+					t.Fatalf("invalid lease or pressure after dial: %+v", d)
+				}
+				retry, err := g.Acquire(t.Context(), overload.ClassFlow)
+				defer retry.Release()
+				if outcome.err == nil || outcome.emergency {
+					if !errors.Is(err, overload.ErrOverloaded) {
+						t.Fatalf("admission reused unavailable headroom: %v", err)
+					}
+				} else {
+					requireSessionOK(t, err)
+				}
+			})
+		}
+	}
+}
+
+func TestOutboundAdmissionKeepsReservationAcrossCandidates(t *testing.T) {
+	first := netip.MustParseAddr("2001:4860:4860::8888")
+	second := netip.MustParseAddr("8.8.8.8")
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			g := overload.New(overload.Options{})
+			defer g.Close()
+			ctx := admissionDialContext(t, g)
+			var attempts atomic.Int32
+			attempt := func(addr netip.Addr) error {
+				attempts.Add(1)
+				d := g.Diagnostics()
+				if d.PendingDials != 1 || (addr == second && !d.Emergency) {
+					t.Errorf("invalid reservation or pressure at %s: %+v", addr, d)
+				}
+				if addr == first {
+					return syscall.ENFILE
+				}
+				return nil
+			}
+			base := &overloadOutboundRecorder{dial: attempt, listen: attempt}
+			out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+			out.routeCheck = func(context.Context, M.Socksaddr) error { return nil }
+			dest := M.Socksaddr{Fqdn: "fixture.invalid", Port: 53}
+			candidates := []netip.Addr{first, second}
+			if network == "tcp" {
+				conn, err := out.DialParallelNetwork(ctx, network, dest, candidates, nil, nil, nil, time.Hour)
+				requireSessionOK(t, err)
+				requireSessionOK(t, conn.Close())
+			} else {
+				conn, addr, err := out.ListenSerialNetworkPacket(ctx, dest, candidates, nil, nil, nil, 0)
+				requireSessionOK(t, err)
+				requireSessionOK(t, conn.Close())
+				if addr != second {
+					t.Fatalf("packet listen selected %s, want %s", addr, second)
+				}
+			}
+			if d := g.Diagnostics(); attempts.Load() != 2 || d.PendingDials != 0 || d.UnmeasuredFDs != 1 || !d.Emergency {
+				t.Fatalf("candidate attempts=%d, %+v", attempts.Load(), d)
+			}
+		})
+	}
+}
+
+func TestOutboundAdmissionChargesConcurrentAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := overload.New(overload.Options{})
+		defer g.Close()
+		ctx := admissionDialContext(t, g)
+		const delay = time.Millisecond
+		failure := errors.New("fixture dial failure")
+		unblock := make(chan struct{}, 2)
+		defer close(unblock)
+		var attempts atomic.Int32
+		base := &overloadOutboundRecorder{dial: func(netip.Addr) error {
+			attempts.Add(1)
+			<-unblock
+			return failure
+		}}
+		out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+		result := make(chan error, 1)
+		go func() {
+			dest := M.Socksaddr{Fqdn: "fixture.invalid", Port: 443}
+			candidates := []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")}
+			_, err := out.DialParallelNetwork(ctx, "tcp", dest, candidates, nil, nil, nil, delay)
+			result <- err
+		}()
+		synctest.Wait()
+		if d := g.Diagnostics(); attempts.Load() != 1 || d.PendingDials != 1 {
+			t.Fatalf("initial attempt reservation: attempts=%d, %+v", attempts.Load(), d)
+		}
+		time.Sleep(delay)
+		synctest.Wait()
+		if d := g.Diagnostics(); attempts.Load() != 2 || d.PendingDials != 2 {
+			t.Fatalf("overlapping attempts did not each reserve a dial: attempts=%d, %+v", attempts.Load(), d)
+		}
+		unblock <- struct{}{}
+		synctest.Wait()
+		if d := g.Diagnostics(); d.PendingDials != 1 {
+			t.Fatalf("one remaining attempt did not inherit the primary slot: %+v", d)
+		}
+		unblock <- struct{}{}
+		if err := <-result; !errors.Is(err, failure) {
+			t.Fatalf("parallel dial returned %v", err)
+		}
+		if d := g.Diagnostics(); d.PendingDials != 0 || d.UnmeasuredFDs != 0 {
+			t.Fatalf("failed attempts retained FD charges: %+v", d)
+		}
+	})
+}
+
+func TestOutboundAdmissionSerialFallbackKeepsLastSlot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := overload.New(overload.Options{})
+		defer g.Close()
+		g.RecordSample(overload.Snapshot{OpenFDs: 83, MaxFDs: 100})
+		ctx := admissionDialContext(t, g)
+		first, second := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")
+		unblock := make(chan struct{})
+		release := sync.OnceFunc(func() { close(unblock) })
+		defer release()
+		var attempts atomic.Int32
+		base := &overloadOutboundRecorder{dial: func(addr netip.Addr) error {
+			attempts.Add(1)
+			if addr == first {
+				<-unblock
+				return errors.New("first candidate failed")
+			}
+			if d := g.Diagnostics(); d.PendingDials != 1 {
+				t.Errorf("serial fallback did not reuse the primary slot: %+v", d)
+			}
+			return nil
+		}}
+		out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+		const delay = time.Millisecond
+		result := make(chan error, 1)
+		go func() {
+			dest := M.Socksaddr{Fqdn: "fixture.invalid", Port: 443}
+			conn, err := out.DialParallelNetwork(ctx, "tcp", dest, []netip.Addr{first, second}, nil, nil, nil, delay)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			result <- err
+		}()
+		synctest.Wait()
+		time.Sleep(delay)
+		synctest.Wait()
+		if d := g.Diagnostics(); attempts.Load() != 1 || d.PendingDials != 1 {
+			t.Fatalf("fallback spent reserved headroom: attempts=%d, %+v", attempts.Load(), d)
+		}
+		release()
+		requireSessionOK(t, <-result)
+		if d := g.Diagnostics(); attempts.Load() != 2 || d.PendingDials != 0 || d.UnmeasuredFDs != 1 {
+			t.Fatalf("serial fallback did not complete: attempts=%d, %+v", attempts.Load(), d)
+		}
+	})
+}
+
+func TestOutboundAdmissionKeepsChargesThroughParallelCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+	}{{"winner", false}, {"cancellation", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				g := overload.New(overload.Options{})
+				defer g.Close()
+				ctx, cancel := context.WithCancel(admissionDialContext(t, g))
+				defer cancel()
+				first, second := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")
+				firstDone, secondDone, closeDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				finishFirst := sync.OnceFunc(func() { close(firstDone) })
+				finishSecond := sync.OnceFunc(func() { close(secondDone) })
+				finishClose := sync.OnceFunc(func() { close(closeDone) })
+				defer finishFirst()
+				defer finishSecond()
+				defer finishClose()
+				closing := make(chan struct{})
+				base := &overloadOutboundRecorder{
+					dial: func(addr netip.Addr) error {
+						if addr == first {
+							<-firstDone
+						} else {
+							<-secondDone
+						}
+						return nil
+					},
+					newConn: func(addr netip.Addr) net.Conn {
+						conn, peer := net.Pipe()
+						_ = peer.Close()
+						if addr == first {
+							return &closeHookSessionConn{Conn: conn, beforeClose: func() {
+								close(closing)
+								<-closeDone
+							}}
+						}
+						return conn
+					},
+				}
+				out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+				const delay = time.Millisecond
+				type dialResult struct {
+					conn net.Conn
+					err  error
+				}
+				result := make(chan dialResult, 1)
+				go func() {
+					dest := M.Socksaddr{Fqdn: "fixture.invalid", Port: 443}
+					conn, err := out.DialParallelNetwork(ctx, "tcp", dest, []netip.Addr{first, second}, nil, nil, nil, delay)
+					result <- dialResult{conn, err}
+				}()
+				synctest.Wait()
+				time.Sleep(delay)
+				synctest.Wait()
+				if d := g.Diagnostics(); d.PendingDials != 2 {
+					t.Fatalf("expected two outstanding attempts: %+v", d)
+				}
+				var wantErr error
+				var pending, unmeasured int64 = 1, 1
+				if tc.cancel {
+					cancel()
+					wantErr, pending, unmeasured = context.Canceled, 2, 0
+				} else {
+					finishSecond()
+				}
+				res := <-result
+				if res.conn != nil {
+					defer res.conn.Close()
+				}
+				if !errors.Is(res.err, wantErr) || (res.conn == nil) != tc.cancel {
+					t.Fatalf("parallel dial returned socket=%t, err=%v, want err=%v", res.conn != nil, res.err, wantErr)
+				}
+				if d := g.Diagnostics(); d.PendingDials != pending || d.UnmeasuredFDs != unmeasured {
+					t.Fatalf("return released outstanding attempts too soon: %+v", d)
+				}
+				finishFirst()
+				synctest.Wait()
+				select {
+				case <-closing:
+				default:
+					t.Fatal("cleanup did not start closing the late socket")
+				}
+				if d := g.Diagnostics(); d.PendingDials != pending {
+					t.Fatalf("socket lost its charge during close: %+v", d)
+				}
+				finishClose()
+				synctest.Wait()
+				if d := g.Diagnostics(); d.PendingDials != pending-1 {
+					t.Fatalf("socket close did not release its charge: %+v", d)
+				}
+				finishSecond()
+				synctest.Wait()
+				if d := g.Diagnostics(); d.PendingDials != 0 || d.UnmeasuredFDs != unmeasured {
+					t.Fatalf("cleanup left unexpected reservations: %+v", d)
+				}
+			})
+		})
+	}
+}
+
+func TestOutboundAdmissionRevocationKeepsStartedDialCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := overload.New(overload.Options{})
+		defer g.Close()
+		g.RecordSample(overload.Snapshot{OpenFDs: 83, MaxFDs: 100})
+		unblock := make(chan struct{})
+		finishDial := sync.OnceFunc(func() { close(unblock) })
+		defer finishDial()
+		lateSocket, latePeer := net.Pipe()
+		defer latePeer.Close()
+		defer lateSocket.Close()
+		base := &overloadOutboundRecorder{
+			dial:    func(netip.Addr) error { <-unblock; return nil },
+			newConn: func(netip.Addr) net.Conn { return lateSocket },
+		}
+		out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g)
+		sessions := newDeviceSessions([]string{"device"}, g)
+		result := make(chan error, 1)
+		router := sessions.wrapRouter(&sessionTestRouter{tcp: func(ctx context.Context, _ net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			addr := M.SocksaddrFrom(netip.MustParseAddr("1.1.1.1"), 443)
+			conn, err := out.DialContext(ctx, "tcp", addr)
+			if conn != nil {
+				t.Error("revoked dial returned a socket")
+				_ = conn.Close()
+			}
+			onClose(err)
+		}})
+		policy := NewEgressPolicy()
+		policy.interfaces = func() ([]net.Addr, error) { return nil, nil }
+		incoming, peer := net.Pipe()
+		defer incoming.Close()
+		defer peer.Close()
+		requireSessionOK(t, latePeer.SetReadDeadline(time.Now().Add(time.Second)))
+		go router.RouteConnectionEx(WithEgressPolicy(t.Context(), policy), incoming, adapter.InboundContext{User: "device"}, func(err error) { result <- err })
+		synctest.Wait()
+		sessions.allow(nil)
+		if d := g.Diagnostics(); d.ActiveFlows != 0 || d.PendingDials != 1 {
+			t.Fatalf("revocation released an unwinding dial: %+v", d)
+		}
+		replacement, err := g.Acquire(t.Context(), overload.ClassFlow)
+		defer replacement.Release()
+		if !errors.Is(err, overload.ErrOverloaded) {
+			t.Fatalf("replacement got the unwinding dial's slot: %v", err)
+		}
+		finishDial()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("revoked dial returned %v", err)
+		}
+		if _, err := latePeer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("revoked dial did not close its late socket: %v", err)
+		}
+		if d := g.Diagnostics(); d.PendingDials != 0 || d.UnmeasuredFDs != 0 {
+			t.Fatalf("revoked dial retained a charge after cleanup: %+v", d)
+		}
+	})
+}
+
+type revokeAtDialCompletion struct {
+	context.Context
+	lease *overload.Lease
+	armed atomic.Bool
+}
+
+func (ctx *revokeAtDialCompletion) Err() error {
+	err := ctx.Context.Err()
+	if ctx.armed.Swap(false) {
+		ctx.lease.Release()
+	}
+	return err
+}
+
+func TestOutboundAdmissionRevocationWinsDialCompletion(t *testing.T) {
+	for _, mode := range []string{"direct", "parallel"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				g := overload.New(overload.Options{})
+				defer g.Close()
+				g.RecordSample(overload.Snapshot{OpenFDs: 83, MaxFDs: 100})
+				parent := admissionDialContext(t, g)
+				ctx := &revokeAtDialCompletion{Context: parent, lease: overload.LeaseFromContext(parent)}
+				conn, peer := net.Pipe()
+				defer conn.Close()
+				defer peer.Close()
+				requireSessionOK(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
+				closing, unblock := make(chan struct{}), make(chan struct{})
+				unblockClose := sync.OnceFunc(func() { close(unblock) })
+				defer unblockClose()
+				socket := &closeHookSessionConn{Conn: conn, beforeClose: func() {
+					close(closing)
+					<-unblock
+				}}
+				base := &overloadOutboundRecorder{
+					dial: func(netip.Addr) error { return nil },
+					newConn: func(netip.Addr) net.Conn {
+						// Release after the outbound reads a live context at completion.
+						ctx.armed.Store(true)
+						return socket
+					},
+				}
+				out := newServerGuardedOutbound(base, func(string, M.Socksaddr) error { return nil }, g).(*guardedParallelOutbound)
+				type dialResult struct {
+					conn net.Conn
+					err  error
+				}
+				done := make(chan dialResult, 1)
+				go func() {
+					first, second := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")
+					dest := M.SocksaddrFrom(first, 443)
+					if mode == "parallel" {
+						conn, err := out.DialParallelNetwork(ctx, "tcp", dest, []netip.Addr{first, second}, nil, nil, nil, time.Hour)
+						done <- dialResult{conn, err}
+						return
+					}
+					conn, err := out.DialContext(ctx, "tcp", dest)
+					done <- dialResult{conn, err}
+				}()
+				synctest.Wait()
+				select {
+				case <-closing:
+				default:
+					t.Fatal("revoked socket did not start closing")
+				}
+				if d := g.Diagnostics(); d.ActiveFlows != 0 || d.PendingDials != 1 || d.UnmeasuredFDs != 0 {
+					t.Fatalf("revoked socket lost its reservation during close: %+v", d)
+				}
+				unblockClose()
+				res := <-done
+				if res.conn != nil || !errors.Is(res.err, errDeviceRevoked) {
+					t.Fatalf("revoked dial returned socket=%t, error=%v", res.conn != nil, res.err)
+				}
+				synctest.Wait()
+				if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+					t.Fatalf("revoked socket stayed open: %v", err)
+				}
+				if d := g.Diagnostics(); d.PendingDials != 0 || d.UnmeasuredFDs != 0 {
+					t.Fatalf("closed socket retained its reservation: %+v", d)
+				}
+			})
+		})
 	}
 }
 

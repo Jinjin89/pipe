@@ -20,10 +20,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"pipe/internal/engine"
+	"pipe/internal/overload"
 )
 
 type RunOptions struct {
@@ -39,12 +41,14 @@ type RunOptions struct {
 	BlockEgress []netip.Addr
 	Log         io.Writer
 
-	egress *engine.EgressPolicy
+	egress   *engine.EgressPolicy
+	overload *overload.Guard
 }
 
 type serverListeners struct {
-	masquerade, probe  int
+	masquerade         int
 	mainTLS, rescueTLS uint16
+	stealthCover       uint16
 	borrowProxy        bool
 	allowLoopback      bool
 }
@@ -82,6 +86,12 @@ func Run(ctx context.Context, options RunOptions) error {
 	log := options.Log
 	if log == nil {
 		log = io.Discard
+	}
+	overload.ConfigureMemoryLimit()
+	if options.overload == nil {
+		options.overload = overload.New(overload.Options{})
+		options.overload.Start(ctx)
+		defer options.overload.Close()
 	}
 	if settings.Mode == Shared {
 		return runShared(ctx, options, settings, devices, address, log)
@@ -177,8 +187,8 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 		httpHandler = issuer.HTTPChallengeHandler(httpHandler)
 		obtain = func(ctx context.Context) error { return manageStandaloneCertificates(ctx, config, settings, log) }
 	}
-	serveErrors := make(chan error, 5)
-	redirect, err := serve(webServer(httpHandler, nil), address, settings.Ports.HTTP, serveErrors)
+	serveErrors := make(chan error, 4)
+	redirect, err := serve(ctx, webServer(httpHandler, nil), address, settings.Ports.HTTP, serveErrors, options.overload, true)
 	if err != nil {
 		return fmt.Errorf("HTTP redirect listener: %w", err)
 	}
@@ -190,11 +200,11 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 	decoyServer := webServer(decoy.main, strictSiteTLS(settings.webName(), getCertificate))
 	if settings.proxyEnabled() {
 		proxy = newHTTPSProxy(decoy.main, devices)
-		proxy.policy = options.egress
+		proxy.policy, proxy.guard = options.egress, options.overload
 		defer proxy.update(nil)
 		decoyServer = proxyWebServer(proxy, settings.webName(), getCertificate)
 	}
-	website, err := serve(decoyServer, "127.0.0.1", settings.Ports.Decoy, serveErrors)
+	website, err := serve(ctx, decoyServer, "127.0.0.1", settings.Ports.Decoy, serveErrors, options.overload, false)
 	if err != nil {
 		return fmt.Errorf("decoy HTTPS listener: %w", err)
 	}
@@ -209,7 +219,7 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 			return rescueCertificateProblem(domain, currentCertificate(domain))
 		}
 		cdnTLS := standaloneRescueTLSConfig(domain, getCertificate, originCA, checkRescueCertificate)
-		cdn, err := serve(webServer(decoy, cdnTLS), "127.0.0.1", 0, serveErrors)
+		cdn, err := serve(ctx, webServer(decoy, cdnTLS), "127.0.0.1", 0, serveErrors, options.overload, false)
 		if err != nil {
 			disableRescue(fmt.Errorf("internal Rescue TLS listener: %w", err))
 		} else {
@@ -221,18 +231,12 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 			}
 		}
 	}
-	masquerade, err := serve(webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors)
+	masquerade, err := serve(ctx, webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors, options.overload, false)
 	if err != nil {
 		return fmt.Errorf("internal decoy listener: %w", err)
 	}
 	defer masquerade.Close()
-	probe, err := serve(webServer(http.HandlerFunc(serveProbe), nil), "127.0.0.1", 0, serveErrors)
-	if err != nil {
-		return fmt.Errorf("internal probe listener: %w", err)
-	}
-	defer probe.Close()
 	listeners.masquerade = masquerade.Addr().(*net.TCPAddr).Port
-	listeners.probe = probe.Addr().(*net.TCPAddr).Port
 	makeConfig := func(address string, devices []Device) engine.Object {
 		return serverConfig(settings, devices, address, listeners, options.TestHosts)
 	}
@@ -245,7 +249,7 @@ func runStandalone(ctx context.Context, options RunOptions, settings Settings, d
 		}
 		return nil
 	}
-	instance, boundAddress, err := startServerEngine(ctx, address, devices, fastCertificateForName(settings.fastName(), getCertificate), makeConfig, false, rescueFailed)
+	instance, boundAddress, err := startServerEngine(ctx, address, devices, fastCertificateForName(settings.fastName(), getCertificate), makeConfig, false, rescueFailed, options.overload)
 	if err != nil {
 		return err
 	}
@@ -262,11 +266,12 @@ func startServerEngine(ctx context.Context, address string, devices []Device,
 	makeConfig func(string, []Device) engine.Object,
 	pauseStealth bool,
 	rescueFailed func(error),
+	guard *overload.Guard,
 ) (*engine.Instance, string, error) {
 	start := func(address string) (*engine.Instance, error) {
 		instance, err := engine.New(ctx, engine.Options{
 			Config: makeConfig(address, devices), GetCertificate: getCertificate, Server: true,
-			DeviceIDs: deviceIDs(devices),
+			DeviceIDs: deviceIDs(devices), Overload: guard,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configure server engine: %w", err)
@@ -420,25 +425,51 @@ func addrPort(host string, port uint16) string {
 
 func loopback(port uint16) string { return addrPort("127.0.0.1", port) }
 
-func serve(server *http.Server, host string, port uint16, failures chan<- error) (net.Listener, error) {
+func serve(ctx context.Context, server *http.Server, host string, port uint16, failures chan<- error, guard *overload.Guard, public bool) (net.Listener, error) {
 	listener, err := listenTCP(host, port, net.Listen)
 	if err != nil {
 		return nil, err
 	}
-	return serveOn(server, listener, failures), nil
+	if public {
+		listener = guardedListener(ctx, listener, guard)
+	}
+	return serveOn(ctx, server, listener, failures, guard), nil
 }
 
-func serveOn(server *http.Server, listener net.Listener, failures chan<- error) net.Listener {
+func serveOn(ctx context.Context, server *http.Server, listener net.Listener, failures chan<- error, guard *overload.Guard) net.Listener {
 	web := &webListener{Listener: listener, server: server}
+	if guard != nil {
+		var mu sync.Mutex
+		mu.Lock()
+		var pressured bool
+		web.stopPressure = guard.OnPressure(func(next bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			if next != pressured && !web.closing.Load() {
+				pressured = next
+				server.SetKeepAlivesEnabled(!next)
+			}
+		})
+		if pressured = guard.Diagnostics().Pressured; pressured {
+			server.SetKeepAlivesEnabled(false)
+		}
+		mu.Unlock()
+	}
 	go func() {
+		if web.stopPressure != nil {
+			defer web.stopPressure()
+		}
 		var err error
 		if server.TLSConfig != nil {
 			err = server.ServeTLS(listener, "", "")
 		} else {
 			err = server.Serve(listener)
 		}
-		if err != nil && !web.closing.Load() {
-			failures <- fmt.Errorf("web listener %s: %w", listener.Addr(), err)
+		if err != nil && !web.closing.Load() && ctx.Err() == nil {
+			select {
+			case failures <- fmt.Errorf("web listener %s: %w", listener.Addr(), err):
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return web
@@ -446,13 +477,17 @@ func serveOn(server *http.Server, listener net.Listener, failures chan<- error) 
 
 type webListener struct {
 	net.Listener
-	server  *http.Server
-	closing atomic.Bool
+	server       *http.Server
+	closing      atomic.Bool
+	stopPressure func()
 }
 
 func (l *webListener) Close() error {
 	// Close both sides in case shutdown races the Serve goroutine's startup.
 	l.closing.Store(true)
+	if l.stopPressure != nil {
+		l.stopPressure()
+	}
 	err := l.server.Close()
 	_ = l.Listener.Close()
 	return err
@@ -495,16 +530,18 @@ func serverConfig(settings Settings, devices []Device, address string, listeners
 		"tls":        engine.Object{"enabled": true, "certificate_provider": engine.Object{"type": engine.SharedCertificate}},
 		"masquerade": masquerade,
 	}}
-	outbounds := []engine.Object{{"type": "direct", "tag": "direct"}, {"type": "direct", "tag": "probe-direct"}}
+	outbounds := []engine.Object{{"type": "direct", "tag": "direct"}, {"type": engine.InMemoryProbe, "tag": "probe-direct"}}
 	var routeRules []engine.Object
 	switch {
 	case settings.Mode == Shared && listeners.borrowProxy:
-		// Use the running HTTPS proxy's address. A wildcard listener is reachable on loopback.
-		proxyHost := "127.0.0.1"
-		if ip, err := netip.ParseAddr(address); err == nil && !ip.IsUnspecified() {
-			proxyHost = ip.String()
+		host, port := "127.0.0.1", listeners.stealthCover
+		if port == 0 {
+			port = settings.HTTPSProxyListener.Port
+			if ip, err := netip.ParseAddr(address); err == nil && !ip.IsUnspecified() {
+				host = ip.String()
+			}
 		}
-		handshake := engine.Object{"server": proxyHost, "server_port": settings.HTTPSProxyListener.Port}
+		handshake := engine.Object{"server": host, "server_port": port}
 		inbounds = append(inbounds, realityInbound(settings.stealthName(), "stealth", address, settings.stealthPort(), handshake))
 	case settings.Mode == Shared:
 		// Stealth requires a running HTTPS proxy.
@@ -538,16 +575,9 @@ func serverConfig(settings Settings, devices []Device, address string, listeners
 			},
 		})
 	}
-	probe := engine.Object{
-		"domain": engine.ProbeDomain, "network": "tcp", "port": 80,
-		"outbound": "probe-direct", "override_address": "127.0.0.1", "override_port": listeners.probe,
-	}
-	if settings.Mode == Shared {
-		outbounds[1]["type"] = engine.InMemoryProbe
-		delete(probe, "override_address")
-		delete(probe, "override_port")
-	}
-	routeRules = append(routeRules, probe)
+	routeRules = append(routeRules, engine.Object{
+		"domain": engine.ProbeDomain, "network": "tcp", "port": 80, "outbound": "probe-direct",
+	})
 	dnsServers := []engine.Object{{"type": "local", "tag": "local"}}
 	localResolve := engine.Object{"action": "resolve", "server": "local"}
 	if len(testHosts) != 0 {

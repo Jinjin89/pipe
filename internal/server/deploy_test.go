@@ -159,10 +159,6 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 		inbounds[1]["type"] != "vmess" || inbounds[1]["listen"] != "127.0.0.1" || inbounds[1]["listen_port"] != s.Ports.VMess {
 		t.Fatalf("expected Fast and loopback VMess: %+v", inbounds)
 	}
-	outbounds := config["outbounds"].([]engine.Object)
-	if outbounds[1]["type"] != engine.InMemoryProbe {
-		t.Fatal("shared health probes need a socket-free outbound")
-	}
 	installDir := filepath.Join(dir, "install")
 	must(t, os.Mkdir(installDir, 0750))
 	stale := []string{"pipe-rescue.nginx", "pipe-nginx.conf"}
@@ -210,6 +206,28 @@ func TestSharedStateEndpointsAndFastRenewal(t *testing.T) {
 				t.Errorf("expected mode %o for %s: %v", mode, filepath.Base(path), err)
 			}
 		}
+	}
+}
+
+func TestDeploymentModesUseInMemoryProbe(t *testing.T) {
+	for _, mode := range []DeployMode{Standalone, Shared} {
+		t.Run(string(mode), func(t *testing.T) {
+			config := serverConfig(Settings{Mode: mode}, nil, "127.0.0.1", serverListeners{}, nil)
+			outbound := config["outbounds"].([]engine.Object)[1]
+			if outbound["type"] != engine.InMemoryProbe || outbound["tag"] != "probe-direct" {
+				t.Fatalf("unexpected probe outbound: %v", outbound)
+			}
+			for _, rule := range config["route"].(engine.Object)["rules"].([]engine.Object) {
+				if rule["domain"] != engine.ProbeDomain {
+					continue
+				}
+				if rule["network"] != "tcp" || rule["port"] != 80 || rule["outbound"] != "probe-direct" || len(rule) != 4 {
+					t.Fatalf("unexpected probe route: %v", rule)
+				}
+				return
+			}
+			t.Fatal("missing route to the in-memory probe")
+		})
 	}
 }
 

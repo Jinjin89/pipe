@@ -3,13 +3,17 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"pipe/templates"
@@ -305,5 +309,84 @@ func TestSetupRefusesUnrelatedInputOwner(t *testing.T) {
 	t.Setenv("SUDO_UID", "65530")
 	if _, err := LoadSetupConfig(path); err != nil {
 		t.Fatalf("trusted operator input: %v", err)
+	}
+}
+
+const (
+	setupOperator0711Path    = "PIPE_TEST_SETUP_OPERATOR_0711_PATH"
+	setupOperator0711JSON    = `{"sni":"fixture.example"}`
+	setupOperator0711PipeUID = 990
+)
+
+func TestSetupOperatorTraversesSearchOnlyDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("requires Linux root to set fixture ownership and child credentials")
+	}
+	const operatorUID, operatorGID = 65534, 65534
+	chown := func(path string, uid, gid int) {
+		t.Helper()
+		err := os.Chown(path, uid, gid)
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EPERM) {
+			t.Skipf("cannot set fixture ownership to UID %d and GID %d in this environment: %v", uid, gid, err)
+		}
+		must(t, err)
+	}
+	parent, err := os.MkdirTemp("/tmp", "pipe-setup-0711-")
+	must(t, err)
+	t.Cleanup(func() { must(t, os.RemoveAll(parent)) })
+	must(t, os.Chmod(parent, 0711))
+	dir := filepath.Join(parent, "operator")
+	must(t, os.Mkdir(dir, 0755))
+	chown(dir, operatorUID, operatorGID)
+	path := filepath.Join(dir, "setup.json")
+	must(t, os.WriteFile(path, []byte(setupOperator0711JSON), 0600))
+	chown(path, operatorUID, operatorGID)
+
+	exe, err := os.Executable()
+	must(t, err)
+	image, err := os.Open(exe)
+	must(t, err)
+	defer image.Close()
+	read := func(path, wantError string) {
+		t.Helper()
+		// The inherited descriptor lets the child execute the test binary
+		// even when the Go build directory is private to root.
+		cmd := exec.CommandContext(t.Context(), "/proc/self/fd/3", "-test.run=^TestSetupOperator0711Helper$")
+		cmd.ExtraFiles = []*os.File{image}
+		cmd.Env = []string{setupOperator0711Path + "=" + path}
+		must(t, dropCredentials(cmd, operatorUID, operatorGID))
+		out, err := cmd.CombinedOutput()
+		if wantError == "" {
+			if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EPERM) {
+				t.Skipf("cannot start the fixture with UID %d and GID %d in this environment: %v", operatorUID, operatorGID, err)
+			}
+			if err != nil {
+				t.Fatalf("operator read through 0711 failed: %v\n%s", err, out)
+			}
+		} else if err == nil || !strings.Contains(string(out), wantError) {
+			t.Fatalf("read %q = %v, want %q\n%s", path, err, wantError, out)
+		}
+	}
+
+	read(path, "")
+	alias := filepath.Join(parent, "alias")
+	must(t, os.Symlink(dir, alias))
+	read(filepath.Join(alias, "setup.json"), "without following links")
+	must(t, os.Chmod(parent, 0731))
+	read(path, "is group- or world-writable")
+	must(t, os.Chmod(parent, 0711))
+	chown(parent, setupOperator0711PipeUID, -1)
+	read(path, "must not be owned by user pipe")
+}
+
+func TestSetupOperator0711Helper(t *testing.T) {
+	path := os.Getenv(setupOperator0711Path)
+	if path == "" {
+		t.Skip("runs in the credential-dropped test subprocess")
+	}
+	var out strings.Builder
+	must(t, ReadSetupOperatorInput(path, strconv.Itoa(setupOperator0711PipeUID), "4096", "true", &out))
+	if got := out.String(); got != setupOperator0711JSON {
+		t.Fatalf("setup input = %q, want %q", got, setupOperator0711JSON)
 	}
 }

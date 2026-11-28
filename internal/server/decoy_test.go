@@ -20,7 +20,7 @@ import (
 
 func TestIncompleteTLSHelloUsesDecoyListener(t *testing.T) {
 	settings := Settings{Mode: Standalone, Domain: "origin.example", CDNDomain: "cdn.example", Ports: TestPorts()}
-	listeners := serverListeners{masquerade: 20001, probe: 20002, mainTLS: settings.Ports.Decoy, rescueTLS: 20003}
+	listeners := serverListeners{masquerade: 20001, mainTLS: settings.Ports.Decoy, rescueTLS: 20003}
 	config := serverConfig(settings, nil, "127.0.0.1", listeners, nil)
 	var routes []engine.Object
 	for _, rule := range config["route"].(engine.Object)["rules"].([]engine.Object) {
@@ -216,15 +216,21 @@ func TestOriginPullCAIsRequestedOnlyOnCDNSNI(t *testing.T) {
 
 func TestHysteriaMasqueradePreservesHostAndUsesSeparateListener(t *testing.T) {
 	settings := Settings{Domain: "origin.example", Ports: TestPorts()}
-	config := serverConfig(settings, nil, "127.0.0.1", serverListeners{masquerade: 20001, probe: 20002, mainTLS: settings.Ports.Decoy}, nil)
+	config := serverConfig(settings, nil, "127.0.0.1", serverListeners{masquerade: 20001, mainTLS: settings.Ports.Decoy}, nil)
 	masquerade := config["inbounds"].([]engine.Object)[0]["masquerade"].(engine.Object)
 	if masquerade["rewrite_host"] != false || !strings.HasSuffix(masquerade["url"].(string), ":20001") {
 		t.Fatal("masquerade must preserve the incoming Host on its own listener")
 	}
 	for _, rule := range config["route"].(engine.Object)["rules"].([]engine.Object) {
-		if rule["domain"] == engine.ProbeDomain && rule["outbound"] == "probe-direct" && rule["override_port"] == 20002 {
-			return
+		if rule["domain"] != engine.ProbeDomain {
+			continue
 		}
+		_, addressOverride := rule["override_address"]
+		_, portOverride := rule["override_port"]
+		if rule["outbound"] != "probe-direct" || rule["network"] != "tcp" || rule["port"] != 80 || addressOverride || portOverride {
+			t.Fatalf("unexpected in-memory probe route: %v", rule)
+		}
+		return
 	}
-	t.Fatal("missing route to the separate probe listener")
+	t.Fatal("missing route to the in-memory probe")
 }

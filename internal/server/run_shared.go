@@ -39,7 +39,7 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 		return err
 	}
 	serveErrors := make(chan error, 4)
-	masquerade, err := serve(webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors)
+	masquerade, err := serve(ctx, webServer(decoy.main, nil), "127.0.0.1", 0, serveErrors, options.overload, false)
 	if err != nil {
 		return fmt.Errorf("internal decoy listener: %w", err)
 	}
@@ -125,7 +125,7 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 					defer static.dir.Close()
 				}
 				proxy = newHTTPSProxy(cover, devices)
-				proxy.policy = options.egress
+				proxy.policy, proxy.guard = options.egress, options.overload
 			}
 		}
 		if proxy != nil {
@@ -134,12 +134,13 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 				fatal = serveErrors
 				stealth = newSharedStealth(settings.stealthName(), options.TestCA)
 			}
-			var stop func()
-			stop, err = startSharedHTTPSProxy(ctx, options.Dir, address, *cfg, proxy, log, warn, fatal, stealth)
+			var proxyListeners sharedProxyListeners
+			proxyListeners, err = startSharedHTTPSProxy(ctx, options.Dir, address, *cfg, proxy, log, warn, fatal, stealth)
 			if err == nil {
 				listeners.borrowProxy = stealth != nil
+				listeners.stealthCover = proxyListeners.stealthPort
 				defer proxy.update(nil)
-				defer stop()
+				defer proxyListeners.stop()
 			} else {
 				proxy.update(nil)
 				proxy = nil
@@ -164,7 +165,7 @@ func runShared(ctx context.Context, options RunOptions, settings Settings, devic
 	makeConfig := func(address string, devices []Device) engine.Object {
 		return serverConfig(settings, devices, address, listeners, options.TestHosts)
 	}
-	instance, boundAddress, err := startServerEngine(ctx, address, devices, getCertificate, makeConfig, listeners.borrowProxy, rescueFailed)
+	instance, boundAddress, err := startServerEngine(ctx, address, devices, getCertificate, makeConfig, listeners.borrowProxy, rescueFailed, options.overload)
 	if err != nil {
 		return err
 	}

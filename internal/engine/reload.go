@@ -16,12 +16,13 @@ import (
 	"github.com/sagernet/sing-box/log"
 )
 
-func registerInbound[T any](registry *inbound.Registry, reloads map[string]*reloadableInbound, reload bool, kind string, create inbound.ConstructorFunc[T]) {
-	if !reload {
+func registerInbound[T any](registry *inbound.Registry, reloads map[string]*reloadableInbound, sessions *deviceSessions, kind string, create inbound.ConstructorFunc[T]) {
+	if sessions == nil {
 		inbound.Register(registry, kind, create)
 		return
 	}
 	inbound.Register(registry, kind, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options T) (adapter.Inbound, error) {
+		router = sessions.wrapRouter(router)
 		initial, err := create(ctx, router, logger, tag, options)
 		if err != nil {
 			return nil, err

@@ -3,12 +3,16 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"slices"
 	"time"
+
+	"pipe/internal/overload"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -141,6 +145,7 @@ type guardedOutbound struct {
 	guard           func(string, M.Socksaddr) error
 	routeCheck      func(context.Context, M.Socksaddr) error
 	serverPolicy    *EgressPolicy
+	overload        *overload.Guard
 	restrictPackets bool
 	byName          bool // a proxy tier: send requestedName
 }
@@ -152,8 +157,8 @@ type guardedParallelOutbound struct {
 
 var _ boxdialer.ParallelNetworkDialer = (*guardedParallelOutbound)(nil)
 
-func newServerGuardedOutbound(base adapter.Outbound, guard func(string, M.Socksaddr) error) adapter.Outbound {
-	wrapped := &guardedOutbound{Outbound: base, restrictPackets: true, guard: guard}
+func newServerGuardedOutbound(base adapter.Outbound, guard func(string, M.Socksaddr) error, pressure *overload.Guard) adapter.Outbound {
+	wrapped := &guardedOutbound{Outbound: base, restrictPackets: true, guard: guard, overload: pressure}
 	if _, ok := base.(boxdialer.ParallelNetworkDialer); ok {
 		return &guardedParallelOutbound{guardedOutbound: wrapped}
 	}
@@ -198,9 +203,36 @@ func (o *guardedOutbound) check(network string, destination M.Socksaddr, allows 
 	return nil
 }
 
-func (o *guardedOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func (o *guardedOutbound) observeDialError(err error) {
+	if err != nil && o.overload != nil {
+		o.overload.ObserveError(err)
+	}
+}
+
+// Complete the reservation after closing any socket returned by a canceled or failed dial.
+func finishOutboundDial[T io.Closer](ctx context.Context, finish func(bool) bool, conn *T, err *error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		*err = ctxErr
+	}
+	socket := io.Closer(*conn)
+	if *err == nil && socket != nil && finish(true) {
+		return
+	}
+	if socket != nil {
+		_ = socket.Close()
+		var zero T
+		*conn = zero
+		if *err == nil {
+			*err = cmp.Or(ctx.Err(), errDeviceRevoked)
+		}
+	}
+	finish(false)
+}
+
+func (o *guardedOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (conn net.Conn, err error) {
+	finish := overload.LeaseFromContext(ctx).StartDial()
+	defer finishOutboundDial(ctx, finish, &conn, &err)
 	if o.byName {
-		var err error
 		if destination, err = requestedName(ctx, network, destination); err != nil {
 			return nil, err
 		}
@@ -216,10 +248,24 @@ func (o *guardedOutbound) DialContext(ctx context.Context, network string, desti
 	if o.restrictPackets {
 		destination = M.SocksaddrFrom(destination.Addr.Unmap(), destination.Port)
 	}
-	return o.Outbound.DialContext(ctx, network, destination)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	conn, err = o.Outbound.DialContext(ctx, network, destination)
+	o.observeDialError(err)
+	return conn, err
 }
 
-func (o *guardedOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+func (o *guardedOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (conn net.PacketConn, err error) {
+	finish := overload.LeaseFromContext(ctx).StartDial()
+	defer finishOutboundDial(ctx, finish, &conn, &err)
+	return o.listenPacket(ctx, destination)
+}
+
+func (o *guardedOutbound) listenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	policy := o.policyFor(ctx)
 	if err := o.check(N.NetworkUDP, destination, policy.Allows); err != nil {
 		return nil, err
@@ -231,12 +277,23 @@ func (o *guardedOutbound) ListenPacket(ctx context.Context, destination M.Socksa
 			routeCheck = checkUDPDestinationRoute
 		}
 		if err := routeCheck(ctx, destination); err != nil {
+			o.observeDialError(err)
 			return nil, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	conn, err := o.Outbound.ListenPacket(ctx, destination)
-	if err != nil || !o.restrictPackets {
-		return conn, err
+	o.observeDialError(err)
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, err
+	}
+	if !o.restrictPackets {
+		return conn, nil
 	}
 	return &publicPacketConn{PacketConn: conn, guard: o.guard, policy: policy}, nil
 }
@@ -276,19 +333,34 @@ func (o *guardedOutbound) allowedAddresses(ctx context.Context, network string, 
 	return allowed, nil
 }
 
-func (o *guardedParallelOutbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, candidates []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+func (o *guardedParallelOutbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, candidates []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (conn net.Conn, err error) {
+	lease := overload.LeaseFromContext(ctx)
+	primaryFinish := lease.StartDial()
 	addresses, err := o.allowedAddresses(ctx, network, destination, candidates)
 	if err != nil {
+		primaryFinish(false)
 		return nil, err
 	}
 	base, ok := o.Outbound.(boxdialer.ParallelNetworkDialer)
 	if !ok {
+		primaryFinish(false)
 		return nil, errors.New("outbound does not support parallel network dialing")
 	}
-	if !o.restrictPackets || N.NetworkName(network) != N.NetworkTCP || len(addresses) <= 1 {
-		return base.DialParallelNetwork(ctx, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+	if err := ctx.Err(); err != nil {
+		primaryFinish(false)
+		return nil, err
+	}
+	if !o.restrictPackets || len(addresses) <= 1 {
+		defer finishOutboundDial(ctx, primaryFinish, &conn, &err)
+		conn, err = base.DialParallelNetwork(ctx, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		o.observeDialError(err)
+		return conn, err
 	}
 	policy := o.policyFor(ctx)
+	allows := policy.Allows
+	if N.NetworkName(network) == N.NetworkTCP {
+		allows = policy.AllowsFresh
+	}
 	delay := fallbackDelay
 	if delay <= 0 {
 		delay = 300 * time.Millisecond
@@ -300,89 +372,132 @@ func (o *guardedParallelOutbound) DialParallelNetwork(ctx context.Context, netwo
 		err  error
 	}
 	results := make(chan attemptResult, len(addresses))
-	started := 0
-	launch := func(idx int, addr netip.Addr) {
-		started++
+	var inFlight, next int
+	var extra []func()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	var tick <-chan time.Time
+	launchNext := func() {
+		tick = nil
+		if next == len(addresses) || ctx.Err() != nil {
+			return
+		}
+		if inFlight > 0 {
+			release, ok := lease.TryReserveDial()
+			if !ok {
+				// Wait for a completion before trying another address.
+				return
+			}
+			extra = append(extra, release)
+		}
+		idx, addr := next, addresses[next]
+		next++
+		inFlight++
 		go func() {
 			if idx > 0 {
-				if err := o.check(network, M.SocksaddrFrom(addr, destination.Port), policy.AllowsFresh); err != nil {
+				if err := o.check(network, M.SocksaddrFrom(addr, destination.Port), allows); err != nil {
 					results <- attemptResult{err: err}
 					return
 				}
 			}
+			if err := dialCtx.Err(); err != nil {
+				results <- attemptResult{err: err}
+				return
+			}
 			conn, err := base.DialParallelNetwork(dialCtx, network, destination, []netip.Addr{addr}, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+			o.observeDialError(err)
 			results <- attemptResult{conn: conn, err: err}
 		}()
-	}
-	launch(0, addresses[0])
-	nextIdx := 1
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	var failures []error
-	finished := 0
-	for finished < len(addresses) {
-		var tick <-chan time.Time
-		if nextIdx < len(addresses) {
+		if next < len(addresses) {
+			timer.Reset(delay)
 			tick = timer.C
 		}
+	}
+	drain := func(remaining int, slots []func(), finish func(bool) bool) {
+		if remaining == 0 {
+			return
+		}
+		go func() {
+			for i := range remaining {
+				if result := <-results; result.conn != nil {
+					_ = result.conn.Close()
+				}
+				if i < len(slots) {
+					slots[i]()
+				}
+			}
+			if finish != nil {
+				finish(false)
+			}
+		}()
+	}
+	var failures []error
+	launchNext()
+	for inFlight > 0 {
 		select {
 		case res := <-results:
-			finished++
+			if err := ctx.Err(); err != nil {
+				// Return promptly even if closing the just-completed socket blocks.
+				results <- res
+				drain(inFlight, extra, primaryFinish)
+				return nil, err
+			}
 			if res.err == nil {
-				cancel()
-				go func(remaining int) {
-					for i := 0; i < remaining; i++ {
-						if extra := <-results; extra.conn != nil {
-							_ = extra.conn.Close()
-						}
-					}
-				}(started - finished)
+				if res.conn == nil {
+					primaryFinish(false)
+				} else if !primaryFinish(true) {
+					results <- res
+					drain(inFlight, extra, primaryFinish)
+					return nil, cmp.Or(ctx.Err(), errDeviceRevoked)
+				}
+				drain(inFlight-1, extra, nil)
 				return res.conn, nil
 			}
+			if res.conn != nil {
+				_ = res.conn.Close()
+			}
+			inFlight--
+			if n := len(extra); n > 0 {
+				// The remaining attempts share the primary slot and n-1 extras.
+				extra[n-1]()
+				extra[n-1] = nil
+				extra = extra[:n-1]
+			}
 			failures = append(failures, res.err)
-			if nextIdx < len(addresses) {
-				launch(nextIdx, addresses[nextIdx])
-				nextIdx++
-				if nextIdx < len(addresses) {
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					timer.Reset(delay)
-				}
-			}
+			launchNext()
 		case <-tick:
-			launch(nextIdx, addresses[nextIdx])
-			nextIdx++
-			if nextIdx < len(addresses) {
-				timer.Reset(delay)
-			}
+			launchNext()
 		case <-ctx.Done():
-			cancel()
-			go func(remaining int) {
-				for i := 0; i < remaining; i++ {
-					if extra := <-results; extra.conn != nil {
-						_ = extra.conn.Close()
-					}
-				}
-			}(started - finished)
+			drain(inFlight, extra, primaryFinish)
 			return nil, ctx.Err()
 		}
+	}
+	primaryFinish(false)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return nil, errors.Join(failures...)
 }
 
-func (o *guardedParallelOutbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, candidates []netip.Addr, _ *C.NetworkStrategy, _ []C.InterfaceType, _ []C.InterfaceType, _ time.Duration) (net.PacketConn, netip.Addr, error) {
+func (o *guardedParallelOutbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, candidates []netip.Addr, _ *C.NetworkStrategy, _ []C.InterfaceType, _ []C.InterfaceType, _ time.Duration) (conn net.PacketConn, address netip.Addr, err error) {
+	finish := overload.LeaseFromContext(ctx).StartDial()
+	defer func() {
+		finishOutboundDial(ctx, finish, &conn, &err)
+		if err != nil {
+			address = netip.Addr{}
+		}
+	}()
 	addresses, err := o.allowedAddresses(ctx, N.NetworkUDP, destination, candidates)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
 	var failures []error
 	for _, address := range addresses {
+		if err := ctx.Err(); err != nil {
+			return nil, netip.Addr{}, err
+		}
 		candidate := M.SocksaddrFrom(address, destination.Port)
-		conn, err := o.ListenPacket(ctx, candidate)
+		conn, err := o.listenPacket(ctx, candidate)
 		if err == nil {
 			return conn, address, nil
 		}

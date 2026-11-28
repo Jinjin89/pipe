@@ -86,7 +86,7 @@ func openTrustedSetupPath(path string, pipeUID, operatorUID uint32, state, creat
 		return nil, false, fmt.Errorf("invalid setup path %q", path)
 	}
 	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	fd, err := unix.Open("/", dirFlags, 0)
+	fd, err := unix.Open("/", setupDirTraversalFlags, 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -132,9 +132,12 @@ func openTrustedSetupPath(path string, pipeUID, operatorUID uint32, state, creat
 			fd = -1
 			return file, operatorOwned, nil
 		}
-		flags := dirFlags
-		if !state && i == len(parts)-1 {
-			flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+		flags := setupDirTraversalFlags
+		if i == len(parts)-1 {
+			flags = dirFlags
+			if !state {
+				flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+			}
 		}
 		part := parts[i]
 		pathPart = filepath.Join(pathPart, part)

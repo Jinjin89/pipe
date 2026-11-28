@@ -5,6 +5,7 @@ package engine
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 )
 
@@ -145,15 +147,20 @@ type noSocketDeadline struct{ net.Conn }
 func (noSocketDeadline) SetDeadline(time.Time) error { return os.ErrInvalid }
 
 func TestDeviceRevocationClosesOnlyRevokedSession(t *testing.T) {
-	tracker := newDeviceSessions([]string{"first", "second"})
+	tracker := newDeviceSessions([]string{"first", "second"}, nil)
+	routed := make(map[string]net.Conn)
+	base := &sessionTestRouter{tcp: func(_ context.Context, conn net.Conn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
+		routed[metadata.User] = conn
+	}}
+	router := tracker.wrapRouter(base)
 	first, firstPeer := net.Pipe()
 	defer firstPeer.Close()
 	second, secondPeer := net.Pipe()
 	defer secondPeer.Close()
-	first = tracker.RoutedConnection(t.Context(), first, adapter.InboundContext{User: "first"}, nil, nil)
-	second = tracker.RoutedConnection(t.Context(), second, adapter.InboundContext{User: "second"}, nil, nil)
-	defer first.Close()
-	defer second.Close()
+	router.RouteConnectionEx(t.Context(), first, adapter.InboundContext{User: "first"}, nil)
+	router.RouteConnectionEx(t.Context(), second, adapter.InboundContext{User: "second"}, nil)
+	defer routed["first"].Close()
+	defer routed["second"].Close()
 	if err := firstPeer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +168,14 @@ func TestDeviceRevocationClosesOnlyRevokedSession(t *testing.T) {
 	if _, err := firstPeer.Write([]byte{0}); err != io.ErrClosedPipe {
 		t.Fatalf("the revoked session stayed open: %v", err)
 	}
+	refused, refusedPeer := net.Pipe()
+	defer refusedPeer.Close()
+	var rejection error
+	router.RouteConnectionEx(t.Context(), refused, adapter.InboundContext{User: "first"}, func(err error) { rejection = err })
+	if !errors.Is(rejection, errDeviceRevoked) || base.calls.Load() != 2 {
+		t.Fatalf("new flow for revoked device got %v, dispatches=%d", rejection, base.calls.Load())
+	}
+	second = routed["second"]
 	if err := second.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}

@@ -4,4 +4,4 @@
 package version
 
 // Version is the pipe release line.
-const Version = "0.7.6-alpha"
+const Version = "0.7.7-alpha"

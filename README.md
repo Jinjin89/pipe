@@ -80,7 +80,7 @@ Download the Linux release and verify it with OpenSSL 3 before installing. Use `
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
   cd "$work"
-  version=0.7.6-alpha
+  version=0.7.7-alpha
   arch=amd64
   archive="pipe-linux-$arch.tar.gz"
   release="https://github.com/Jinjin89/pipe/releases/download/v$version"
@@ -97,10 +97,11 @@ Download the Linux release and verify it with OpenSSL 3 before installing. Use `
   awk -v name="$archive" '$3 == name {print $5 "  " $3}' SHA256SUMS | sha256sum -c -
   tar -xzf "$archive"
   sudo install -m 0755 -o root -g root ./pipe /usr/local/bin/pipe
+  # sudo /usr/local/bin/pipe update --from "$work"  # Upgrade relay and Linux Helper copies
 )
 ```
 
-For the one-time upgrade from 0.7.5 to 0.7.6, follow this step and restart the service as in Step 3. Use `sudo pipe update` for later upgrades.
+For the one-time upgrade from 0.7.5, follow this step and restart the service as in Step 3. On hosts also running `pipe-relay` or the Linux Pipe Helper, uncomment the offline update command to upgrade those copies before the verified files are removed. Use `sudo pipe update` for later upgrades.
 
 You can also build and install from source with Go 1.27.
 

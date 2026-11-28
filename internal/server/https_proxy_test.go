@@ -20,10 +20,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"pipe/internal/engine"
+	"pipe/internal/overload"
 )
 
 func TestHTTPSProxyUnauthenticatedRequestsUseTheSite(t *testing.T) {
@@ -231,42 +234,317 @@ func TestHTTPSProxyCONNECTRelaysBufferedDataAndClosesOnRevoke(t *testing.T) {
 	}
 }
 
-func TestHTTPSProxyCapsConnectionsAndCancelsRevokedDevice(t *testing.T) {
-	first := Device{Name: "first"}
-	first.DeviceID, first.HTTPSProxyPassword = "first-id", "first-pass"
-	second := Device{Name: "second"}
-	second.DeviceID, second.HTTPSProxyPassword = "second-id", "second-pass"
-	p := newHTTPSProxy(http.NotFoundHandler(), []Device{first, second})
-	peer := netip.MustParseAddr("11.0.0.80")
-	var active []context.Context
-	for range proxyDeviceLimit {
-		ctx, finish, accepted := p.acquire(t.Context(), peer, first.Name, first.HTTPSProxyPassword)
-		if !accepted || finish == nil {
-			t.Fatal("device hit cap too early")
+func proxyTestConnect(ctx context.Context, p *httpsProxy, device Device, address string) *httptest.ResponseRecorder {
+	r := httptest.NewRequestWithContext(ctx, http.MethodConnect, address, nil)
+	r.ProtoMajor = 2 // exercise the CONNECT relay with an in-memory recorder
+	r.Header.Set("Proxy-Authorization", basicProxyAuth(device.Name, device.HTTPSProxyPassword))
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	return w
+}
+
+func TestHTTPSProxyAdmits50RequestsOnOneCredential(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		device := Device{Name: "shared"}
+		device.HTTPSProxyPassword = "shared-password"
+		p := newHTTPSProxy(http.NotFoundHandler(), []Device{device})
+		p.policy = proxyEgressPolicyFunc(engine.PublicDestination)
+		p.guard = overload.New(overload.Options{})
+		defer p.guard.Close()
+		p.guard.RecordSample(overload.Snapshot{OpenFDs: 10, MaxFDs: 512})
+		gate := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(gate) })
+		defer unblock()
+		p.dial = func(context.Context, string, string) (net.Conn, error) {
+			<-gate
+			conn, peer := net.Pipe()
+			peer.Close()
+			return conn, nil
 		}
-		t.Cleanup(finish)
-		active = append(active, ctx)
+		const requests = 50
+		results := make(chan int, requests)
+		for range requests {
+			go func() { results <- proxyTestConnect(t.Context(), p, device, "11.0.0.80:443").Code }()
+		}
+		synctest.Wait()
+		if d := p.guard.Diagnostics(); d.ActiveFlows != requests || d.PendingDials != requests || d.Waiters != 0 {
+			t.Fatalf("healthy shared link was limited: %+v", d)
+		}
+		unblock()
+		for range requests {
+			if code := <-results; code != http.StatusOK {
+				t.Errorf("CONNECT returned %d", code)
+			}
+		}
+		if d := p.guard.Diagnostics(); d.ActiveFlows != 0 || d.PendingDials != 0 {
+			t.Errorf("finished CONNECTs retained leases: %+v", d)
+		}
+	})
+}
+
+func TestHTTPSProxyRevocationCancelsActiveAndQueuedRequests(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		first, second := Device{Name: "first"}, Device{Name: "second"}
+		first.HTTPSProxyPassword, second.HTTPSProxyPassword = "first-pass", "second-pass"
+		p := newHTTPSProxy(http.NotFoundHandler(), []Device{first, second})
+		p.policy = proxyEgressPolicyFunc(engine.PublicDestination)
+		p.guard = overload.New(overload.Options{})
+		defer p.guard.Close()
+		defer p.update(nil)
+		const queuedAddress = "11.0.0.82:443"
+		peers := make(chan net.Conn, 2)
+		var queuedDials atomic.Int32
+		p.dial = func(_ context.Context, _, address string) (net.Conn, error) {
+			if address == queuedAddress {
+				queuedDials.Add(1)
+				return nil, errors.New("queued request reached the dialer")
+			}
+			conn, peer := net.Pipe()
+			peers <- peer
+			return conn, nil
+		}
+		start := func(device Device, address string) <-chan int {
+			result := make(chan int, 1)
+			go func() { result <- proxyTestConnect(t.Context(), p, device, address).Code }()
+			return result
+		}
+		active := start(first, "11.0.0.80:443")
+		other := start(second, "11.0.0.81:443")
+		synctest.Wait()
+		if d := p.guard.Diagnostics(); d.ActiveFlows != 2 || d.PendingDials != 0 {
+			t.Fatalf("CONNECT relays did not establish: %+v", d)
+		}
+		defer (<-peers).Close()
+		defer (<-peers).Close()
+		low := overload.Snapshot{GoMemoryBytes: 85, GoMemoryLimit: 100}
+		p.guard.RecordSample(low)
+		p.guard.RecordSample(low)
+		queued := start(first, queuedAddress)
+		synctest.Wait()
+		if d := p.guard.Diagnostics(); d.Waiters != 1 || queuedDials.Load() != 0 {
+			t.Fatalf("request did not queue before dialing: %+v", d)
+		}
+		p.update([]Device{second})
+		synctest.Wait()
+		if len(active) == 0 || len(queued) == 0 || <-active != http.StatusOK ||
+			<-queued != http.StatusServiceUnavailable || queuedDials.Load() != 0 {
+			t.Fatal("revocation did not stop the active tunnel and shed the queued request before dialing")
+		}
+		select {
+		case code := <-other:
+			t.Fatalf("revocation interrupted the other device: %d", code)
+		default:
+		}
+		if d := p.guard.Diagnostics(); d.ActiveFlows != 1 || d.Waiters != 0 {
+			t.Fatalf("revocation retained resources: %+v", d)
+		}
+	})
+}
+
+func TestHTTPSProxyPasswordRotationCancelsQueuedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		old := Device{Name: "phone"}
+		old.HTTPSProxyPassword = "old-password"
+		p := newHTTPSProxy(http.NotFoundHandler(), []Device{old})
+		p.guard = overload.New(overload.Options{})
+		defer p.guard.Close()
+		held, err := p.guard.Acquire(t.Context(), overload.ClassFlow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer held.Release()
+		held.DialDone(false)
+		low := overload.Snapshot{GoMemoryBytes: 85, GoMemoryLimit: 100}
+		p.guard.RecordSample(low)
+		p.guard.RecordSample(low)
+		p.policy = proxyEgressPolicyFunc(engine.PublicDestination)
+		var dials atomic.Int32
+		p.dial = func(context.Context, string, string) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("queued request reached the dialer")
+		}
+		queued := make(chan int, 1)
+		go func() { queued <- proxyTestConnect(t.Context(), p, old, "11.0.0.80:443").Code }()
+		synctest.Wait()
+		if d := p.guard.Diagnostics(); d.Waiters != 1 {
+			t.Fatalf("request did not queue: %+v", d)
+		}
+		next := old
+		next.HTTPSProxyPassword = "replacement-password"
+		p.update([]Device{next})
+		synctest.Wait()
+		if len(queued) == 0 || <-queued != http.StatusServiceUnavailable || dials.Load() != 0 || p.guard.Diagnostics().Waiters != 0 {
+			t.Fatal("password rotation did not cancel the queued request before dialing")
+		}
+	})
+}
+
+func TestHTTPSProxyOverloadPreservesCoverAndBackoff(t *testing.T) {
+	device := Device{Name: "phone"}
+	device.HTTPSProxyPassword = "password"
+	p := newHTTPSProxy(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}), []Device{device})
+	p.guard = overload.New(overload.Options{MaxWait: 3500 * time.Millisecond})
+	defer p.guard.Close()
+	p.guard.ObserveError(syscall.EMFILE)
+	p.policy = proxyEgressPolicyFunc(engine.PublicDestination)
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
+		t.Error("overloaded handler attempted an upstream dial")
+		return nil, errors.New("unexpected dial")
 	}
-	if _, finish, accepted := p.acquire(t.Context(), peer, first.Name, first.HTTPSProxyPassword); !accepted || finish != nil {
-		t.Fatal("connection cap was not enforced")
-	}
-	other, finish, accepted := p.acquire(t.Context(), peer, second.Name, second.HTTPSProxyPassword)
-	if !accepted || finish == nil {
-		t.Fatal("one device exhausted the other device's cap")
-	}
-	defer finish()
-	p.update([]Device{second})
-	for _, ctx := range active {
-		if ctx.Err() != context.Canceled {
-			t.Fatal("revoked device retained an active tunnel")
+	now := time.Unix(1000, 0)
+	p.now = func() time.Time { return now }
+	bad := device
+	bad.HTTPSProxyPassword = "wrong-password"
+	checkCover := func(credentials Device) {
+		t.Helper()
+		if w := proxyTestConnect(t.Context(), p, credentials, "11.0.0.80:443"); w.Code != http.StatusTeapot || w.Header().Get("Retry-After") != "" {
+			t.Fatalf("failed or cooling-down login lost cover: %d, %v", w.Code, w.Header())
 		}
 	}
-	if other.Err() != nil {
-		t.Fatal("revocation interrupted a different device")
+	for _, credentials := range []Device{bad, bad, bad, device} {
+		checkCover(credentials)
 	}
-	if _, _, accepted := p.acquire(t.Context(), peer, first.Name, first.HTTPSProxyPassword); accepted {
-		t.Fatal("revoked proxy credential remained valid")
+	now = now.Add(time.Second)
+	checkCover(bad) // the fourth failure starts a two-second cooldown
+	now = now.Add(time.Second)
+	checkCover(device)
+	now = now.Add(time.Second)
+	if w := proxyTestConnect(t.Context(), p, device, "11.0.0.80:443"); w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "3" {
+		t.Fatalf("overload response = %d, %v", w.Code, w.Header())
 	}
+	if d := p.guard.Diagnostics(); d.ActiveFlows != 0 || d.PendingDials != 0 || d.Waiters != 0 || len(p.devices[device.Name].active) != 0 {
+		t.Fatalf("overload retained request resources: %+v", d)
+	}
+}
+
+func TestHTTPSProxyDialRetiresReservationAndObservesFDExhaustion(t *testing.T) {
+	for _, outcome := range []struct {
+		name               string
+		lookupErr, dialErr error
+		sample             bool
+	}{
+		{name: "success until release"},
+		{name: "success until FD sample", sample: true},
+		{name: "lookup EMFILE", lookupErr: syscall.EMFILE},
+		{name: "dial EMFILE", dialErr: syscall.EMFILE},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			p := newHTTPSProxy(http.NotFoundHandler(), nil)
+			p.policy = proxyEgressPolicyFunc(engine.PublicDestination)
+			p.guard = overload.New(overload.Options{})
+			defer p.guard.Close()
+			lease, err := p.guard.Acquire(t.Context(), overload.ClassFlow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Release()
+			p.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+				if outcome.lookupErr != nil {
+					return nil, outcome.lookupErr
+				}
+				return []netip.Addr{netip.MustParseAddr("11.0.0.80")}, nil
+			}
+			p.dial = func(context.Context, string, string) (net.Conn, error) {
+				if outcome.dialErr != nil {
+					return nil, outcome.dialErr
+				}
+				conn, peer := net.Pipe()
+				peer.Close()
+				return conn, nil
+			}
+			conn, err := p.dialPublic(overload.WithLease(t.Context(), lease), "tcp", "origin.example:443")
+			if conn != nil {
+				defer conn.Close()
+			}
+			pressure := outcome.lookupErr != nil || outcome.dialErr != nil
+			wantUnmeasured := int64(1)
+			if pressure {
+				wantUnmeasured = 0
+			}
+			if d := p.guard.Diagnostics(); (conn == nil) != pressure || (err != nil) != pressure ||
+				d.Pressured != pressure || d.Emergency != pressure || d.PendingDials != 0 ||
+				d.ActiveFlows != 1 || d.UnmeasuredFDs != wantUnmeasured {
+				t.Fatalf("dial returned %v and left %+v", err, d)
+			}
+			if outcome.sample {
+				p.guard.RecordSample(overload.Snapshot{OpenFDs: 12, MaxFDs: 512})
+				if d := p.guard.Diagnostics(); d.UnmeasuredFDs != 0 || d.ActiveFlows != 1 {
+					t.Fatalf("fresh FD sample left %+v", d)
+				}
+			}
+			if conn != nil {
+				must(t, conn.Close())
+			}
+			lease.Release()
+			if d := p.guard.Diagnostics(); d.UnmeasuredFDs != 0 || d.ActiveFlows != 0 {
+				t.Fatalf("lease release left %+v", d)
+			}
+		})
+	}
+}
+
+func TestWebListenerClosesIdleHTTP1ConnectionsUnderPressure(t *testing.T) {
+	guard := overload.New(overload.Options{})
+	defer guard.Close()
+	raw, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := webServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok")
+	}), nil)
+	idle := make(chan struct{}, 4)
+	server.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateIdle {
+			idle <- struct{}{}
+		}
+	}
+	web := serveOn(t.Context(), server, raw, make(chan error, 1), guard)
+	defer web.Close()
+	dial := func() (net.Conn, *bufio.Reader) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", raw.Addr().String(), 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		return conn, bufio.NewReader(conn)
+	}
+	request := func(conn net.Conn, reader *bufio.Reader) {
+		t.Helper()
+		if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: loopback\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		res, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil || string(body) != "ok" || res.Close {
+			t.Fatalf("expected a reusable connection, got %q, close=%t, %v", body, res.Close, err)
+		}
+	}
+	conn, reader := dial()
+	request(conn, reader)
+	select {
+	case <-idle:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not make the connection idle")
+	}
+	guard.RecordSample(overload.Snapshot{GoMemoryBytes: 90, GoMemoryLimit: 100})
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Fatalf("idle connection survived pressure: %v", err)
+	}
+	for range 3 {
+		guard.RecordSample(overload.Snapshot{GoMemoryBytes: 10, GoMemoryLimit: 100})
+	}
+	conn, reader = dial()
+	request(conn, reader)
+	request(conn, reader)
 }
 
 func TestHTTPSProxyFailureBackoff(t *testing.T) {

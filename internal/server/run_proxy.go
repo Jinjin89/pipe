@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"time"
+
+	"pipe/internal/overload"
 
 	"github.com/caddyserver/certmagic"
 )
@@ -48,30 +51,36 @@ func strictProxyTLS(domain string, getCertificate func(*tls.ClientHelloInfo) (*t
 	return config
 }
 
-func proxyWebServer(proxy *httpsProxy, domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *http.Server {
+func proxyWebServer(handler http.Handler, domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *http.Server {
 	// HTTP/1.1 absolute-form forwarding preserves the requested origin scheme.
 	// Go's HTTP/2 handler cannot distinguish HTTP and HTTPS forwards.
-	server := webServer(proxy, strictProxyTLS(domain, getCertificate))
+	server := webServer(handler, strictProxyTLS(domain, getCertificate))
 	server.Protocols = new(http.Protocols)
 	server.Protocols.SetHTTP1(true)
 	return server
 }
 
-// startSharedHTTPSProxy binds the HTTPS proxy's TCP listener and starts its
-// certificates. It runs before the engine so that, with reality_dest self,
-// REALITY's handshake target is always a socket this process owns. It returns
-// a stop function. A missing certificate is not an error: handshakes fail.
-func startSharedHTTPSProxy(ctx context.Context, dir, address string, cfg httpsProxyListenerConfig, proxy *httpsProxy, output io.Writer, warn func(string), fatal chan<- error, stealth *sharedStealth) (func(), error) {
+const stealthCoverLimit = 32
+
+type sharedProxyListeners struct {
+	stop        func()
+	stealthPort uint16
+}
+
+// startSharedHTTPSProxy binds the public proxy and, when Stealth borrows its
+// site, the private REALITY handshake target. It starts certificate management
+// before the engine starts, with handshakes available once a certificate is ready.
+func startSharedHTTPSProxy(ctx context.Context, dir, address string, cfg httpsProxyListenerConfig, proxy *httpsProxy, output io.Writer, warn func(string), fatal chan<- error, stealth *sharedStealth) (sharedProxyListeners, error) {
 	if cfg.retired() {
-		return nil, errors.New(retiredProxy)
+		return sharedProxyListeners{}, errors.New(retiredProxy)
 	}
 	if cfg.method() == "http" {
 		busy, err := probeProxyHTTP()
 		if busy {
-			return nil, errors.New(proxyHTTPBusy)
+			return sharedProxyListeners{}, errors.New(proxyHTTPBusy)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("cannot probe TCP 80: %w", err)
+			return sharedProxyListeners{}, fmt.Errorf("cannot probe TCP 80: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -96,14 +105,14 @@ func startSharedHTTPSProxy(ctx context.Context, dir, address string, cfg httpsPr
 			clear(secret)
 			if err != nil {
 				stop()
-				return nil, errors.New("HTTPS proxy could not load its saved DNS credentials")
+				return sharedProxyListeners{}, errors.New("HTTPS proxy could not load its saved DNS credentials")
 			}
 			provider = savedProvider
 		}
 		certificates, cache, err := proxyManagedCertificates(dir, cfg, provider, warn)
 		if err != nil {
 			stop()
-			return nil, errors.New("HTTPS proxy could not initialize its certificate storage")
+			return sharedProxyListeners{}, errors.New("HTTPS proxy could not initialize its certificate storage")
 		}
 		stops = append(stops, cache.Stop)
 		if err := certificates.ManageAsync(ctx, []string{cfg.Domain}); err != nil {
@@ -120,16 +129,38 @@ func startSharedHTTPSProxy(ctx context.Context, dir, address string, cfg httpsPr
 		getCertificate = stealth.proxyCertificate(getCertificate)
 	}
 	server := proxyWebServer(proxy, cfg.Domain, getCertificate)
-	failures := make(chan error, 1)
-	listener, err := serve(server, address, cfg.Port, failures)
+	failures := make(chan error, 2)
+	var guard *overload.Guard
+	if proxy != nil {
+		guard = proxy.guard
+	}
+	listener, err := serve(ctx, server, address, cfg.Port, failures, guard, true)
 	if err != nil {
 		stop()
-		return nil, fmt.Errorf("HTTPS proxy could not bind TCP port %d: %v", cfg.Port, err)
+		return sharedProxyListeners{}, fmt.Errorf("HTTPS proxy could not bind TCP port %d: %v", cfg.Port, err)
 	}
 	stops = append(stops, func() { _ = listener.Close() })
+	var stealthPort uint16
+	if stealth != nil {
+		// REALITY's local handshake must still reach the cover during an emergency.
+		raw, err := listenTCP("127.0.0.1", 0, net.Listen)
+		if err != nil {
+			stop()
+			return sharedProxyListeners{}, fmt.Errorf("Stealth cover could not bind loopback: %w", err)
+		}
+		stealthPort = uint16(raw.Addr().(*net.TCPAddr).Port)
+		limited := emergencyLimitListener(raw, guard, stealthCoverLimit)
+		context.AfterFunc(ctx, func() { _ = limited.Close() })
+		coverServer := proxyWebServer(proxy.site, cfg.Domain, getCertificate)
+		coverServer.WriteTimeout = 10 * time.Second
+		coverServer.IdleTimeout = 5 * time.Second
+		coverServer.SetKeepAlivesEnabled(false)
+		cover := serveOn(ctx, coverServer, limited, failures, nil)
+		stops = append(stops, func() { _ = cover.Close() })
+	}
 	fmt.Fprintf(output, "HTTPS proxy listening on %s\n", listener.Addr())
 	go watchSharedProxy(ctx, failures, fatal, warn)
-	return stop, nil
+	return sharedProxyListeners{stop: stop, stealthPort: stealthPort}, nil
 }
 
 func watchSharedProxy(ctx context.Context, failures <-chan error, fatal chan<- error, warn func(string)) {

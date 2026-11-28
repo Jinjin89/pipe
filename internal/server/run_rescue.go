@@ -76,8 +76,8 @@ func startSharedRescue(ctx context.Context, settings Settings, options RunOption
 		return nil, fmt.Errorf("bind TCP port %d: %w", port, err)
 	}
 	getCertificate := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil }
-	listener := serveOn(webServer(handler, rescueTLSConfig(settings.CDNDomain, getCertificate, originCA)),
-		rescueListener{Listener: tcp, allowLoopback: options.TestPorts}, failures)
+	listener := serveOn(ctx, webServer(handler, rescueTLSConfig(settings.CDNDomain, getCertificate, originCA)),
+		rescueListener{Listener: guardedListener(ctx, tcp, options.overload), allowLoopback: options.TestPorts}, failures, options.overload)
 	fmt.Fprintf(log, "Rescue listening on %s\n", listener.Addr())
 	checkExpiry := func(now time.Time) {
 		if warning := rescueExpiryWarning(cert.Leaf.NotAfter, now); warning != "" {

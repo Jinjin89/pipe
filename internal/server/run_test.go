@@ -4,12 +4,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +19,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"pipe/internal/engine"
+	"pipe/internal/overload"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
@@ -62,7 +66,7 @@ func TestServerEngineOptions(t *testing.T) {
 				testHosts = map[string]netip.Addr{"other.split.test": netip.MustParseAddr("11.0.0.80")}
 			}
 			instance, err := engine.New(t.Context(), engine.Options{
-				Config:         serverConfig(settings, devices, "127.0.0.1", serverListeners{masquerade: 12345, probe: 12346, mainTLS: settings.Ports.Decoy, rescueTLS: 12347}, testHosts),
+				Config:         serverConfig(settings, devices, "127.0.0.1", serverListeners{masquerade: 12345, mainTLS: settings.Ports.Decoy, rescueTLS: 12347}, testHosts),
 				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
 				Server:         true, DeviceIDs: deviceIDs(devices),
 			})
@@ -92,7 +96,7 @@ func TestServerEngineMixedAddressHostUsesGuardedDirect(t *testing.T) {
 	const host = "mixed.split.test"
 	private := netip.MustParseAddr("10.0.0.1")
 	public := netip.MustParseAddr("8.8.8.8")
-	config := serverConfig(settings, nil, "127.0.0.1", serverListeners{masquerade: 12345, probe: 12346, mainTLS: settings.Ports.Decoy}, map[string]netip.Addr{host: private})
+	config := serverConfig(settings, nil, "127.0.0.1", serverListeners{masquerade: 12345, mainTLS: settings.Ports.Decoy}, map[string]netip.Addr{host: private})
 	dns := config["dns"].(engine.Object)
 	var foundTestHosts bool
 	for _, server := range dns["servers"].([]engine.Object) {
@@ -211,6 +215,7 @@ func TestDecoyAndProbeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer decoy.Close()
 	for _, test := range []struct {
 		handler http.Handler
 		url     string
@@ -218,8 +223,6 @@ func TestDecoyAndProbeHandler(t *testing.T) {
 		body    string
 	}{
 		{decoy, "https://origin.example.test/", 200, string(page)},
-		{http.HandlerFunc(serveProbe), "http://" + engine.ProbeDomain + engine.ProbePath, 200, "OK"},
-		{http.HandlerFunc(serveProbe), "http://" + engine.ProbeDomain + engine.ProbePath + "?burst=1", 200, strings.Repeat("0", engine.ProbeBurstSize)},
 		{decoy, "https://" + engine.ProbeDomain + engine.ProbePath, 404, "404"},
 		{decoy, "http://" + engine.ProbeDomain + engine.ProbePath, 404, "404"},
 	} {
@@ -229,9 +232,26 @@ func TestDecoyAndProbeHandler(t *testing.T) {
 			t.Fatalf("unexpected response for %s: HTTP %d", test.url, recorder.Code)
 		}
 	}
+	for _, mode := range []DeployMode{Standalone, Shared} {
+		t.Run(string(mode), func(t *testing.T) {
+			config := serverConfig(Settings{Mode: mode}, nil, "127.0.0.1", serverListeners{}, nil)
+			instance, err := engine.New(t.Context(), engine.Options{Server: true,
+				Config: engine.Object{"outbounds": config["outbounds"]},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			for _, burst := range []bool{false, true} {
+				if stalled, err := instance.Probe(t.Context(), "probe-direct", burst); err != nil || stalled {
+					t.Errorf("in-memory probe burst=%t failed: %v", burst, err)
+				}
+			}
+		})
+	}
 }
 
-// Shared Stealth borrows our own HTTPS proxy site, reached where it listens.
+// Configurations without a private cover port fall back to the proxy address.
 func TestSharedStealthHandshakeUsesProxyListenAddress(t *testing.T) {
 	dir := t.TempDir()
 	if err := Init(dir, "origin.example.test", ""); err != nil {
@@ -259,6 +279,119 @@ func TestSharedStealthHandshakeUsesProxyListenAddress(t *testing.T) {
 			t.Fatalf("listen %s: handshake %v, want %s:9443", listen, handshake, want)
 		}
 	}
+}
+
+func TestSharedStealthCoverDuringEmergency(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeProxyTestPair(t, testProxyDomain, dir)
+	pair, err := tls.LoadX509KeyPair(cert, key)
+	must(t, err)
+	publicPort, reservation := reserveRunTCP(t)
+	must(t, reservation.Close())
+	cfg := httpsProxyListenerConfig{Domain: testProxyDomain, Port: publicPort, CertMethod: "files", Cert: cert, Key: key}
+	stealth := newSharedStealth(cfg.Domain, dir)
+	guard := overload.New(overload.Options{})
+	defer guard.Close()
+	guard.RecordSample(overload.Snapshot{GoMemoryBytes: 90, GoMemoryLimit: 100})
+	if !guard.Diagnostics().Emergency {
+		t.Fatal("memory sample did not start an emergency")
+	}
+	const coverBody = "Stealth cover"
+	device := Device{Name: "device"}
+	device.HTTPSProxyPassword = "test-password"
+	proxy := newHTTPSProxy(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, coverBody)
+	}), []Device{device})
+	proxy.guard = guard
+	proxy.dial = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("unexpected forwarding dial")
+	}
+	listeners, err := startSharedHTTPSProxy(t.Context(), dir, "127.0.0.1", cfg, proxy, io.Discard, func(string) {}, nil, stealth)
+	must(t, err)
+	defer listeners.stop()
+	if listeners.stealthPort == 0 || listeners.stealthPort == publicPort {
+		t.Fatalf("public port %d and private cover port %d", publicPort, listeners.stealthPort)
+	}
+
+	settings := Settings{Mode: Shared, HTTPSProxyListener: &cfg}
+	settings.borrowProxySite()
+	config := serverConfig(settings, nil, "10.83.0.1", serverListeners{borrowProxy: true, stealthCover: listeners.stealthPort}, nil)
+	var target engine.Object
+	for _, inbound := range config["inbounds"].([]engine.Object) {
+		if inbound["tag"] == "stealth" {
+			target = inbound["tls"].(engine.Object)["reality"].(engine.Object)["handshake"].(engine.Object)
+		}
+	}
+	if target["server"] != "127.0.0.1" || target["server_port"] != listeners.stealthPort {
+		t.Fatalf("Stealth handshake target = %v, want %s", target, loopback(listeners.stealthPort))
+	}
+
+	tlsConfig := &tls.Config{ServerName: cfg.Domain, RootCAs: stealth.verify.Roots, NextProtos: []string{"http/1.1"}}
+	dial := func(port uint16) *tls.Conn {
+		t.Helper()
+		raw, err := net.DialTimeout("tcp4", loopback(port), 3*time.Second)
+		must(t, err)
+		t.Cleanup(func() { _ = raw.Close() })
+		return tls.Client(raw, tlsConfig)
+	}
+	handshake := func(conn *tls.Conn, timeout time.Duration) error {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		return conn.HandshakeContext(ctx)
+	}
+	const pauseCheck = 250 * time.Millisecond
+	if err := handshake(dial(publicPort), pauseCheck); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("public TLS handshake during emergency = %v, want deadline exceeded", err)
+	}
+	dialCover := func() *tls.Conn {
+		t.Helper()
+		conn := dial(listeners.stealthPort)
+		must(t, handshake(conn, 3*time.Second))
+		return conn
+	}
+	checkCover := func(cover *tls.Conn) {
+		t.Helper()
+		state := cover.ConnectionState()
+		if state.NegotiatedProtocol != "http/1.1" || !bytes.Equal(state.PeerCertificates[0].Raw, pair.Certificate[0]) {
+			t.Fatalf("private cover negotiated %q with certificate %q", state.NegotiatedProtocol, state.PeerCertificates[0].Subject)
+		}
+		must(t, cover.SetDeadline(time.Now().Add(3*time.Second)))
+		// An authenticated absolute-form request would enter the public proxy's forwarding path.
+		_, err := fmt.Fprintf(cover, "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\nProxy-Authorization: %s\r\n\r\n", basicProxyAuth(device.Name, device.HTTPSProxyPassword))
+		must(t, err)
+		response, err := http.ReadResponse(bufio.NewReader(cover), nil)
+		must(t, err)
+		body, err := io.ReadAll(response.Body)
+		must(t, err)
+		must(t, response.Body.Close())
+		if response.StatusCode != http.StatusOK || string(body) != coverBody || !response.Close {
+			t.Fatalf("private cover response = %s, %q, close = %v", response.Status, body, response.Close)
+		}
+	}
+
+	held := make([]*tls.Conn, 0, stealthCoverLimit)
+	for range stealthCoverLimit {
+		held = append(held, dialCover())
+	}
+	if err := handshake(dial(listeners.stealthPort), pauseCheck); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("private TLS handshake with %d active connections during emergency = %v, want immediate close", len(held), err)
+	}
+	checkCover(held[0])
+	for _, conn := range held {
+		_ = conn.Close()
+	}
+
+	// Clear both emergency and pressure so the cover also sees a recovery transition.
+	for range 3 {
+		guard.RecordSample(overload.Snapshot{GoMemoryBytes: 10, GoMemoryLimit: 100})
+	}
+	if d := guard.Diagnostics(); d.Emergency || d.Pressured {
+		t.Fatalf("guard did not recover: %+v", d)
+	}
+	for range 40 {
+		dialCover()
+	}
+	checkCover(dialCover())
 }
 
 func TestDecoyCoverSelection(t *testing.T) {
@@ -733,7 +866,7 @@ func TestBorrowedHTTPSProxyListenerFailureIsFatal(t *testing.T) {
 	failures, fatal := make(chan error, 1), make(chan error, 1)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	web := serveOn(webServer(http.NotFoundHandler(), nil), listener, failures)
+	web := serveOn(ctx, webServer(http.NotFoundHandler(), nil), listener, failures, nil)
 	defer web.Close()
 	go watchSharedProxy(ctx, failures, fatal, func(string) {})
 	// Closing the socket directly simulates losing it before the service stops.
@@ -745,5 +878,163 @@ func TestBorrowedHTTPSProxyListenerFailureIsFatal(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("the failed listener did not reach engine supervision")
+	}
+}
+
+type testAcceptListener struct {
+	net.Listener
+	accept func() (net.Conn, error)
+	closed bool
+}
+
+func (l *testAcceptListener) Accept() (net.Conn, error) { return l.accept() }
+
+func (l *testAcceptListener) Close() error {
+	l.closed = true
+	return nil
+}
+
+func TestGuardedListenerWaitsAtEmergencyFloor(t *testing.T) {
+	for _, stop := range []string{"recover", "close"} {
+		t.Run(stop, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				guard := overload.New(overload.Options{})
+				defer guard.Close()
+				guard.RecordSample(overload.Snapshot{GoMemoryBytes: 90, GoMemoryLimit: 100})
+				calls := 0
+				inner := &testAcceptListener{accept: func() (net.Conn, error) {
+					calls++
+					conn, peer := net.Pipe()
+					peer.Close()
+					return conn, nil
+				}}
+				listener := guardedListener(t.Context(), inner, guard)
+				defer listener.Close()
+				result := make(chan error, 1)
+				go func() {
+					conn, err := listener.Accept()
+					if conn != nil {
+						conn.Close()
+					}
+					result <- err
+				}()
+				synctest.Wait()
+				if calls != 0 || len(result) != 0 {
+					t.Fatal("the listener accepted while at the emergency floor")
+				}
+				if stop == "close" {
+					_ = listener.Close()
+				} else {
+					guard.RecordSample(overload.Snapshot{GoMemoryBytes: 10, GoMemoryLimit: 100})
+				}
+				synctest.Wait()
+				select {
+				case err := <-result:
+					if stop == "close" {
+						if !errors.Is(err, context.Canceled) || calls != 0 || !inner.closed {
+							t.Fatalf("Close returned %v with %d accepts and inner closed=%t", err, calls, inner.closed)
+						}
+					} else if err != nil || calls != 1 {
+						t.Fatalf("recovery returned %v with %d accepts", err, calls)
+					}
+				default:
+					t.Fatal("the paused Accept did not wake")
+				}
+			})
+		})
+	}
+}
+
+func TestGuardedListenerClosesSocketWhenEmergencyStartsDuringAccept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		guard := overload.New(overload.Options{})
+		defer guard.Close()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		first, peer := net.Pipe()
+		defer first.Close()
+		defer peer.Close()
+		must(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
+		second, secondPeer := net.Pipe()
+		defer second.Close()
+		defer secondPeer.Close()
+
+		connections := make(chan net.Conn, 1)
+		calls := 0
+		inner := &testAcceptListener{accept: func() (net.Conn, error) {
+			calls++
+			select {
+			case conn := <-connections:
+				return conn, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}}
+		listener := guardedListener(ctx, inner, guard)
+		defer listener.Close()
+		type acceptResult struct {
+			conn net.Conn
+			err  error
+		}
+		result := make(chan acceptResult, 1)
+		go func() {
+			conn, err := listener.Accept()
+			result <- acceptResult{conn, err}
+		}()
+		synctest.Wait()
+		if calls != 1 || len(result) != 0 {
+			t.Fatal("inner Accept was not waiting for a socket")
+		}
+
+		guard.RecordSample(overload.Snapshot{GoMemoryBytes: 90, GoMemoryLimit: 100})
+		connections <- first
+		synctest.Wait()
+		if calls != 1 || len(result) != 0 {
+			t.Fatal("listener did not pause after emergency started")
+		}
+		var b [1]byte
+		if _, err := peer.Read(b[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("accepted socket stayed open during emergency: read returned %v", err)
+		}
+
+		connections <- second
+		guard.RecordSample(overload.Snapshot{GoMemoryBytes: 10, GoMemoryLimit: 100})
+		synctest.Wait()
+		select {
+		case accepted := <-result:
+			if accepted.err != nil || accepted.conn != second || calls != 2 {
+				t.Fatalf("Accept after recovery returned %v, %v with %d inner calls", accepted.conn, accepted.err, calls)
+			}
+		default:
+			t.Fatal("paused Accept did not resume after recovery")
+		}
+	})
+}
+
+func TestGuardedListenerObservesAcceptFDExhaustion(t *testing.T) {
+	guard := overload.New(overload.Options{})
+	defer guard.Close()
+	inner := &testAcceptListener{accept: func() (net.Conn, error) { return nil, syscall.EMFILE }}
+	listener := guardedListener(t.Context(), inner, guard)
+	defer listener.Close()
+	if _, err := listener.Accept(); !errors.Is(err, syscall.EMFILE) {
+		t.Fatalf("Accept returned %v", err)
+	}
+	if d := guard.Diagnostics(); !d.Pressured || !d.Emergency {
+		t.Fatalf("accept exhaustion did not trigger pressure: %+v", d)
+	}
+}
+
+func TestEmergencyLimitListenerObservesAcceptFDExhaustion(t *testing.T) {
+	guard := overload.New(overload.Options{})
+	defer guard.Close()
+	inner := &testAcceptListener{accept: func() (net.Conn, error) { return nil, syscall.EMFILE }}
+	listener := emergencyLimitListener(inner, guard, stealthCoverLimit)
+	defer listener.Close()
+	if _, err := listener.Accept(); !errors.Is(err, syscall.EMFILE) {
+		t.Fatalf("Accept returned %v", err)
+	}
+	if d := guard.Diagnostics(); !d.Pressured || !d.Emergency {
+		t.Fatalf("accept exhaustion did not trigger pressure: %+v", d)
 	}
 }

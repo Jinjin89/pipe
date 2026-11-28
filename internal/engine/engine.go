@@ -20,6 +20,7 @@ import (
 	"time"
 
 	ruleAssets "pipe/assets/rules"
+	"pipe/internal/overload"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -72,6 +73,7 @@ type Options struct {
 	GetCertificate   func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Server           bool
 	DeviceIDs        []string
+	Overload         *overload.Guard
 	ObserveFastDial  func(error)
 	ObserveTraffic   func()
 	ObserveFastStall func()
@@ -109,7 +111,9 @@ type Instance struct {
 
 func New(ctx context.Context, options Options) (*Instance, error) {
 	instance := &Instance{reloads: make(map[string]*reloadableInbound)}
-	if !options.Server {
+	if options.Server {
+		instance.sessions = newDeviceSessions(options.DeviceIDs, options.Overload)
+	} else {
 		instance.relay = newRelayState(options.Relay)
 	}
 	if options.VPN != nil {
@@ -127,8 +131,8 @@ func New(ctx context.Context, options Options) (*Instance, error) {
 	mixed.RegisterInbound(in)
 	direct.RegisterInbound(in)
 	tun.RegisterInbound(in)
-	registerInbound(in, instance.reloads, options.Server, C.TypeVLESS, vless.NewInbound)
-	registerInbound(in, instance.reloads, options.Server, C.TypeVMess, vmess.NewInbound)
+	registerInbound(in, instance.reloads, instance.sessions, C.TypeVLESS, vless.NewInbound)
+	registerInbound(in, instance.reloads, instance.sessions, C.TypeVMess, vmess.NewInbound)
 	out := outbound.NewRegistry()
 	if options.Server {
 		outbound.Register(out, InMemoryProbe, newProbeOutbound)
@@ -136,7 +140,7 @@ func New(ctx context.Context, options Options) (*Instance, error) {
 	block.RegisterOutbound(out)
 	group.RegisterSelector(out)
 	registerOutbounds(out, options, instance.relay)
-	registerQUIC(in, out, instance.reloads, options, instance.relay)
+	registerQUIC(in, out, instance.reloads, options, instance.relay, instance.sessions)
 	if instance.relay != nil && instance.relay.stealth {
 		outbound.Register(out, relayTCPType, instance.relay.newTCPOutbound)
 	}
@@ -209,10 +213,7 @@ func New(ctx context.Context, options Options) (*Instance, error) {
 			factory.AttachPlatformWriter(newLevelWriter(options.LogWriter, decoded.Log.Level))
 		}
 	}
-	if options.Server {
-		instance.sessions = newDeviceSessions(options.DeviceIDs)
-		instance.box.Router().AppendTracker(instance.sessions)
-	} else if options.ObserveTraffic != nil {
+	if !options.Server && options.ObserveTraffic != nil {
 		instance.box.Router().AppendTracker(&trafficTracker{
 			observe: options.ObserveTraffic, suspectStall: options.ObserveFastStall,
 		})
@@ -277,7 +278,12 @@ func (i *Instance) Close() error {
 		if i.relay != nil && i.relay.stopMonitor != nil {
 			i.relay.stopMonitor()
 		}
+		var revoked []*session
+		if i.sessions != nil {
+			revoked = i.sessions.revokeDisallowed(nil)
+		}
 		i.closeErr = i.box.Close()
+		closeSessions(revoked)
 	})
 	return i.closeErr
 }
@@ -494,7 +500,7 @@ func registerOutbounds(registry *outbound.Registry, options Options, relay *rela
 			}
 			return newServerGuardedOutbound(base, func(_ string, destination M.Socksaddr) error {
 				return publicDestination(destination)
-			}), nil
+			}, options.Overload), nil
 		})
 	registerSlowTier(registry, C.TypeVLESS, relay.newStealthOutbound)
 	registerSlowTier(registry, C.TypeVMess, vmess.NewOutbound)
